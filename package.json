@@ -1,0 +1,23 @@
+{
+  "name": "agent-comms",
+  "version": "0.2.0",
+  "private": false,
+  "license": "MIT",
+  "description": "Serverless, join-able comms bus + live dashboard for cooperating agents (Bun + bun:sqlite).",
+  "type": "module",
+  "bin": {
+    "comms": "bin/comms.ts",
+    "comms-dashboard": "bin/dashboard.ts"
+  },
+  "scripts": {
+    "comms": "bun bin/comms.ts",
+    "dashboard": "bun bin/dashboard.ts --port 8787"
+  },
+  "engines": {
+    "bun": ">=1.3.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/onchainapps/agent-comms.git"
+  }
+}

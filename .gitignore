@@ -1,0 +1,21 @@
+# Live bus state — never publish
+.comms/
+messages/
+handoffs/
+AGENTS.local.md
+
+# Logs / scratch
+*.log
+*.tmp
+
+# Node/Bun
+node_modules/
+
+# HIP / compiler junk accidentally dropped in this tree
+probe_*
+*.hipi
+*.hipfb
+*.bc
+*.s
+*.o
+!bin/
