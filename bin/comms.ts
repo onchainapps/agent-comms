@@ -3,16 +3,19 @@
  * comms CLI — thin shell over the bus core (RFC-001 §3 piece 4).
  *
  * All DB logic lives in src/bus.ts. This file owns ONLY: argv parsing, env
- * (COMMS_HOME / COMMS_FINGERPRINT), readBody (@file/stdin), rendering, exit
- * codes, and the watch polling loop. Byte-identical behavior is enforced by
- * tests/golden.ts.
+ * (COMMS_HOME / COMMS_FINGERPRINT / COMMS_TEST_SEAMS), readBody (@file/stdin),
+ * rendering, exit codes, and the watch polling loop. No SQL, no DB access.
+ * Byte-identical local-mode behavior is enforced by tests/golden.test.ts.
  *
- * Env: COMMS_HOME  project root holding .comms/ (DB) + messages/ (default: auto-detected)
+ * Env: COMMS_HOME        project root holding .comms/ (DB) + messages/ (default: auto-detected)
+ *      COMMS_FINGERPRINT stable per-runtime identity for join/rename guards
+ *      COMMS_TEST_SEAMS  JSON {at,seed,pid} — frozen seams for the golden harness (test-only)
  */
 import { dirname, join, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, readFileSync } from "node:fs";
-import { openBus, localCtx, csv, type MsgRow, type Res } from "../src/bus.ts";
+import { openBus, localCtx, EXIT_CODES, type MsgRow, type Res } from "../src/bus.ts";
+import { testSeams, type Seams } from "../src/seams.ts";
 
 function findRoot(start: string): string {
   let d = start;
@@ -24,7 +27,10 @@ function findRoot(start: string): string {
   }
 }
 const HOME = process.env.COMMS_HOME ?? findRoot(dirname(fileURLToPath(import.meta.url)));
-const bus = openBus({ home: HOME, mode: "local" });
+const seams: Seams | undefined = process.env.COMMS_TEST_SEAMS
+  ? testSeams(JSON.parse(process.env.COMMS_TEST_SEAMS))
+  : undefined;
+const bus = openBus({ home: HOME, mode: "local", seams });
 
 // ---------- rendering (byte-exact from the pre-refactor CLI) ----------
 function fmtRow(r: MsgRow, unread = false): string {
@@ -57,11 +63,11 @@ function printWho(activeOnly: boolean) {
   if (!shown) console.log("  (none)");
 }
 
-/** Unwrap core result or exit with the local-mode contract: usage→2, identity→3, else 1. */
+/** Unwrap a core Res or exit via the core's §7 table — the shell maps, never invents (finding 19). */
 function unwrap<T>(r: Res<T>): T {
   if (r.error) {
     console.error(r.detail);
-    process.exit(r.error === "usage" ? 2 : r.error === "identity_conflict" ? 3 : 1);
+    process.exit(EXIT_CODES[r.error]);
   }
   return r.value;
 }
@@ -112,7 +118,7 @@ function cmdReceipts(a: Args) {
 }
 
 function cmdChannels() {
-  const list = bus.channels(localCtx(""));
+  const list = unwrap(bus.channels(localCtx("")));
   console.log("channels:");
   for (const c of list)
     console.log(`  #${String(c.name).padEnd(14)} ${String(c.n).padStart(4)} msgs  last=${c.last ?? "-"}  ${c.purpose ?? ""}`);
@@ -141,7 +147,7 @@ async function cmdWatch(a: Args) {
   const role = bus.roleOf(a.agent);
   const ivSec = a.interval ?? 3;
   const capSec = a.timeout ?? 28800;
-  const seen = new Set((bus.db.query("SELECT id FROM messages").all() as { id: string }[]).map((r) => r.id));
+  const seen = new Set(bus.allMessageIds()); // core accessor — no SQL in the shell (finding 9)
   const scope = a.all ? (a.channel ? `all of #${a.channel}` : "ALL channels (firehose)") : (a.channel ? `#${a.channel} addressed to me` : "addressed to me");
   console.log(`watch: ${a.agent} (role=${role ?? "-"}) scope=${scope}; every ${ivSec}s; ${a.once ? "one-shot" : `cap ${capSec}s`}. baseline=${seen.size} msgs`);
   let stop = false;
@@ -149,13 +155,13 @@ async function cmdWatch(a: Args) {
   const started = Date.now();
   while (!stop) {
     bus.touch(a.agent);
-    const rows = bus.db.query("SELECT * FROM messages ORDER BY created_at ASC").all() as MsgRow[];
     let hitForMe = false;
-    for (const r of rows) {
+    for (const r of bus.allMessages()) {
       if (seen.has(r.id)) continue;
       seen.add(r.id);
       if (r.sender === a.agent) continue;
       if (a.channel && r.channel !== a.channel) continue;
+      // --all surfaces every message in scope (a whole channel); default = only addressed to me
       if (a.all || bus.recipientsMatch(r.recipients, a.agent, role)) { console.log(`NEW ${fmtRow(r)}`); hitForMe = true; }
     }
     if (a.once) break;

@@ -2,45 +2,70 @@
  * Bus core — all DB logic of agent-comms, extracted from bin/comms.ts (RFC-001 §3).
  *
  * Synchronous, typed results and typed errors. No console.log, no process.exit,
- * no stdin, no @file resolution, no ambient env reads. Determinism flows through
- * the injectable seams (clock/rng/pid/mirror). mode (local|server) is bound at
- * openBus() — the server build cannot construct a local-root principal (§3).
+ * no stdin, no @file resolution, no ambient env reads, no process.pid.
+ * Determinism flows through the injectable seams (clock/rng/pid/mirror/sleep).
+ *
+ * mode (local|server) is bound at openBus() and is TYPE-PARAMETRIC:
+ * Bus<"server"> methods only accept Ctx<"server">, whose principal cannot carry
+ * localRoot (branded); Ctx<"local"> can. Server mode ALSO rejects a localRoot
+ * principal at runtime (types erase at the RPC boundary).
+ *
+ * Legacy schema is preserved exactly (in-place upgrade from de4ed3b DBs);
+ * documented quirks are behavior-locked by tests/golden.ts.
  */
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { defaultSeams, type Seams } from "./seams.ts";
 
 // ---------- public types ----------
 
 export type Mode = "local" | "server";
-export type Scope = "read:all" | "post:as" | "tokens:admin" | "agents:admin";
-export const ALL_SCOPES: readonly Scope[] = ["read:all", "post:as", "tokens:admin", "agents:admin"];
+export type Scope =
+  | "read:all" | "post:as" | "tokens:admin" | "agents:admin"
+  | "tokens:admin:human" | "presence:all" | "backup" | "restore"
+  | `channel:${string}`;
+export const ALL_SCOPES: readonly Scope[] = [
+  "read:all", "post:as", "tokens:admin", "agents:admin",
+  "tokens:admin:human", "presence:all", "backup", "restore",
+];
 
-export type Principal = {
-  agentId: string;
-  kind: "agent" | "human" | "service";
-  scopes: Scope[];
-  localRoot?: true;
-};
+export type PrincipalBase = { agentId: string; kind: "agent" | "human"; scopes: Scope[] };
+export type LocalPrincipal = PrincipalBase & { localRoot?: true };
+export type ServerPrincipal = PrincipalBase & { localRoot?: undefined };
+export type Principal<M extends Mode> = M extends "server" ? ServerPrincipal : LocalPrincipal;
 
-export type Ctx = { principal: Principal; actor: string };
+/** Opaque transport credential (finding 10a): what a client presents; the
+ *  server resolves it to a Principal via tokenVerify. Local sessions carry none. */
+export type Cred = { token: string } | { session: string };
 
-export const localCtx = (actor: string): Ctx => ({
-  principal: { agentId: actor, kind: "agent", scopes: [...ALL_SCOPES], localRoot: true },
-  actor,
-});
+// CONCRETE per-mode ctx types — NOT one generic alias with a conditional
+// member. tsc compares two instantiations of the same alias via a variance
+// shortcut that WRONGLY accepts Ctx<"local"> where Ctx<"server"> is required
+// (probe-verified on tsc 7.0.2); distinct named targets make the assignment
+// check structural and the localRoot leak fails closed (finding B1).
+export type LocalCtx = { principal: LocalPrincipal; actor: string; cred?: Cred };
+export type ServerCtx = { principal: ServerPrincipal; actor: string; cred?: Cred };
+export type Ctx<M extends Mode = Mode> = M extends "server" ? ServerCtx : LocalCtx;
 
-export type BusError =
-  | { error: "usage"; detail: string }
-  | { error: "not_found"; detail: string }
-  | { error: "forbidden"; detail: string }
-  | { error: "identity_conflict"; detail: string }
-  | { error: "conflict"; detail: string }
-  | { error: "contention"; detail: string };
-
-export type Ok<T> = { error?: undefined; value: T };
+export type BusErrorCode =
+  | "usage" | "not_found" | "forbidden" | "unauthorized" | "conflict" | "gone"
+  | "identity_conflict" | "rate_limited" | "unavailable" | "internal" | "resync" | "contention";
+export type BusError = { error: BusErrorCode; detail: string; data?: Record<string, unknown> };
+export type Ok<T> = { error?: undefined; value: T; cursor?: string };
 export type Res<T> = Ok<T> | BusError;
+
+/** §7 mappings — the shell and the server map, never invent. */
+export const RPC_CODES: Record<BusErrorCode, number> = {
+  usage: -32602, not_found: -32003, forbidden: -32002, unauthorized: -32001,
+  conflict: -32005, gone: -32004, identity_conflict: -32005, rate_limited: -32004,
+  unavailable: -32006, internal: -32603, resync: -32003, contention: -32006,
+};
+export const EXIT_CODES: Record<BusErrorCode, number> = {
+  usage: 2, not_found: 1, forbidden: 3, unauthorized: 3, conflict: 1, gone: 1,
+  identity_conflict: 3, rate_limited: 1, unavailable: 1, internal: 1, resync: 1, contention: 1,
+};
 
 export type AgentRow = {
   id: string; role: string | null; caps: string | null; pid: number | null;
@@ -63,65 +88,92 @@ export const PRESENCE_TTL_MS = 15 * 60 * 1000;
 
 // ---------- helpers (quirk-exact from bin/comms.ts) ----------
 
-// QUIRK: stamp() calls nowIso() itself (two clock reads per call in the original;
-// with a frozen clock seam this is byte-identical).
 const mkNowIso = (s: Seams) => () => s.now().toISOString().replace(/\.\d{3}Z$/, "Z");
 const mkStamp = (nowIso: () => string) => () =>
   nowIso().replace(/[-:TZ]/g, "").slice(0, 15).replace(/(\d{8})(\d{6})/, "$1T$2");
 const mkShortHex = (s: Seams) => (n = 2) =>
   Array.from(s.rng(n), (b) => b.toString(16).padStart(2, "0")).join("");
-const csv = (str?: string | null) => (str ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+export const csv = (str?: string | null) => (str ?? "").split(",").map((x) => x.trim()).filter(Boolean);
 
-/** scope normalizer contract (§4, grok): split→trim→dedupe→sort→join. */
 export const normalizeScopes = (scopes: Iterable<string>): string =>
   [...new Set([...scopes].map((s) => s.trim()).filter(Boolean))].sort().join(",");
 
-/** canonical req_hash input (§6): UTF-8, keys sorted, recipients sorted. */
 export function canonicalJson(v: unknown): string {
   if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
   if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
   return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + canonicalJson((v as any)[k])).join(",") + "}";
 }
-
 export function sha256hex(text: string): string {
-  const buf = new Uint8Array(new TextEncoder().encode(text));
-  // bun:crypto-free fallback kept sync via node:crypto
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { createHash } = require("node:crypto") as typeof import("node:crypto");
-  return createHash("sha256").update(buf).digest("hex");
+  return createHash("sha256").update(new TextEncoder().encode(text)).digest("hex");
 }
 
-/** recursive-CTE recipient split — probe-verified == csv() (§4 N1). */
+/** The JS whitespace set as a SQLite trim() char-set expression (finding 5):
+ *  SQLite trim() strips only U+0020 by default while JS .trim() strips the full
+ *  Unicode set — the recipient split must use ALL of them to match csv() BY
+ *  CONSTRUCTION. bun:sqlite (1.4.2) has no custom-function API, so the set is
+ *  inlined: TAB VT FF CR SP NBSP OGHAM-SP EN-QUAD..HAIR-SP LSEP PSEP NNBSP
+ *  MMSP IDEOGRAPHIC-SP ZWNBSP. */
+const WSET = `char(9)||char(10)||char(11)||char(12)||char(13)||char(32)||char(160)||char(5760)||char(8192)||char(8193)||char(8194)||char(8195)||char(8196)||char(8197)||char(8198)||char(8199)||char(8200)||char(8201)||char(8202)||char(8232)||char(8233)||char(8239)||char(8287)||char(12288)||char(65279)`;
+const jtrim = (x: string) => `trim(${x},${WSET})`;
+
+/** The ONE recipient-split statement: used by the msg_ai trigger AND the
+ *  one-shot backfill, so index rows follow identical semantics by CONSTRUCTION
+ *  (§4 N1, finding 5). */
 const SPLIT_SQL = `WITH RECURSIVE s(rest,tok) AS (
     SELECT coalesce(?,'') || ',', NULL
     UNION ALL
-    SELECT substr(rest, instr(rest,',')+1), trim(substr(rest,1,instr(rest,',')-1)) FROM s WHERE rest <> '')
+    SELECT substr(rest, instr(rest,',')+1), ${jtrim("substr(rest,1,instr(rest,',')-1)")} FROM s WHERE rest <> '')
   SELECT tok FROM s WHERE tok IS NOT NULL AND tok <> ''`;
 
-function recipientsMatch(recips: string, agent: string, role?: string | null): boolean {
+export function recipientsMatch(recips: string, agent: string, role?: string | null): boolean {
   const toks = new Set(csv(recips));
   if (toks.has("@all") || toks.has(agent)) return true;
   return !!role && toks.has(role);
 }
 
-// ---------- open / schema ----------
-
 export type BusOpts = {
   home: string;
   mode: Mode;
   seams?: Seams;
-  /** server mode: busy_timeout ms (150, §9). local keeps 5000. */
   busyTimeoutMs?: number;
 };
 
-export type Bus = ReturnType<typeof openBusCore>;
-
-export function openBus(opts: BusOpts) {
-  const bus = openBusCore(opts);
-  return bus;
+export function openBus<M extends Mode>(opts: { home: string; mode: M; seams?: Seams; busyTimeoutMs?: number }): Bus<M> {
+  return openBusCore(opts.home, opts.mode, opts.seams ?? defaultSeams, opts.busyTimeoutMs) as unknown as Bus<M>;
 }
 
-function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpts) {
+type Core = ReturnType<typeof openBusCore>;
+/** Server-mode surface: every ctx-taking method accepts ONLY Ctx<"server"> —
+ *  a localRoot principal is unnameable here (finding B1). Signatures are
+ *  spelled out explicitly: the core methods are generic over M, and inferring
+ *  through them would widen the ctx to the union and let localRoot slip back
+ *  in (probe-verified with tsc). */
+export type Bus<M extends Mode = Mode> = M extends "server" ? Omit<Core,
+  "joinAgent" | "post" | "inbox" | "read" | "threadOf" | "receipts" | "setStatus" | "channels" | "rename" | "history" | "waitStep" | "tokenCreate" | "tokenList" | "tokenRevoke"
+> & ServerOnly : Core;
+interface ServerOnly {
+  // property (arrow) syntax, NOT method syntax: strictFunctionTypes is only
+  // contravariant for properties — method params are bivariant and would let
+  // a Ctx<"local"> slip back in (probe-verified).
+  joinAgent: (ctx: Ctx<"server">, p: { agent: string; role: string; caps?: string; fingerprint?: string | null }) => Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number }>;
+  post: (ctx: Ctx<"server">, p: { from: string; to: string; type: string; subject?: string; body: string; thread?: string | null; re?: string | null; tags?: string; channel?: string | null; as?: string | null; idempotencyKey?: string | null }) => Res<{ id: string; channel: string; thread: string; file: string }>;
+  inbox: (ctx: Ctx<"server">, p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean }) => Res<{ rows: MsgRow[]; unreadIds: Set<string> }>;
+  read: (ctx: Ctx<"server">, p: { agent: string; id: string }) => Res<MsgRow & { receipts: Receipts }>;
+  threadOf: (ctx: Ctx<"server">, id: string) => Res<{ rows: MsgRow[]; receipts: Receipts[] }>;
+  receipts: (ctx: Ctx<"server">, id: string) => Res<MsgRow & { receipts: Receipts }>;
+  setStatus: (ctx: Ctx<"server">, p: { agent: string; id: string; state: string }) => Res<{ id: string; status: string }>;
+  channels: (ctx: Ctx<"server">) => Res<{ name: string; n: number; last: string | null; purpose: string | null }[]>;
+  rename: (ctx: Ctx<"server">, p: { agent: string; to: string; fingerprint?: string | null }) => Res<{ announced: MsgRow }>;
+  history: (ctx: Ctx<"server">, p: { channel?: string | null; limit?: number; since?: string }) => Res<{ rows: MsgRow[]; hasMore: boolean; cursor: { epoch: string; seq: number } }>;
+  waitStep: (ctx: Ctx<"server">, p: { for?: string; consumer?: string; since?: string }) => Res<{ messages: MsgRow[]; cursor: string; done: boolean }>;
+  tokenCreate: (ctx: Ctx<"server">, p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean }) => Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string }>;
+  tokenList: (ctx: Ctx<"server">) => Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; created_at: string; last_used: string; revoked_at: string | null }[] }>;
+  tokenRevoke: (ctx: Ctx<"server">, p: { id: number }) => Res<{ revoked: boolean }>;
+}
+
+// ---------- open / schema ----------
+
+function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTimeoutMs?: number) {
   const nowIso = mkNowIso(seams);
   const stamp = mkStamp(nowIso);
   const shortHex = mkShortHex(seams);
@@ -153,7 +205,6 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
     CREATE INDEX IF NOT EXISTS idx_msg_channel ON messages(channel);
   `);
 
-  // self-migrations (existing pattern) + v2.2 additive schema (§4)
   const mcols = d.query("PRAGMA table_info(messages)").all() as any[];
   if (!mcols.some((c) => c.name === "channel"))
     d.exec("ALTER TABLE messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'general'");
@@ -198,38 +249,48 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
       PRIMARY KEY(agent_id, consumer)
     );
   `);
+  // dedupe key for the recipient index; legacy DBs may hold duplicates from the
+  // racing-backfill bug — clean them first so the unique index can exist.
+  try {
+    d.exec("DELETE FROM message_recipients WHERE rowid NOT IN (SELECT MIN(rowid) FROM message_recipients GROUP BY msg,target)");
+    d.exec("CREATE UNIQUE INDEX IF NOT EXISTS mr_uq ON message_recipients(msg,target)");
+  } catch { /* non-fatal: index stays non-unique on pathological legacy data */ }
 
-  // triggers (§4) — recursive CTE split, presence debounce, agents_ai, tokens_ai/au
+  // triggers (§4). Timestamps coalesced (finding 6): a NULL created_at/last_seen/
+  // revoked_at from a manual or stale writer must not abort the write.
+  const NOW_SQL = `strftime('%Y-%m-%dT%H:%M:%SZ','now')`;
   d.exec(`
     CREATE TRIGGER IF NOT EXISTS msg_ai AFTER INSERT ON messages BEGIN
-      INSERT INTO events(kind,msg_id,agent_id,at) VALUES('msg',NEW.id,NEW.sender,NEW.created_at);
-      INSERT INTO message_recipients(msg,target)
+      INSERT INTO events(kind,msg_id,agent_id,at) VALUES('msg',NEW.id,NEW.sender,coalesce(NEW.created_at,${NOW_SQL}));
+      INSERT OR IGNORE INTO message_recipients(msg,target)
       WITH RECURSIVE s(rest,tok) AS (
         SELECT coalesce(NEW.recipients,'') || ',', NULL
         UNION ALL
-        SELECT substr(rest, instr(rest,',')+1), trim(substr(rest,1,instr(rest,',')-1)) FROM s WHERE rest <> '')
+        SELECT substr(rest, instr(rest,',')+1), ${jtrim("substr(rest,1,instr(rest,',')-1)")} FROM s WHERE rest <> '')
       SELECT NEW.id, tok FROM s WHERE tok IS NOT NULL AND tok <> '';
     END;
     CREATE TRIGGER IF NOT EXISTS msg_au AFTER UPDATE OF status ON messages BEGIN
-      INSERT INTO events(kind,msg_id,agent_id,at) VALUES('status',NEW.id,NEW.sender,NEW.updated_at);
+      INSERT INTO events(kind,msg_id,agent_id,at) VALUES('status',NEW.id,NEW.sender,coalesce(NEW.updated_at,${NOW_SQL}));
     END;
     CREATE TRIGGER IF NOT EXISTS reads_ai AFTER INSERT ON reads BEGIN
-      INSERT INTO events(kind,msg_id,agent_id,at) VALUES('read',NEW.msg,NEW.agent,NEW.read_at);
+      INSERT INTO events(kind,msg_id,agent_id,at) VALUES('read',NEW.msg,NEW.agent,coalesce(NEW.read_at,${NOW_SQL}));
     END;
     CREATE TRIGGER IF NOT EXISTS agents_ai AFTER INSERT ON agents BEGIN
-      INSERT INTO events(kind,agent_id,at) VALUES('presence',NEW.id,NEW.last_seen);
+      INSERT INTO events(kind,agent_id,at) VALUES('presence',NEW.id,coalesce(NEW.last_seen,NEW.joined_at,${NOW_SQL}));
     END;
     CREATE TRIGGER IF NOT EXISTS agents_au AFTER UPDATE ON agents
     WHEN OLD.id IS NOT NEW.id OR OLD.role IS NOT NEW.role OR OLD.caps IS NOT NEW.caps
-      OR (julianday(NEW.last_seen) - julianday(OLD.last_seen)) * 86400 >= 60
+      OR (NEW.last_seen IS NOT NULL AND (OLD.last_seen IS NULL
+          OR (julianday(NEW.last_seen) - julianday(OLD.last_seen)) * 86400 >= 60))
     BEGIN
       INSERT INTO events(kind,agent_id,at)
-      VALUES(CASE WHEN OLD.id IS NOT NEW.id THEN 'rename' ELSE 'presence' END, NEW.id, NEW.last_seen);
+      VALUES(CASE WHEN OLD.id IS NOT NEW.id THEN 'rename' ELSE 'presence' END, NEW.id, coalesce(NEW.last_seen,${NOW_SQL}));
     END;
     CREATE TRIGGER IF NOT EXISTS tokens_ai AFTER INSERT ON tokens BEGIN
-      INSERT INTO events(kind,agent_id,at) VALUES('token',NEW.agent_id,NEW.created_at);
+      INSERT INTO events(kind,agent_id,at) VALUES('token',NEW.agent_id,coalesce(NEW.created_at,${NOW_SQL}));
     END;
-    CREATE TRIGGER IF NOT EXISTS tokens_au AFTER UPDATE OF revoked_at ON tokens BEGIN
+    CREATE TRIGGER IF NOT EXISTS tokens_au AFTER UPDATE OF revoked_at ON tokens
+    WHEN NEW.revoked_at IS NOT NULL BEGIN
       INSERT INTO events(kind,agent_id,at) VALUES('token',NEW.agent_id,NEW.revoked_at);
     END;
   `);
@@ -243,38 +304,26 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
   if (!d.query("SELECT value FROM meta WHERE key='epoch'").get())
     d.run("INSERT INTO meta(key,value) VALUES('epoch',?)", [hex(seams.rng(16))]);
 
-  // one-shot backfill of message_recipients for pre-trigger rows (§4)
-  const backfilled = (d.query("SELECT value FROM meta WHERE key='backfill_recipients'").get() as any) !== null;
-  if (!backfilled) {
-    // one-shot backfill using the same split semantics as the msg_ai CTE (§4 N1)
+  // one-shot backfill: marker re-checked INSIDE the txn (finding 5), and the
+  // split runs through the SAME SPLIT_SQL statement as the trigger (no JS trim).
+  if (!d.query("SELECT value FROM meta WHERE key='backfill_recipients'").get()) {
     d.exec("BEGIN IMMEDIATE");
     try {
-      for (const r of d.query("SELECT id, recipients FROM messages").all() as any[]) {
-        for (const t of splitCsv(String(r.recipients ?? "")))
-          d.run("INSERT INTO message_recipients(msg,target) VALUES(?,?)", [r.id, t]);
+      if (!d.query("SELECT value FROM meta WHERE key='backfill_recipients'").get()) {
+        const splitStmt = d.query(SPLIT_SQL);
+        for (const r of d.query("SELECT id, recipients FROM messages").all() as any[])
+          for (const t of splitStmt.all(String(r.recipients ?? "")) as any[])
+            d.run("INSERT OR IGNORE INTO message_recipients(msg,target) VALUES(?,?)", [r.id, t.tok]);
+        d.run("INSERT OR REPLACE INTO meta(key,value) VALUES('backfill_recipients',?)", [nowIso()]);
       }
-      d.run("INSERT OR REPLACE INTO meta(key,value) VALUES('backfill_recipients',?)", [nowIso()]);
       d.exec("COMMIT");
     } catch (e) { d.exec("ROLLBACK"); throw e; }
   }
 
-  // JS-side mirror of the SQL split (used by backfill + parity tests)
-  function splitCsv(s: string): string[] {
-    const out: string[] = [];
-    let rest = s + ",";
-    while (rest !== "") {
-      const i = rest.indexOf(",");
-      const tok = rest.slice(0, i).trim();
-      rest = rest.slice(i + 1);
-      if (tok !== "") out.push(tok);
-    }
-    return out;
-  }
-
   // ---------- internals ----------
 
-  const isActive = (lastSeen: string) => {
-    const t = Date.parse(lastSeen);
+  const isActive = (lastSeen: string | null) => {
+    const t = lastSeen ? Date.parse(lastSeen) : NaN;
     return Number.isFinite(t) && seams.now().getTime() - t <= PRESENCE_TTL_MS;
   };
 
@@ -283,7 +332,6 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
     const t = nowIso();
     const r = d.run("UPDATE agents SET last_seen=? WHERE id=?", [t, agent]);
     if (r.changes === 0 && mode === "local") {
-      // local-mode auto-register; server mode never auto-creates rows (§3)
       d.run(
         "INSERT OR IGNORE INTO agents(id,role,caps,pid,joined_at,last_seen,meta) VALUES(?,?,?,?,?,?,?)",
         [agent, agent, "", seams.pid(), t, t, "{}"],
@@ -326,84 +374,100 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
     return `---\n${JSON.stringify(fm, null, 2)}\n---\n\n# ${m.subject || m.type}\n\n${m.body}\n`;
   }
 
-  // QUIRK preserved: fname uses a SECOND stamp() call (same frozen-clock value).
-  function insertMessage(m: Omit<MsgRow, "file"> & { as?: string | null }, fname: string): MsgRow {
-    const content = renderMd({ ...m, file: "", meta: m.as ? JSON.stringify({ as: m.as }) : null });
-    const file = seams.mirror(join(MSG_DIR, m.channel), fname, content);
-    d.run(
-      `INSERT INTO messages(id,thread,re,sender,recipients,type,status,tags,subject,body,file,created_at,updated_at,channel,meta)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [m.id, m.thread, m.re, m.sender, m.recipients, m.type, m.status, m.tags, m.subject, m.body,
-       file, m.created_at, m.updated_at, m.channel, m.as ? JSON.stringify({ as: m.as }) : null],
-    );
-    return { ...m, file, meta: m.as ? JSON.stringify({ as: m.as }) : null };
+  // ---------- §5 guards (finding 1: runtime backstop for erased types) ----------
+
+  type AnyCtx = { principal: PrincipalBase & { localRoot?: boolean }; actor: string };
+  function ctxCheck(ctx: AnyCtx): BusError | null {
+    if (mode === "server" && (ctx.principal as any).localRoot === true)
+      return { error: "internal", detail: "local-root principal in server mode (types erased at RPC boundary)" };
+    return null;
   }
+  const isRootCtx = (ctx: AnyCtx) => mode === "local" && (ctx.principal as any).localRoot === true;
+  const hasScope = (ctx: AnyCtx, s: Scope) =>
+    isRootCtx(ctx) || (ctx.principal.scopes as Scope[]).includes(s);
 
   // ---------- commands ----------
 
-  function joinAgent(ctx: Ctx, p: { agent: string; role: string; caps?: string; fingerprint?: string | null }): Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number }> {
+  function joinAgent(ctx: Ctx<M>, p: { agent: string; role: string; caps?: string; fingerprint?: string | null }): Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
     if (!p.agent || !p.role) return { error: "usage", detail: "error: join requires --agent and --role" };
     if (!ID_RE.test(p.agent)) return { error: "usage", detail: `invalid agent id: ${p.agent}` };
-    if (mode === "server" && p.agent !== ctx.principal.agentId)
-      return { error: "forbidden", detail: `agent assertion '${p.agent}' != principal '${ctx.principal.agentId}'` };
     const t = nowIso();
-    const fp = p.fingerprint ?? null;
-    if (fp) {
-      const byFp = d.query("SELECT id FROM agents WHERE fingerprint=?").get(fp) as any;
-      if (byFp && byFp.id !== p.agent)
-        return { error: "identity_conflict", detail:
-          `error: this runtime already joined as '${byFp.id}'. One id per agent.\n` +
-          `  Reconnect as yourself:  --agent ${byFp.id}\n` +
-          `  Or change your name (announces it to @all):  bun comms.ts rename --agent ${byFp.id} --to ${p.agent} --fingerprint <fp>` };
-      const byId = d.query("SELECT fingerprint FROM agents WHERE id=?").get(p.agent) as any;
-      if (byId && byId.fingerprint && byId.fingerprint !== fp)
-        return { error: "identity_conflict", detail: `error: id '${p.agent}' is already claimed by another runtime. Pick a different id, or coordinate a rename.` };
+    if (mode === "server") {
+      // finding 12: assertion id, UPDATE-only (no auto-register), fingerprint IGNORED.
+      if (p.agent !== ctx.principal.agentId)
+        return { error: "forbidden", detail: `agent assertion '${p.agent}' != principal '${ctx.principal.agentId}'` };
+      const r = d.run("UPDATE agents SET role=?, caps=?, last_seen=? WHERE id=?", [p.role, p.caps ?? "", t, p.agent]);
+      if (r.changes === 0)
+        return { error: "not_found", detail: `unknown agent '${p.agent}' — rows are minted by token.create on the server` };
+    } else {
+      const fp = p.fingerprint ?? null;
+      if (fp) {
+        const byFp = d.query("SELECT id FROM agents WHERE fingerprint=?").get(fp) as any;
+        if (byFp && byFp.id !== p.agent)
+          return { error: "identity_conflict", detail:
+            `error: this runtime already joined as '${byFp.id}'. One id per agent.\n` +
+            `  Reconnect as yourself:  --agent ${byFp.id}\n` +
+            `  Or change your name (announces it to @all):  bun comms.ts rename --agent ${byFp.id} --to ${p.agent} --fingerprint <fp>` };
+        const byId = d.query("SELECT fingerprint FROM agents WHERE id=?").get(p.agent) as any;
+        if (byId && byId.fingerprint && byId.fingerprint !== fp)
+          return { error: "identity_conflict", detail: `error: id '${p.agent}' is already claimed by another runtime. Pick a different id, or coordinate a rename.` };
+      }
+      d.run(
+        `INSERT INTO agents(id,role,caps,pid,joined_at,last_seen,meta,fingerprint,kind) VALUES(?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET role=excluded.role, caps=excluded.caps, pid=excluded.pid, last_seen=excluded.last_seen,
+           fingerprint=COALESCE(excluded.fingerprint, agents.fingerprint)`,
+        [p.agent, p.role, p.caps ?? "", seams.pid(), t, t, "{}", fp,
+         (d.query("SELECT kind FROM agents WHERE id=?").get(p.agent) as any)?.kind ?? "agent"],
+      );
     }
-    d.run(
-      `INSERT INTO agents(id,role,caps,pid,joined_at,last_seen,meta,fingerprint,kind) VALUES(?,?,?,?,?,?,?,?,?)
-       ON CONFLICT(id) DO UPDATE SET role=excluded.role, caps=excluded.caps, pid=excluded.pid, last_seen=excluded.last_seen,
-         fingerprint=COALESCE(excluded.fingerprint, agents.fingerprint)`,
-      [p.agent, p.role, p.caps ?? "", mode === "local" ? seams.pid() : null, t, t, "{}", fp,
-       mode === "local" ? "agent" : (d.query("SELECT kind FROM agents WHERE id=?").get(p.agent) as any)?.kind ?? "agent"],
-    );
     const row = d.query("SELECT * FROM agents WHERE id=?").get(p.agent) as AgentRow;
-    const active = listAgents(true);
-    // QUIRK preserved: unresolved count filters sender!=agent only (no status semantics beyond IN list)
     const unresolved = (d.query(
       "SELECT COUNT(*) c FROM messages WHERE status IN ('open','acked','in_progress') AND sender!=?",
     ).get(p.agent) as any).c;
-    return { value: { agent: row, active, unresolved } };
+    return { value: { agent: row, active: listAgents(true), unresolved } };
   }
 
   function listAgents(activeOnly: boolean): AgentRow[] {
     return (d.query("SELECT * FROM agents ORDER BY last_seen DESC, rowid ASC").all() as AgentRow[])
       .filter((r) => !!r.id)
-      .filter((r) => (activeOnly ? isActive(r.last_seen ?? "") : true));
+      .filter((r) => (activeOnly ? isActive(r.last_seen) : true));
   }
 
-  function post(ctx: Ctx, p: {
+  function post(ctx: Ctx<M>, p: {
     from: string; to: string; type: string; subject?: string; body: string;
     thread?: string | null; re?: string | null; tags?: string; channel?: string | null;
     as?: string | null; idempotencyKey?: string | null;
   }): Res<{ id: string; channel: string; thread: string; file: string }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    const rootCtx = isRootCtx(ctx);
     if (!p.from || !p.to) return { error: "usage", detail: "error: post requires --from and --to" };
+
+    // QUIRK restored (finding 14): legacy touched the sender BEFORE validating
+    // type/channel/etc, so a rejected post still registered the agent. Server
+    // mode never auto-registers (touch is UPDATE-only there).
+    if (mode === "local") touch(p.from);
+
+    if (p.as !== null && p.as !== undefined && !ID_RE.test(p.as))
+      return { error: "usage", detail: `invalid as: ${p.as}` }; // finding 3 (B3): before any path join
     if (!ID_RE.test(p.from)) return { error: "usage", detail: `invalid from id: ${p.from}` };
-    if (!MSG_TYPES.includes(p.type as any)) return { error: "usage", detail: `error: --type must be one of ${MSG_TYPES.join(",")}` };
+    if (!MSG_TYPES.includes(p.type as any)) return { error: "usage", detail: `error: --type must be one of ${[...MSG_TYPES].sort()}` };
     if (!TYPE_RE.test(p.type)) return { error: "usage", detail: `invalid type: ${p.type}` };
     if (p.channel !== undefined && p.channel !== null && !ID_RE.test(p.channel))
       return { error: "usage", detail: `invalid channel: ${p.channel}` };
-    if (mode === "server") {
-      if (p.from !== ctx.principal.agentId && !(ctx.principal.scopes.includes("post:as") && p.as))
-        return { error: "forbidden", detail: `from '${p.from}' != principal (needs post:as + as)` };
+
+    if (mode === "server" || !rootCtx) {
+      // finding 2 (B2): `from` is ALWAYS an assertion — even with post:as.
+      // post:as governs `as` only. sender = as-target ?? principal.
+      if (p.from !== ctx.principal.agentId)
+        return { error: "forbidden", detail: `from '${p.from}' must equal authenticated principal` };
       if (p.as && !ctx.principal.scopes.includes("post:as"))
         return { error: "forbidden", detail: "as requires post:as scope" };
     }
-    const t = nowIso();
-    if (mode === "local") touch(p.from);
 
-    // idempotency (§6): same key+hash ⇒ replay; same key+different hash ⇒ conflict
+    const t = nowIso();
     let idem: { key: string; hash: string } | null = null;
-    if (ctx.principal.localRoot !== true && p.idempotencyKey) {
+    if ((mode === "server" || !rootCtx) && p.idempotencyKey) { // finding 1: mode-gated, not localRoot-gated
       const key = String(p.idempotencyKey);
       if (key.length > 128) return { error: "usage", detail: "idempotency key > 128 bytes" };
       const hash = sha256hex(canonicalJson({
@@ -421,7 +485,6 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
       }
     }
 
-    // channel resolution: explicit > inherit thread/parent > general
     let channel: string | null = p.channel ?? null;
     if (!channel) {
       const parentId = p.thread || p.re;
@@ -434,25 +497,30 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
     channel = channel || "general";
     ensureChannel(channel, p.from);
 
-    const sender = p.as ?? p.from;              // §5: sender = as-target (observable)
-    const asAudit = p.as ? ctx.principal.agentId : null; // meta.as = principal
+    const sender = rootCtx ? (p.as ?? p.from) : (p.as || ctx.principal.agentId); // §5: sender = as-target
+    const asAudit = p.as ? ctx.principal.agentId : null;                        // N4: meta.as = principal
     const mid = newId(sender.split("-")[0]);
     const thread = p.thread || mid;
-    const fname = `msg-${stamp()}-${sender}-${p.type}-${mid.split("-").pop()}.md`;
+    let fname = `msg-${stamp()}-${sender}-${p.type}-${mid.split("-").pop()}.md`;
     const m: MsgRow = {
       id: mid, thread, re: p.re ?? null, sender, recipients: p.to,
       type: p.type, status: "open", tags: p.tags ?? "", subject: p.subject ?? "",
       body: p.body, file: "", created_at: t, updated_at: t, channel,
       meta: asAudit ? JSON.stringify({ as: asAudit }) : null,
     };
+    // QUIRK (legacy §10): a dangling --re inserts silently in local mode;
+    // server mode rejects it (contract-pinned divergence for M2).
+    if (p.re && mode === "server") {
+      const reRow = d.query("SELECT id FROM messages WHERE id=?").get(p.re);
+      if (!reRow) return { error: "not_found", detail: `error: re -> unknown message id '${p.re}'` };
+    }
 
-    // insert-first (§9): DB txn commits (message + idempotency + retry on 16-bit
-    // PK collision), THEN mirror write outside the txn.
-    let file = "";
+    // insert-first (§9): DB txn commits (message + idempotency + PK-collision
+    // retry), THEN mirror write outside the txn.
     try {
       d.exec("BEGIN IMMEDIATE");
       try {
-        let id = mid, fname2 = fname, tries = 0;
+        let id = mid, tries = 0;
         for (;;) {
           try {
             d.run(
@@ -461,12 +529,12 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
               [id, thread, m.re, sender, p.to, p.type, "open", m.tags, m.subject, p.body, "", t, t, channel,
                asAudit ? JSON.stringify({ as: asAudit }) : null],
             );
-            m.id = id; m.file = "";
+            m.id = id;
             break;
           } catch (e: any) {
             if (!String(e?.message ?? e).includes("UNIQUE") || ++tries >= 8) throw e;
-            id = newId(sender.split("-")[0]);                       // G12: retry, same format
-            fname2 = `msg-${stamp()}-${sender}-${p.type}-${id.split("-").pop()}.md`;
+            id = newId(sender.split("-")[0]);
+            fname = `msg-${stamp()}-${sender}-${p.type}-${id.split("-").pop()}.md`; // finding 13: fname follows id
           }
         }
         if (idem) {
@@ -477,26 +545,31 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
       } catch (e) { d.exec("ROLLBACK"); throw e; }
     } catch (e: any) {
       const msg = String(e?.message ?? e);
-      if (msg.includes("UNIQUE") && idem) return { error: "conflict", detail: "idempotency key race" };
+      if (msg.includes("UNIQUE") && idem) return { error: "conflict", detail: "idempotency key race (single-writer rule; retry)" };
       if (msg.includes("SQLITE_BUSY") || msg.includes("database is locked")) return { error: "contention", detail: "busy after retries" };
       throw e;
     }
 
     const content = renderMd(m);
     seams.mirror(join(MSG_DIR, channel), fname, content);
-    file = join("messages", channel, fname); // display path, relative to home (old contract)
+    const file = join("messages", channel, fname);
     d.run("UPDATE messages SET file=? WHERE id=?", [file, m.id]);
     m.file = file;
     return { value: { id: m.id, channel, thread, file } };
   }
 
-  function inbox(ctx: Ctx, p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null }): Res<{ rows: MsgRow[]; unreadIds: Set<string> }> {
-    if (mode === "server" && p.agent !== ctx.principal.agentId && !ctx.principal.scopes.includes("read:all"))
+  function inbox(ctx: Ctx<M>, p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean }): Res<{ rows: MsgRow[]; unreadIds: Set<string> }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    const rootCtx = isRootCtx(ctx);
+    if ((mode === "server" || !rootCtx) && p.agent !== ctx.principal.agentId && !hasScope(ctx, "read:all"))
       return { error: "forbidden", detail: "for≠self requires read:all" };
-    const peek = mode === "server" && p.agent !== ctx.principal.agentId; // non-marking peek
-    if (mode === "local" || (!peek && p.agent === ctx.principal.agentId)) touch(p.agent);
+    const peek = !rootCtx && p.agent !== ctx.principal.agentId; // non-marking peek
+    // QUIRK (legacy §10): inbox does NOT mark reads — only `read` does.
+    // mark:true opts in (server consumers use it explicitly).
+    const mark = p.mark === true && !peek;
+    if (mode === "local") touch(p.agent);
     const role = roleOf(p.agent);
-    const rows = d.query("SELECT * FROM messages ORDER BY created_at ASC").all() as MsgRow[];
+    const rows = d.query("SELECT * FROM messages ORDER BY created_at ASC, rowid ASC").all() as MsgRow[];
     const readIds = new Set((d.query("SELECT msg FROM reads WHERE agent=?").all(p.agent) as any[]).map((x) => x.msg));
     const out = rows.filter((r) => {
       if (r.sender === p.agent) return false;
@@ -506,64 +579,76 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
       if (p.unread && readIds.has(r.id)) return false;
       return true;
     });
+    if (mark) for (const r of out) d.run("INSERT OR REPLACE INTO reads(agent,msg,read_at) VALUES(?,?,?)", [p.agent, r.id, nowIso()]);
     return { value: { rows: out, unreadIds: new Set(out.map((r) => r.id).filter((id) => !readIds.has(id))) } };
   }
 
-  function read(ctx: Ctx, p: { agent: string; id: string }): Res<MsgRow & { receipts: Receipts }> {
+  function read(ctx: Ctx<M>, p: { agent: string; id: string }): Res<MsgRow & { receipts: Receipts }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    const rootCtx = isRootCtx(ctx);
+    if ((mode === "server" || !rootCtx) && p.agent !== ctx.principal.agentId && !hasScope(ctx, "read:all"))
+      return { error: "forbidden", detail: "read for another agent requires read:all" }; // finding 2 (B2)
     const r = d.query("SELECT * FROM messages WHERE id=?").get(p.id) as MsgRow | null;
     if (!r) return { error: "not_found", detail: `no such message: ${p.id}` };
     if (mode === "local") touch(p.agent);
-    const peek = mode === "server" && p.agent !== ctx.principal.agentId && ctx.principal.scopes.includes("read:all");
+    const peek = !rootCtx && p.agent !== ctx.principal.agentId; // with read:all: NON-marking peek
     if (!peek) d.run("INSERT OR REPLACE INTO reads(agent,msg,read_at) VALUES(?,?,?)", [p.agent, p.id, nowIso()]);
     return { value: { ...r, receipts: receiptsForMsg(r) } };
   }
 
-  function threadOf(ctx: Ctx, id: string): Res<{ rows: MsgRow[]; receipts: Receipts[] }> {
-    const rows = d.query("SELECT * FROM messages WHERE thread=? OR id=? ORDER BY created_at ASC").all(id, id) as MsgRow[];
+  function threadOf(ctx: Ctx<M>, id: string): Res<{ rows: MsgRow[]; receipts: Receipts[] }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    // QUIRK (legacy): thread = explicit thread OR own id (de4ed3b semantics).
+    const rows = d.query("SELECT * FROM messages WHERE thread=? OR id=? ORDER BY created_at ASC, rowid ASC").all(id, id) as MsgRow[];
     if (!rows.length) return { error: "not_found", detail: `no thread: ${id}` };
     return { value: { rows, receipts: rows.map(receiptsForMsg) } };
   }
 
-  function receipts(ctx: Ctx, id: string): Res<MsgRow & { receipts: Receipts }> {
+  function receipts(ctx: Ctx<M>, id: string): Res<MsgRow & { receipts: Receipts }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
     const r = d.query("SELECT * FROM messages WHERE id=?").get(id) as MsgRow | null;
     if (!r) return { error: "not_found", detail: `no such message: ${id}` };
     return { value: { ...r, receipts: receiptsForMsg(r) } };
   }
 
-  function setStatus(ctx: Ctx, p: { agent: string; id: string; state: string }): Res<{ id: string; status: string }> {
-    if (!STATES.includes(p.state as any)) return { error: "usage", detail: `error: state must be one of ${STATES.join(",")}` };
+  function setStatus(ctx: Ctx<M>, p: { agent: string; id: string; state: string }): Res<{ id: string; status: string }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    const rootCtx = isRootCtx(ctx);
+    // QUIRK restored (finding 14): legacy touched the agent BEFORE validating
+    // state/existence, so a rejected status still registered the agent.
+    const agent = rootCtx ? p.agent : ctx.principal.agentId; // finding B2: server acts AS principal
+    if (mode === "local") touch(agent);
+    if (!STATES.includes(p.state as any)) return { error: "usage", detail: `error: state must be one of ${[...STATES].sort()}` };
     const r = d.query("SELECT * FROM messages WHERE id=?").get(p.id) as MsgRow | null;
     if (!r) return { error: "not_found", detail: `no such message: ${p.id}` };
-    if (mode === "local") touch(p.agent);
-    // §5 status permission: sender OR resolved recipient OR agents:admin
-    const isAdmin = ctx.principal.scopes.includes("agents:admin") || ctx.principal.localRoot === true;
-    if (!isAdmin && r.sender !== p.agent) {
-      const agents = d.query("SELECT id, role FROM agents").all() as any[];
-      const isRecipient = agents.some((a) => a.id === p.agent && recipientsMatch(r.recipients, a.id, a.role))
-        || recipientsMatch(r.recipients, p.agent, roleOf(p.agent));
-      if (!isRecipient) return { error: "forbidden", detail: "status: not sender, not recipient" };
+    if (!rootCtx) {
+      const maySet = agent === r.sender
+        || recipientsMatch(r.recipients, agent, roleOf(agent))
+        || hasScope(ctx, "read:all");
+      if (!maySet) return { error: "forbidden", detail: "status: not sender, not recipient (needs read:all)" };
     }
     d.run("UPDATE messages SET status=?, updated_at=? WHERE id=?", [p.state, nowIso(), p.id]);
     return { value: { id: p.id, status: p.state } };
   }
 
-  function channels(ctx: Ctx): { name: string; n: number; last: string | null; purpose: string | null }[] {
+  function channels(ctx: Ctx<M>): Res<{ name: string; n: number; last: string | null; purpose: string | null }[]> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
     const counts = d.query("SELECT channel name, COUNT(*) n, MAX(created_at) last FROM messages GROUP BY channel").all() as any[];
     const cmap = new Map<string, any>(counts.map((c) => [c.name, c]));
     for (const c of d.query("SELECT name, purpose FROM channels").all() as any[])
       if (!cmap.has(c.name)) cmap.set(c.name, { name: c.name, n: 0, last: null, purpose: c.purpose });
     for (const c of counts) c.purpose = (d.query("SELECT purpose FROM channels WHERE name=?").get(c.name) as any)?.purpose ?? "";
-    return [...cmap.values()].sort((a, b) => String(b.last ?? "").localeCompare(String(a.last ?? "")));
+    return { value: [...cmap.values()].sort((a, b) => String(b.last ?? "").localeCompare(String(a.last ?? ""))) };
   }
 
-  function rename(ctx: Ctx, p: { agent: string; to: string; fingerprint?: string | null }): Res<{ announced: MsgRow }> {
+  function rename(ctx: Ctx<M>, p: { agent: string; to: string; fingerprint?: string | null }): Res<{ announced: MsgRow }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
     if (!p.agent || !p.to) return { error: "usage", detail: "error: rename requires --agent <old> --to <new>" };
-    if (!ID_RE.test(p.to)) return { error: "usage", detail: `invalid new id: ${p.to}` };
+    if (!ID_RE.test(p.agent) || !ID_RE.test(p.to)) return { error: "usage", detail: "invalid id" };
     const old = d.query("SELECT * FROM agents WHERE id=?").get(p.agent) as any;
     if (!old) return { error: "not_found", detail: `error: no such agent '${p.agent}'` };
-    if (mode === "server") {
-      const isAdmin = ctx.principal.scopes.includes("agents:admin");
-      if (p.agent !== ctx.principal.agentId && !isAdmin)
+    if (isRootCtx(ctx) || mode === "server") {
+      if (!isRootCtx(ctx) && p.agent !== ctx.principal.agentId && !hasScope(ctx, "agents:admin"))
         return { error: "forbidden", detail: "renaming others requires agents:admin" };
     } else if (old.fingerprint && old.fingerprint !== (p.fingerprint ?? null)) {
       return { error: "identity_conflict", detail: `error: rename of '${p.agent}' must come from the same runtime (fingerprint mismatch).` };
@@ -579,12 +664,9 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
       type: "announce", status: "open", tags: "identity,rename",
       subject: `Agent rename: ${p.agent} -> ${p.to}`,
       body: `Identity change: ${p.agent} is now ${p.to} (same runtime). Please update routing; historical messages keep sender=${p.agent}.`,
-      file: "", created_at: t, updated_at: t, channel: "general", meta: null,
+      file: join("messages", "general", fname), created_at: t, updated_at: t, channel: "general", meta: null,
     };
-    // QUIRK preserved: mirror written BEFORE the agents UPDATE (announce msg first).
-    seams.mirror(join(MSG_DIR, "general"), fname, renderMd(m));
-    m.file = join("messages", "general", fname);
-    // §4: single transaction — announce + id move + dependent rows
+    // finding 16: mirror AFTER commit — no orphan .md on rollback.
     try {
       d.exec("BEGIN IMMEDIATE");
       try {
@@ -598,64 +680,104 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
         d.run("UPDATE tokens SET agent_id=? WHERE agent_id=?", [p.to, p.agent]);
         d.run("UPDATE cursors SET agent_id=? WHERE agent_id=?", [p.to, p.agent]);
         d.run("UPDATE idempotency SET agent_id=? WHERE agent_id=?", [p.to, p.agent]);
+        d.run("UPDATE events SET agent_id=? WHERE agent_id=?", [p.to, p.agent]);
         d.exec("COMMIT");
       } catch (e) { d.exec("ROLLBACK"); throw e; }
     } catch (e: any) {
       if (String(e?.message ?? e).includes("SQLITE_BUSY")) return { error: "contention", detail: "busy" };
       throw e;
     }
+    seams.mirror(join(MSG_DIR, "general"), fname, renderMd(m));
     return { value: { announced: m } };
   }
 
   // ---------- server-mode token ops (§5) ----------
 
-  function tokenCreate(p: { agent: string; kind?: "agent" | "human" | "service"; scopes?: Scope[]; admin?: boolean }): Res<{ token: string; prefix: string }> {
+  function tokenCreate(ctx: Ctx<M>, p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean }): Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
     if (!ID_RE.test(p.agent)) return { error: "usage", detail: `invalid agent id: ${p.agent}` };
-    const scopes = normalizeScopes(p.admin ? ALL_SCOPES : (p.scopes ?? (p.kind === "human" ? ["read:all"] : [])));
+    const kind = p.kind ?? "agent";
+    const rootCtx = isRootCtx(ctx);
+    // finding 2 (B2): authz — server callers need tokens:admin (humans: the
+    // separate scope); local root is the bootstrap path.
+    if (!rootCtx) {
+      if (!ctx.principal.scopes.includes("tokens:admin"))
+        return { error: "unauthorized", detail: "token.create requires tokens:admin" };
+      if (kind === "human" && !ctx.principal.scopes.includes("tokens:admin:human"))
+        return { error: "unauthorized", detail: "minting human tokens requires tokens:admin:human" };
+    }
+    let scopes: Scope[];
+    if (p.admin) scopes = [...ALL_SCOPES];
+    else if (p.scopes) scopes = p.scopes;
+    else scopes = kind === "human" ? ["read:all"] : [];
+    if (!rootCtx && p.scopes) {
+      // subset rule: cannot mint scopes you don't hold (channel:* is transitive)
+      for (const s of scopes)
+        if (!ctx.principal.scopes.includes(s) && !(s.startsWith("channel:") && ctx.principal.scopes.includes("channel:*" as Scope)))
+          return { error: "unauthorized", detail: `cannot mint scope '${s}' you do not hold` };
+    }
+    const norm = normalizeScopes(scopes);
     const bytes = seams.rng(32);
     const token = "ac_" + b64url(bytes);
     const prefix = token.slice(3, 15);
     const salt = seams.rng(16);
-    const { createHmac } = require("node:crypto") as typeof import("node:crypto");
     const keyHash = createHmac("sha256", Buffer.from(salt)).update(token).digest();
     const t = nowIso();
     try {
       d.exec("BEGIN IMMEDIATE");
       try {
-        const existingAdmin = d.query(
-          "SELECT count(*) c FROM tokens WHERE revoked_at IS NULL AND instr(',' || scopes || ',', ',tokens:admin,') > 0",
-        ).get() as any;
-        if (!existingAdmin.c && p.admin) {
-          // bootstrap via local CLI only; no-op marker for the guard doc
+        // bootstrap guard ACTUALLY aborts (finding 2): second admin needs force.
+        if (norm.split(",").includes("tokens:admin") && !p.force) {
+          const existingAdmin = d.query(
+            "SELECT count(*) c FROM tokens WHERE revoked_at IS NULL AND instr(',' || scopes || ',', ',tokens:admin,') > 0",
+          ).get() as any;
+          if (existingAdmin.c) { d.exec("ROLLBACK"); return { error: "conflict", detail: "bootstrap guard: an admin token already exists (pass force to mint another)" }; }
         }
+        // NOTE (finding 21): on an EXISTING agent row, kind is NOT overwritten —
+        // the row's kind wins; minting a second token never rewrites identity.
         d.run("INSERT OR IGNORE INTO agents(id,role,caps,pid,joined_at,last_seen,meta,kind) VALUES(?,?,?,?,?,?,?,?)",
-          [p.agent, p.agent, "", null, t, t, "{}", p.kind ?? "agent"]);
-        d.run("INSERT INTO tokens(prefix,agent_id,salt,key_hash,scopes,created_at,last_used) VALUES(?,?,?,?,?,?,?)",
-          [prefix, p.agent, salt, keyHash, scopes, t, t]);
+          [p.agent, p.agent, "", null, t, t, "{}", kind]);
+        const r = d.run("INSERT INTO tokens(prefix,agent_id,salt,key_hash,scopes,created_at,last_used) VALUES(?,?,?,?,?,?,?)",
+          [prefix, p.agent, salt, keyHash, norm, t, t]);
         d.exec("COMMIT");
+        return { value: { id: Number(r.lastInsertRowid), token, prefix, agentId: p.agent, scopes: norm } };
       } catch (e) { d.exec("ROLLBACK"); throw e; }
     } catch (e: any) {
       if (String(e?.message ?? e).includes("UNIQUE")) return { error: "conflict", detail: "prefix collision (60-bit; retry)" };
       throw e;
     }
-    return { value: { token, prefix } };
   }
 
-  function tokenVerify(token: string): Res<{ agentId: string; scopes: Scope[]; kind: string }> {
-    if (!token.startsWith("ac_") || token.length < 20) return { error: "forbidden", detail: "malformed token" };
+  function tokenVerify(token: string): Res<{ agentId: string; scopes: Scope[]; kind: "agent" | "human"; tokenId: number }> {
+    if (!token.startsWith("ac_") || token.length < 20) return { error: "unauthorized", detail: "malformed token" };
     const prefix = token.slice(3, 15);
     const row = d.query("SELECT * FROM tokens WHERE prefix=? AND revoked_at IS NULL").get(prefix) as any;
-    if (!row) return { error: "forbidden", detail: "unknown or revoked token" };
-    const { createHmac, timingSafeEqual } = require("node:crypto") as typeof import("node:crypto");
+    if (!row) return { error: "unauthorized", detail: "unknown or revoked token" };
     const digest = createHmac("sha256", Buffer.from(row.salt)).update(token).digest();
     if (digest.length !== row.key_hash.length || !timingSafeEqual(digest, Buffer.from(row.key_hash)))
-      return { error: "forbidden", detail: "bad token" };
-    const kind = (d.query("SELECT kind FROM agents WHERE id=?").get(row.agent_id) as any)?.kind ?? "agent";
-    return { value: { agentId: row.agent_id, scopes: csv(row.scopes) as Scope[], kind } };
+      return { error: "unauthorized", detail: "bad token" };
+    const kind = ((d.query("SELECT kind FROM agents WHERE id=?").get(row.agent_id) as any)?.kind ?? "agent") as "agent" | "human";
+    return { value: { agentId: row.agent_id, scopes: normalizeScopes(csv(row.scopes)).split(",") as Scope[], kind, tokenId: row.id } }; // finding 20: tokenId
+  }
+
+  function tokenList(ctx: Ctx<M>): Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; created_at: string; last_used: string; revoked_at: string | null }[] }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    if (!isRootCtx(ctx) && !ctx.principal.scopes.includes("tokens:admin"))
+      return { error: "unauthorized", detail: "token.list requires tokens:admin" };
+    const rows = d.query("SELECT * FROM tokens ORDER BY id").all() as any[];
+    return { value: { tokens: rows.map((r) => ({ id: r.id, agentId: r.agent_id, kind: r.kind, prefix: r.prefix, scopes: normalizeScopes(csv(r.scopes)).split(",") as Scope[], created_at: r.created_at, last_used: r.last_used, revoked_at: r.revoked_at })) } };
+  }
+
+  function tokenRevoke(ctx: Ctx<M>, p: { id: number }): Res<{ revoked: boolean }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    if (!isRootCtx(ctx) && !ctx.principal.scopes.includes("tokens:admin"))
+      return { error: "unauthorized", detail: "token.revoke requires tokens:admin" };
+    const r = d.run("UPDATE tokens SET revoked_at=? WHERE id=? AND revoked_at IS NULL", [nowIso(), p.id]);
+    if (r.changes === 0) return { error: "not_found", detail: `no active token ${p.id}` };
+    return { value: { revoked: true } };
   }
 
   function tokenTouch(id: number) {
-    // debounced ≤1/min (§9)
     const row = d.query("SELECT last_used FROM tokens WHERE id=?").get(id) as any;
     if (!row) return;
     const prev = Date.parse(row.last_used);
@@ -665,71 +787,140 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
 
   // ---------- cursors (§6) ----------
 
-  function cursorGet(agentId: string, consumer: string): { epoch: string; seq: number } {
-    const epoch = (d.query("SELECT value FROM meta WHERE key='epoch'").get() as any).value;
-    const row = d.query("SELECT epoch, last_seq FROM cursors WHERE agent_id=? AND consumer=?").get(agentId, consumer) as any;
-    if (!row || row.epoch !== epoch) return { epoch, seq: 0 };
-    return { epoch, seq: row.last_seq };
+  function epoch(): string {
+    return (d.query("SELECT value FROM meta WHERE key='epoch'").get() as any).value;
+  }
+  function gcFloor(): number {
+    return Number((d.query("SELECT value FROM meta WHERE key='gc_floor'").get() as any)?.value ?? 0);
   }
 
-  function cursorSet(agentId: string, consumer: string, epoch: string, seq: number, force = false): Res<null> {
+  function cursorGet(agentId: string, consumer: string): { epoch: string; seq: number } {
+    const e = epoch();
+    const row = d.query("SELECT epoch, last_seq FROM cursors WHERE agent_id=? AND consumer=?").get(agentId, consumer) as any;
+    if (!row || row.epoch !== e) return { epoch: e, seq: 0 };
+    return { epoch: e, seq: row.last_seq };
+  }
+
+  function cursorSet(agentId: string, consumer: string, ep: string, seq: number, force = false): Res<null> {
+    if (!Number.isFinite(seq) || !/^[0-9a-f]{8,64}$/.test(ep))
+      return { error: "usage", detail: "cursor must be <hex-epoch>.<int-seq>" };
+    const e = epoch();
+    if (ep !== e) return { error: "resync", detail: "epoch mismatch; resync required", data: { resync: true, epoch: e } };
+    if (seq < gcFloor()) return { error: "resync", detail: `cursor below retention floor`, data: { resync: true, epoch: e, floor: gcFloor() } };
     const cur = cursorGet(agentId, consumer);
-    if (epoch !== cur.epoch && !force) return { error: "not_found", detail: "epoch mismatch; resync required" };
     if (!force && seq < cur.seq) return { error: "conflict", detail: "cursor not monotonic (use force)" };
     d.run("INSERT INTO cursors(agent_id,consumer,epoch,last_seq) VALUES(?,?,?,?) ON CONFLICT(agent_id,consumer) DO UPDATE SET epoch=excluded.epoch,last_seq=excluded.last_seq",
-      [agentId, consumer, epoch, seq]);
+      [agentId, consumer, ep, seq]);
     return { value: null };
   }
 
   // ---------- streaming/history (§6) ----------
 
-  function history(ctx: Ctx, p: { channel?: string | null; limit?: number }): Res<{ rows: MsgRow[]; cursor: { epoch: string; seq: number } }> {
-    if (mode === "server" && !ctx.principal.scopes.includes("read:all"))
+  function history(ctx: Ctx<M>, p: { channel?: string | null; limit?: number; since?: string }): Res<{ rows: MsgRow[]; hasMore: boolean; cursor: { epoch: string; seq: number } }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    if (!isRootCtx(ctx) && !ctx.principal.scopes.includes("read:all"))
       return { error: "forbidden", detail: "history requires read:all" };
-    const limit = Math.min(p.limit ?? 100, 500);
-    // same read txn for rows + high-water cursor (§6 nit):
+    const limit = Math.min(Math.max(p.limit ?? 200, 1), 1000);
+    let seqFrom = 0;
+    if (p.since) {
+      const m = /^([0-9a-f]{8,64})\.(\d+)$/.exec(p.since);
+      if (!m) return { error: "usage", detail: "since must be <epoch>.<seq>" };
+      if (m[1] !== epoch()) return { error: "resync", detail: "epoch mismatch", data: { resync: true, epoch: epoch() } };
+      seqFrom = Number(m[2]);
+    }
+    // finding 8: NEWEST page + cursor of last DELIVERED event + has_more — no hole.
     d.exec("BEGIN");
     try {
-      const rows = (p.channel
-        ? d.query("SELECT * FROM messages WHERE channel=? ORDER BY created_at ASC LIMIT ?")
-        : d.query("SELECT * FROM messages ORDER BY created_at ASC LIMIT ?")) as any;
-      const got = (p.channel ? rows.all(p.channel, limit) : rows.all(limit)) as MsgRow[];
-      const hw = (d.query("SELECT coalesce(max(seq),0) m FROM events").get() as any).m;
-      const epoch = (d.query("SELECT value FROM meta WHERE key='epoch'").get() as any).value;
+      const evs = (p.channel
+        ? d.query(`SELECT e.seq,e.msg_id FROM events e JOIN messages m ON m.id=e.msg_id WHERE e.kind='msg' AND e.seq>? AND m.channel=? ORDER BY e.seq DESC LIMIT ?`)
+        : d.query(`SELECT seq,msg_id FROM events WHERE kind='msg' AND seq>? ORDER BY seq DESC LIMIT ?`)) as any;
+      const got = (p.channel ? evs.all(seqFrom, p.channel, limit + 1) : evs.all(seqFrom, limit + 1)) as { seq: number; msg_id: string }[];
+      const hasMore = got.length > limit;
+      const page = got.slice(0, limit).reverse();
+      const rows = page.map((e) => d.query("SELECT * FROM messages WHERE id=?").get(e.msg_id) as MsgRow).filter(Boolean);
+      const lastSeq = page.length ? page[page.length - 1].seq : seqFrom;
       d.exec("COMMIT");
-      return { value: { rows: got, cursor: { epoch, seq: hw } } };
+      return { value: { rows, hasMore, cursor: { epoch: epoch(), seq: lastSeq } }, cursor: `${epoch()}.${lastSeq}` };
     } catch (e) { d.exec("ROLLBACK"); throw e; }
+  }
+
+  /** finding 9/11: the inboxWait SCAN lives here — server-reachable, fully
+   *  asserted (read:all gate, epoch check, malformed cursor). The wait LOOP
+   *  (backoff) is transport-side via seams.sleep. */
+  function waitStep(ctx: Ctx<M>, p: { for?: string; consumer?: string; since?: string }): Res<{ messages: MsgRow[]; cursor: string; done: boolean }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    const target = p.for ?? ctx.principal.agentId;
+    if (target !== ctx.principal.agentId && !hasScope(ctx, "read:all"))
+      return { error: "forbidden", detail: "inbox.wait for another agent requires read:all" };
+    const consumer = p.consumer ?? "default";
+    let ep = epoch(); let seq: number;
+    if (p.since) {
+      const m = /^([0-9a-f]{8,64})\.(\d+)$/.exec(p.since);
+      if (!m) return { error: "usage", detail: "since must be <epoch>.<seq>" };
+      if (m[1] !== ep) return { error: "resync", detail: "since epoch mismatch", data: { resync: true, epoch: ep } };
+      seq = Number(m[2]);
+    } else {
+      const c = cursorGet(ctx.principal.agentId, consumer);
+      ep = c.epoch; seq = c.seq;
+      if (seq < gcFloor()) return { error: "resync", detail: "cursor below retention floor", data: { resync: true, epoch: ep, floor: gcFloor() } };
+    }
+    const role = roleOf(target);
+    const messages: MsgRow[] = [];
+    let cur = seq;
+    for (const e of tailEvents(seq, 500)) {
+      cur = e.seq;
+      if (e.kind !== "msg" || !e.msg_id) continue;
+      const m = d.query("SELECT * FROM messages WHERE id=?").get(e.msg_id) as MsgRow | null;
+      if (m && m.sender !== target && recipientsMatch(m.recipients, target, role)) messages.push(m);
+    }
+    return { value: { messages, cursor: `${ep}.${cur}`, done: messages.length > 0 } };
   }
 
   function tailEvents(afterSeq: number, limit = 200): { seq: number; kind: string; msg_id: string | null; agent_id: string | null; at: string }[] {
     return d.query("SELECT seq,kind,msg_id,agent_id,at FROM events WHERE seq>? ORDER BY seq LIMIT ?").all(afterSeq, limit) as any;
   }
 
-  function epoch(): string {
-    return (d.query("SELECT value FROM meta WHERE key='epoch'").get() as any).value;
-  }
-
   function rotateEpoch(): string {
     const e = hex(seams.rng(16));
     d.run("INSERT INTO meta(key,value) VALUES('epoch',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [e]);
+    d.run("INSERT INTO meta(key,value) VALUES('gc_floor','0') ON CONFLICT(key) DO UPDATE SET value='0'");
     return e;
   }
 
-  function gc(): { events: number; idempotency: number } {
-    const cutE = new Date(seams.now().getTime() - 30 * 86400_000).toISOString();
-    const cutI = new Date(seams.now().getTime() - 86400_000).toISOString();
-    const a = d.run("DELETE FROM events WHERE at < ? AND seq > (SELECT coalesce(min(seq),0) FROM events)", [cutE]);
-    const b = d.run("DELETE FROM idempotency WHERE created_at < ?", [cutI]);
-    return { events: a.changes, idempotency: b.changes };
+  function gc(): { events: number; idempotency: number; floor: number } {
+    return db_txn(() => {
+      const cutE = new Date(seams.now().getTime() - 30 * 86400_000).toISOString().replace(/\.\d{3}Z$/, "Z");
+      const cutI = new Date(seams.now().getTime() - 86400_000).toISOString().replace(/\.\d{3}Z$/, "Z");
+      const maxDel = (d.query("SELECT coalesce(max(seq),0) m FROM events WHERE at < ?").get(cutE) as any).m;
+      const a = d.run("DELETE FROM events WHERE at < ? AND seq <= ?", [cutE, maxDel]);
+      if (a.changes > 0) // finding 7: floor advances so stale cursors RESYNC, never skip silently
+        d.run("INSERT INTO meta(key,value) VALUES('gc_floor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [String(maxDel)]);
+      const b = d.run("DELETE FROM idempotency WHERE created_at < ?", [cutI]);
+      return { events: a.changes, idempotency: b.changes, floor: Number(maxDel) };
+    });
   }
 
   function preflight(): { badIds: string[]; badChannels: string[] } {
     const badIds = (d.query("SELECT DISTINCT id FROM agents").all() as any[])
-      .map((r) => r.id).filter((id) => id && !ID_RE.test(id));
+      .map((r) => r.id).filter((id: string) => id && !ID_RE.test(id));
     const badChannels = (d.query("SELECT DISTINCT sender FROM messages").all() as any[])
-      .map((r) => r.sender).filter((s) => s && !ID_RE.test(s))
-      .concat((d.query("SELECT name FROM channels").all() as any[]).map((r) => r.name).filter((n) => n && !ID_RE.test(n)));
+      .map((r) => r.sender).filter((s: string) => s && !ID_RE.test(s))
+      .concat((d.query("SELECT name FROM channels").all() as any[]).map((r) => r.name).filter((n: string) => n && !ID_RE.test(n)));
     return { badIds, badChannels: [...new Set(badChannels)] };
+  }
+
+  // local watch helpers (finding 9: no SQL above the core)
+  function allMessages(): MsgRow[] {
+    return d.query("SELECT * FROM messages ORDER BY created_at ASC, rowid ASC").all() as MsgRow[];
+  }
+  function allMessageIds(): string[] {
+    return (d.query("SELECT id FROM messages").all() as any[]).map((r) => r.id);
+  }
+
+  function db_txn<T>(fn: () => T): T {
+    d.exec("BEGIN IMMEDIATE");
+    try { const v = fn(); d.exec("COMMIT"); return v; }
+    catch (e) { d.exec("ROLLBACK"); throw e; }
   }
 
   function close() { d.close(); }
@@ -737,8 +928,9 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
   return {
     db: d, home, mode, seams, DB_PATH, MSG_DIR, nowIso, stamp, newId,
     joinAgent, listAgents, post, inbox, read, threadOf, receipts, setStatus, channels, rename,
-    tokenCreate, tokenVerify, tokenTouch,
-    cursorGet, cursorSet, history, tailEvents, epoch, rotateEpoch, gc, preflight,
+    tokenCreate, tokenVerify, tokenList, tokenRevoke, tokenTouch,
+    cursorGet, cursorSet, history, waitStep, tailEvents, epoch, gcFloor, rotateEpoch, gc, preflight,
+    allMessages, allMessageIds, ensureChannel,
     isActive, recipientsMatch, roleOf, receiptsForMsg, renderMd, touch, close,
   };
 }
@@ -747,5 +939,9 @@ function hex(b: Uint8Array) { return Array.from(b, (x) => x.toString(16).padStar
 function b64url(b: Uint8Array) {
   return btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
-
-export { csv, recipientsMatch };
+export function localCtx(actor: string): Ctx<"local"> {
+  return { principal: { agentId: actor, kind: "agent", scopes: [...ALL_SCOPES], localRoot: true }, actor };
+}
+export function serverCtx(agentId: string, scopes: Scope[] = [], kind: "agent" | "human" = "agent", cred?: Cred): Ctx<"server"> {
+  return { principal: { agentId, kind, scopes }, actor: agentId, cred };
+}

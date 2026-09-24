@@ -32,21 +32,30 @@ export const defaultSeams: Seams = {
   },
 };
 
-/** Test seam: frozen instant + seeded LCG bytes + fixed pid + in-memory mirror. */
+/** Test seam: frozen instant + fixed pid (+ optional seeded rng for IN-PROCESS
+ *  tests only — a seeded LCG resets per process, so two CLI invocations would
+ *  mint identical ids and collide; the golden harness therefore keeps rng real
+ *  and masks the suffix instead). */
 export function testSeams(opts: { at?: string; seed?: number; pid?: number; files?: Map<string, string> }): Seams {
   const t = Date.parse(opts.at ?? "2026-01-02T03:04:05.000Z");
   let s = opts.seed ?? 1;
   const files = opts.files ?? new Map<string, string>();
   return {
     now: () => new Date(t),
-    rng: (n) => {
-      const a = new Uint8Array(n);
-      for (let i = 0; i < n; i++) s = (s * 1103515245 + 12345) & 0x7fffffff, a[i] = (s >>> 16) & 0xff;
-      return a;
-    },
+    rng: opts.seed === undefined
+      ? (n) => crypto.getRandomValues(new Uint8Array(n))
+      : (n) => {
+          const a = new Uint8Array(n);
+          for (let i = 0; i < n; i++) s = (s * 1103515245 + 12345) & 0x7fffffff, a[i] = (s >>> 16) & 0xff;
+          return a;
+        },
     pid: () => opts.pid ?? 4242,
     mirror: (dir, fname, content) => {
+      // write to disk (the CLI golden harness snapshots real files) AND record
+      // in the map when one is supplied (in-process assertions)
+      mkdirSync(dir, { recursive: true });
       const path = join(dir, fname);
+      writeFileSync(path, content);
       files.set(path, content);
       return path;
     },

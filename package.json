@@ -11,7 +11,9 @@
   },
   "scripts": {
     "comms": "bun bin/comms.ts",
-    "dashboard": "bun bin/dashboard.ts --port 8787"
+    "dashboard": "bun bin/dashboard.ts --port 8787",
+    "test": "bun test && bunx tsc -p tsconfig.json",
+    "typecheck": "bunx tsc -p tsconfig.json"
   },
   "engines": {
     "bun": ">=1.3.0"
@@ -19,5 +21,9 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/onchainapps/agent-comms.git"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
   }
 }

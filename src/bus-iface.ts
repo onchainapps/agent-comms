@@ -1,100 +1,144 @@
 /**
  * interface Bus — the seam that keeps dual mode honest (RFC-001 §3).
- * LocalBus wraps the sync core; RpcBus (M2) speaks HTTP. ONE contract suite
- * (tests/contract.ts) runs against every implementation in CI.
+ *
+ * A BusHandle hands out Sessions bound to a credential (finding 10a: the
+ * interface is transport-implementable — RpcBus holds nothing but {url, token}).
+ * wrapSession(core, ctx) is the SAME adapter the M2 server uses after token
+ * verification: one code path, zero drift. Methods are async so RpcBus
+ * implements the identical interface over fetch; LocalBus resolves immediately.
+ * EVERY method returns Res (finding 10b: transports must represent failures).
+ * ONE contract suite (tests/contract.suite.ts) runs against every impl.
  */
-import { openBus, localCtx, type Bus, type Ctx, type MsgRow, type Receipts, type AgentRow, type Res, type Scope } from "./bus.ts";
+import { openBus, localCtx, serverCtx, type Bus, type Ctx, type Mode, type MsgRow, type Receipts, type AgentRow, type Res, type Scope, type Cred } from "./bus.ts";
 
-export interface BusInterface {
-  joinAgent(ctx: Ctx, p: { agent: string; role: string; caps?: string; fingerprint?: string | null }): Promise<Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number }>>;
-  listAgents(activeOnly: boolean): Promise<AgentRow[]>;
-  post(ctx: Ctx, p: { from: string; to: string; type: string; subject?: string; body: string; thread?: string | null; re?: string | null; tags?: string; channel?: string | null; as?: string | null; idempotencyKey?: string | null }): Promise<Res<{ id: string; channel: string; thread: string; file: string }>>;
-  inbox(ctx: Ctx, p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null }): Promise<Res<{ rows: MsgRow[]; unreadIds: string[] }>>;
-  read(ctx: Ctx, p: { agent: string; id: string }): Promise<Res<MsgRow & { receipts: Receipts }>>;
-  threadOf(ctx: Ctx, id: string): Promise<Res<{ rows: MsgRow[]; receipts: Receipts[] }>>;
-  receipts(ctx: Ctx, id: string): Promise<Res<MsgRow & { receipts: Receipts }>>;
-  setStatus(ctx: Ctx, p: { agent: string; id: string; state: string }): Promise<Res<{ id: string; status: string }>>;
-  channels(ctx: Ctx): Promise<{ name: string; n: number; last: string | null; purpose: string | null }[]>;
-  rename(ctx: Ctx, p: { agent: string; to: string; fingerprint?: string | null }): Promise<Res<{ announced: MsgRow }>>;
-  history(ctx: Ctx, p: { channel?: string | null; limit?: number }): Promise<Res<{ rows: MsgRow[]; cursor: { epoch: string; seq: number } }>>;
-  inboxWait(ctx: Ctx, p: { for?: string; consumer?: string; since?: string; timeout?: number }): Promise<Res<{ messages: MsgRow[]; cursor: string }>>;
-  cursorGet(ctx: Ctx, p: { consumer?: string }): Promise<{ epoch: string; seq: number }>;
-  cursorSet(ctx: Ctx, p: { consumer: string; cursor: string; force?: boolean }): Promise<Res<null>>;
-  /** admin/test primitive: token.create mints the agent row + a token, then join sets role.
-   *  RpcBus implements it with token.create + join under the minted token. */
-  seedAgent(root: Ctx, id: string, role: string, scopes?: Scope[]): Promise<Res<Ctx>>;
-  close(): Promise<void>;
+export interface Session {
+  readonly agentId: string;
+  joinAgent(p: { agent: string; role: string; caps?: string; fingerprint?: string | null }): Promise<Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number }>>;
+  listAgents(activeOnly: boolean): Promise<Res<AgentRow[]>>;
+  post(p: { from: string; to: string; type: string; subject?: string; body: string; thread?: string | null; re?: string | null; tags?: string; channel?: string | null; as?: string | null; idempotencyKey?: string | null }): Promise<Res<{ id: string; channel: string; thread: string; file: string }>>;
+  inbox(p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean }): Promise<Res<{ rows: MsgRow[]; unreadIds: string[] }>>;
+  read(p: { agent: string; id: string }): Promise<Res<MsgRow & { receipts: Receipts }>>;
+  threadOf(id: string): Promise<Res<{ rows: MsgRow[]; receipts: Receipts[] }>>;
+  receipts(id: string): Promise<Res<MsgRow & { receipts: Receipts }>>;
+  setStatus(p: { agent: string; id: string; state: string }): Promise<Res<{ id: string; status: string }>>;
+  channels(): Promise<Res<{ name: string; n: number; last: string | null; purpose: string | null }[]>>;
+  rename(p: { agent: string; to: string; fingerprint?: string | null }): Promise<Res<{ announced: MsgRow }>>;
+  history(p: { channel?: string | null; limit?: number; since?: string }): Promise<Res<{ rows: MsgRow[]; hasMore: boolean; cursor: { epoch: string; seq: number } }>>;
+  waitStep(p: { for?: string; consumer?: string; since?: string }): Promise<Res<{ messages: MsgRow[]; cursor: string; done: boolean }>>;
+  cursorGet(p: { consumer?: string }): Promise<Res<{ epoch: string; seq: number }>>;
+  cursorSet(p: { consumer: string; cursor: string; force?: boolean }): Promise<Res<null>>;
+  tokenCreate(p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean }): Promise<Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string }>>;
+  tokenList(): Promise<Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; created_at: string; last_used: string; revoked_at: string | null }[] }>>;
+  tokenRevoke(p: { id: number }): Promise<Res<{ revoked: boolean }>>;
 }
 
-export class LocalBus implements BusInterface {
-  constructor(private bus: Bus) {}
-  static open(opts: Parameters<typeof openBus>[0]): LocalBus { return new LocalBus(openBus(opts)); }
+export interface BusHandle {
+  readonly mode: Mode;
+  /** cred binds the session to a credential. Local handle: no cred ⇒ root
+   *  (the CLI is its own authority); {token} ⇒ same resolution as the server. */
+  session(cred?: Cred): Session;
+  /** typed credential resolution for transports (finding 10c): a bad token is
+   *  a Res error (→ -32001), not an exception. */
+  resolve(cred: Cred): Res<Session>;
+  close(): void;
+}
 
-  async joinAgent(ctx: Ctx, p: any) { return this.bus.joinAgent(ctx, p); }
-  async listAgents(activeOnly: boolean) { return this.bus.listAgents(activeOnly); }
-  async post(ctx: Ctx, p: any) {
-    const r = await this.bus.post(ctx, p);
-    return r.error ? r : { value: { ...r.value } };
+/** Wrap an already-resolved ctx over the core as a Session — used by LocalBus
+ *  AND by the M2 server post-token-verification (one adapter, no drift).
+ *  The `as never` casts only satisfy tsc's deferred conditional when M is
+ *  generic (Bus<M> methods take Ctx<M>); the ctx reaching here is always the
+ *  mode-correct one (serverCtx/localCtx constructors + ServerOnly param types). */
+export function wrapSession<M extends Mode>(bus: Bus<M>, ctx: Ctx<M>): Session {
+  const a = <T>(r: Res<T>) => Promise.resolve(r);
+  const c = ctx as never;
+  return {
+    agentId: ctx.principal.agentId,
+    joinAgent: (p) => a(bus.joinAgent(c, p)),
+    listAgents: (activeOnly) => a({ value: bus.listAgents(activeOnly) }),
+    post: (p) => a(bus.post(c, p)),
+    inbox: (p) => {
+      const r = bus.inbox(c, p);
+      return Promise.resolve(r.error ? r : { value: { rows: r.value.rows, unreadIds: [...r.value.unreadIds] } });
+    },
+    read: (p) => a(bus.read(c, p)),
+    threadOf: (id) => a(bus.threadOf(c, id)),
+    receipts: (id) => a(bus.receipts(c, id)),
+    setStatus: (p) => a(bus.setStatus(c, p)),
+    channels: () => a(bus.channels(c)),
+    rename: (p) => a(bus.rename(c, p)),
+    history: (p) => a(bus.history(c, p)),
+    waitStep: (p) => a(bus.waitStep(c, p)),
+    cursorGet: (p) => a({ value: bus.cursorGet(ctx.principal.agentId, p.consumer ?? "default") }),
+    cursorSet: (p) => {
+      const m = /^([0-9a-f]{8,64})\.(\d+)$/.exec(p.cursor);
+      if (!m) return Promise.resolve({ error: "usage" as const, detail: "cursor must be <epoch>.<seq>" });
+      return a(bus.cursorSet(ctx.principal.agentId, p.consumer, m[1], Number(m[2]), p.force));
+    },
+    tokenCreate: (p) => a(bus.tokenCreate(c, p)),
+    tokenList: () => a(bus.tokenList(c)),
+    tokenRevoke: (p) => a(bus.tokenRevoke(c, p)),
+  };
+}
+
+/** Local-mode handle: session() = root (CLI is its own authority);
+ *  session({token}) = verified token — same resolution path as the server. */
+export class LocalBus implements BusHandle {
+  private constructor(private core: Bus<"local">) {}
+  static open(opts: { home: string; seams?: Parameters<typeof openBus>[0]["seams"] }): LocalBus {
+    return new LocalBus(openBus({ ...opts, mode: "local" }));
   }
-  async inbox(ctx: Ctx, p: any) {
-    const r = this.bus.inbox(ctx, p);
-    return r.error ? r : { value: { rows: r.value.rows, unreadIds: [...r.value.unreadIds] } };
-  }
-  async read(ctx: Ctx, p: any) { return this.bus.read(ctx, p); }
-  async threadOf(ctx: Ctx, id: string) { return this.bus.threadOf(ctx, id); }
-  async receipts(ctx: Ctx, id: string) { return this.bus.receipts(ctx, id); }
-  async setStatus(ctx: Ctx, p: any) { return this.bus.setStatus(ctx, p); }
-  async channels(ctx: Ctx) { return this.bus.channels(ctx); }
-  async rename(ctx: Ctx, p: any) { return this.bus.rename(ctx, p); }
-  async history(ctx: Ctx, p: any) { return this.bus.history(ctx, p); }
-  async inboxWait(ctx: Ctx, p: { for?: string; consumer?: string; since?: string; timeout?: number }) {
-    // local impl: resolve cursor, poll until messages or timeout (seams-free fast path)
-    const consumer = p.consumer ?? "default";
-    const target = p.for ?? ctx.actor;
-    const cur = p.since ? parseCursor(p.since) : this.bus.cursorGet(ctx.principal.agentId, consumer);
-    const deadline = Date.now() + Math.min(p.timeout ?? 30, 60) * 1000;
-    for (;;) {
-      const last = this.bus.tailEvents(cur.seq, 500);
-      const msgs: MsgRow[] = [];
-      let seq = cur.seq;
-      for (const e of last) {
-        seq = e.seq;
-        if (e.kind !== "msg" || !e.msg_id) continue;
-        const m = this.bus.db.query("SELECT * FROM messages WHERE id=?").get(e.msg_id) as MsgRow | null;
-        if (m && m.sender !== target && this.bus.recipientsMatch(m.recipients, target, this.bus.roleOf(target)))
-          msgs.push(m);
-      }
-      if (msgs.length || Date.now() >= deadline)
-        return { value: { messages: msgs, cursor: `${cur.epoch}.${seq}` } };
-      await Bun.sleep(250);
-    }
-  }
-  async cursorGet(ctx: Ctx, p: { consumer?: string }) {
-    return this.bus.cursorGet(ctx.principal.agentId, p.consumer ?? "default");
-  }
-  async cursorSet(ctx: Ctx, p: { consumer: string; cursor: string; force?: boolean }) {
-    const { epoch, seq } = parseCursor(p.cursor);
-    return this.bus.cursorSet(ctx.principal.agentId, p.consumer, epoch, seq, p.force);
-  }
-  async seedAgent(root: Ctx, id: string, role: string, scopes: Scope[] = []) {
-    const tc = this.bus.tokenCreate({ agent: id, scopes });
-    if (tc.error) return tc;
-    const v = this.bus.tokenVerify(tc.value.token);
+  readonly mode = "local" as const;
+  resolve(cred: Cred): Res<Session> {
+    if (!("token" in cred)) return { error: "unauthorized", detail: "session cookie not supported on a local bus" };
+    const v = this.core.tokenVerify(cred.token);
     if (v.error) return v;
-    const ctx: Ctx = { principal: { agentId: v.value.agentId, kind: v.value.kind as any, scopes: v.value.scopes }, actor: v.value.agentId };
-    const j = this.bus.joinAgent(ctx, { agent: id, role });
-    if (j.error) return j;
-    return { value: ctx };
+    return { value: wrapSession(this.core, serverCtx(v.value.agentId, v.value.scopes, v.value.kind, cred)) };
   }
-  async close() { this.bus.close(); }
-  /** escape hatch for local-only admin ops (bootstrap, backup) */
-  get raw(): Bus { return this.bus; }
+  session(cred?: Cred): Session {
+    if (!cred) return wrapSession(this.core, localCtx("local"));
+    const r = this.resolve(cred);
+    if (r.error) throw new Error(r.detail);
+    return r.value;
+  }
+  close() { this.core.close(); }
+  /** test/admin escape hatch (bootstrap, backup) — local handles only */
+  get raw(): Bus<"local"> { return this.core; }
 }
 
-function parseCursor(c: string): { epoch: string; seq: number } {
-  const i = c.lastIndexOf(".");
-  return { epoch: c.slice(0, i), seq: Number(c.slice(i + 1)) };
+/** Server-mode handle over the core: every session is credential-bound and
+ *  resolved via tokenVerify on EVERY request (finding: rename rewrites
+ *  tokens.agent_id, so a cached principal would go stale). */
+export function serverHandle(core: Bus<"server">): BusHandle & { raw: Bus<"server"> } {
+  return {
+    mode: "server" as const,
+    raw: core,
+    resolve(cred: Cred): Res<Session> {
+      if (!("token" in cred)) return { error: "unauthorized", detail: "server sessions require a token credential" };
+      const v = core.tokenVerify(cred.token);
+      if (v.error) return v;
+      return { value: wrapSession(core, serverCtx(v.value.agentId, v.value.scopes, v.value.kind, cred)) };
+    },
+    session(cred?: Cred): Session {
+      if (!cred) throw new Error("server sessions require a token credential");
+      const r = this.resolve(cred);
+      if (r.error) throw new Error(r.detail);
+      return r.value;
+    },
+    close(): void { core.close(); },
+  };
 }
 
-export { localCtx };
-export type { Ctx, Scope };
+/** Transport-independent admin/test primitive (§5 bootstrap path):
+ *  root.token.create mints the agent row + token, then join under the MINTED
+ *  credential sets the role. Returns the credential too (finding 10a). */
+export async function seedAgent(handle: BusHandle, root: Session, id: string, role: string, scopes: Scope[] = []): Promise<Res<{ session: Session; token: string }>> {
+  const tc = await root.tokenCreate({ agent: id, scopes });
+  if (tc.error) return tc;
+  const session = handle.session({ token: tc.value.token });
+  const j = await session.joinAgent({ agent: id, role });
+  if (j.error) return { error: j.error, detail: j.detail };
+  return { value: { session, token: tc.value.token } };
+}
+
+export { localCtx, serverCtx };
+export type { Ctx, Scope, Cred, Mode, Res };
