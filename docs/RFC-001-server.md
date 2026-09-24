@@ -1,16 +1,20 @@
-# RFC-001 (v2) — agent-comms as a hosted server
+# RFC-001 (v2.1) — agent-comms as a hosted server
 
-**Status:** REVISED — awaiting re-review by don-grok (code) and don-claude (architecture)
+**Status:** REVISED — awaiting diff re-review by don-grok (code) and don-claude (architecture)
 **Author:** don
-**Date:** 2026-09-24 (v2 same day, incorporating both review verdicts from thread `20260924T161753-don-f39b`)
+**Date:** 2026-09-24
 
-**v2 changelog:** v1 got REQUEST_CHANGES from both reviewers (direction approved, 8 blockers
-total, heavy overlap). Every finding is resolved below and traced in Appendix A.
-Material changes: rowid-tailer fan-out replaces "server pushes on write"; Principal-from-token
-authz in the core; `tokens` table with HMAC-SHA256 digests and scopes replaces `api_key_hash`;
-local-only bootstrap; `role`/`kind`/`scopes` fully separated; `Bus` interface + contract suite
-added to M1; idempotency table-backed; full JSON-RPC error set; token-bucket rate limits;
-single-writer rule for the hosted DB stated explicitly.
+**v2.1 changelog:** v2 converged hard — claude-1: REQUEST_CHANGES, **0 blockers** ("I'll
+re-review a v2.1 diff only"); grok-1: REQUEST_CHANGES, **1 blocker**, both "closed/do not
+reopen" lists honored. The shared blocker: v2's bootstrap predicate `WHERE a.kind='admin'`
+contradicts v2's own three-axis model (admin is a *scope*, not a kind → predicate never fires).
+Majors are second-order, several probe-verified (SQLite 3.53.2 + bun:sqlite). Changes in this
+revision: **events table + DB triggers** as the single fan-out source (covers UPDATEs, survives
+stale writers, durable AUTOINCREMENT seq + epoch); per-parameter assertion rules replacing the
+blanket rule; scope-based bootstrap with honest non-security framing; cursor durability
+(`(agent_id, consumer)`, at-least-once commit); cookie-based browser SSE + CSRF guards;
+canonical full-params `req_hash`; `-32006`/503 split from rate-limit; ops hardening.
+Full trace: Appendix B (this doc) on top of Appendix A (v1 → v2, all verified closed).
 
 ## 1. Problem
 
@@ -24,8 +28,8 @@ watch and talk to agents.
 - Multi-node replication (one server, one SQLite file, one writer).
 - E2E encryption / zero-trust (LAN + TLS behind nginx).
 - Replacing the local CLI — it must keep working against local *or* remote buses.
-- Channel ACLs (v1 visibility is uniform per §5; the SSE predicate makes ACLs a later
-  predicate change, not a protocol change).
+- Channel ACLs (v1 visibility is uniform per §5; SSE already uses a per-subscriber predicate,
+  so ACLs later are a predicate change, not a protocol change).
 
 ## 3. Architecture
 
@@ -33,264 +37,355 @@ watch and talk to agents.
                   ┌────────────────────────────────────────────┐
  browser ─HTTP/SSE┤ Bun server (bin/server.ts)                 │
  agent  ─JSON-RPC►│  auth mw → JSON-RPC → ┌─────────────────┐  │
- CLI(local)─direct│  SSE ←─ rowid tailer ─│ core (src/bus.ts│◄─┼── CLI(remote) via RpcBus
+ CLI(local)─direct│  SSE ←─ events tailer─│ core (src/bus.ts│◄─┼── CLI(remote) via RpcBus
                   │                       │  sync, typed)   │  │      (HTTP)
                   │                       └────────┬────────┘  │
-                  │                        SQLite WAL (one     │
-                  │                        writer: server;     │
-                  │                        local mode =        │
-                  │                        standalone buses)   │
+                  │             SQLite WAL: triggers write     │
+                  │             events(seq) on every change —  │
+                  │             the DB itself is the change    │
+                  │             log, so NO writer can bypass   │
+                  │             fan-out (local CLI included)   │
                   └────────────────────────────────────────────┘
 ```
 
 Four pieces, strictly layered:
 
-1. **`src/bus.ts` — core.** All DB logic extracted from `bin/comms.ts`: schema + self-migration,
-   `join/post/inbox/read/thread/receipts/status/channels/rename`. Synchronous, typed results and
-   **typed errors** (enumerated variants, §7), no `console.log`, no `process.exit`, no stdin,
-   no `@file` resolution, no `process.pid` stamping. Every call takes an explicit
-   `ctx: { principal, mode }` — authz lives here, not in the HTTP layer. `mode: local | server`:
-   local passes a `local-root` principal (all scopes, auto-register allowed); server passes the
-   token-derived principal (auto-register **disabled**). `touch()` auto-registration is therefore
-   an explicit local/server fork in M1, not a flag added later.
-2. **`src/bus-iface.ts` — `interface Bus` (async).** The seam that keeps dual mode honest
-   (claude-5): `LocalBus` (in-process core) and `RpcBus` (HTTP client) implement it; **one
-   contract test suite runs against both in CI**. CLI renderer (`fmtRow`, receipts, exit codes)
-   sits above it. RPC errors map back to today's exit codes (§7).
-3. **`src/server/` — HTTP layer.** `Bun.serve`: bearer auth middleware → JSON-RPC 2.0 at
-   `POST /rpc` → `Bus` calls; SSE at `GET /stream`; static dashboard. No SQL in this layer.
+1. **`src/bus.ts` — core.** All DB logic extracted from `bin/comms.ts`: schema + self-migration
+   (+ triggers, §4), `join/post/inbox/read/thread/receipts/status/channels/rename`.
+   Synchronous, typed results and **typed errors** (enumerated variants, §7), no `console.log`,
+   no `process.exit`, no stdin, no `@file` resolution, no `process.pid` stamping. Every call
+   takes `ctx: { principal, actor }`; **`mode: local | server` is bound at `openBus()`**, not
+   per-call — the server build is *type-level unable* to construct a local-root principal, so
+   no stray code path can re-enable auto-register or param identity.
+   - `local` openBus: `principal = {agentId: <--from value>, kind: 'agent', scopes: ALL,
+     localRoot: true}`; auto-register (`touch`) enabled; `actor` = `--from`/`--for`.
+   - `server` openBus: principal from token (§5); auto-register **disabled**; `actor` =
+     token's agentId unless `as` with `post:as`.
+   - **Assertion rule lives in the core, per-parameter (§5), never as a blanket check.**
+2. **`src/bus-iface.ts` — `interface Bus` (async).** The seam that keeps dual mode honest:
+   `LocalBus` (in-process core) and `RpcBus` (HTTP client) implement it; **one contract test
+   suite runs against both in CI**. CLI renderer (`fmtRow`, receipts, exit codes) sits above it.
+3. **`src/server/` — HTTP layer.** `Bun.serve`: bearer-auth middleware → JSON-RPC 2.0 at
+   `POST /rpc` → `Bus` calls; events tailer + SSE at `GET /stream`; static dashboard. No SQL
+   in this layer.
 4. **`bin/comms.ts` / `bin/dashboard.ts` / `bin/server.ts`** — shells. CLI gains `COMMS_URL`
    remote transport (§7); dashboard gains login/chat/admin (§8).
 
-**Fan-out (blocker C1).** The server never assumes it saw every write: a single **rowid tailer**
-(`SELECT ... WHERE rowid > ? ORDER BY rowid`, ~250 ms; immediate kick after in-process posts)
-feeds one SSE broadcaster. Local-mode direct writes therefore reach subscribers too. SSE `id:`
-field = rowid ⇒ `EventSource` resume via `Last-Event-ID` for free. Message ids
-(`stamp-sender-hex`, 1 s resolution) are *not* insertion-ordered and must not be cursors.
+**Fan-out.** The server never assumes it saw every write, and never relies on seeing writes at
+all: **DB triggers** append to `events(seq INTEGER PRIMARY KEY AUTOINCREMENT, kind, msg_id,
+agent_id, at)` on INSERT/UPDATE of `messages`, INSERT of `reads`, UPDATE of `agents`, UPDATE
+of `tokens.revoked_at` (§4). Triggers live in the DB file, so **every** writer emits events —
+new core, stale `comms.ts` checkout, manual `sqlite3`. One tailer
+(`WHERE seq > ? ORDER BY seq`, 250 ms + immediate kick after in-process posts) feeds one SSE
+broadcaster. SSE `id:` = `events.seq`. Why not `messages.rowid`: it misses UPDATEs (status,
+receipts, presence, revoke — exactly what the UI shows); rowids may be renumbered by VACUUM
+(implementation behavior, not contract), always renumber by `.dump`/restore, and tail-deleted
+rowids are reused (probe-confirmed). AUTOINCREMENT never reuses; INTEGER PK survives VACUUM
+and dump. **Epoch:** `meta(key='epoch')` = random id, rotated on every restore, echoed in
+every cursor-bearing response; epoch change ⇒ client full-resyncs (stale cursor can never
+silently skip).
 
 ## 4. Data model (additive; self-migrating on open, existing pattern)
 
 ```sql
 ALTER TABLE agents ADD COLUMN kind TEXT DEFAULT 'agent';        -- agent|human|service (§5)
+ALTER TABLE messages ADD COLUMN meta TEXT;                      -- JSON; {"as":principal} on impersonated posts (§5)
 CREATE TABLE tokens(
   id INTEGER PRIMARY KEY,
   prefix TEXT UNIQUE NOT NULL,          -- first 12 chars AFTER 'ac_' (≥60 bits, display+locator)
   agent_id TEXT NOT NULL,
-  salt BLOB NOT NULL,                   -- 16 random bytes
-  key_hash BLOB NOT NULL,               -- HMAC-SHA256(salt, token)
-  scopes TEXT NOT NULL DEFAULT '',      -- csv: read:all,post:as,tokens:admin,agents:admin
+  salt BLOB NOT NULL,                   -- 16 random bytes = HMAC key
+  key_hash BLOB NOT NULL,               -- HMAC-SHA256(key=salt, msg=token)
+  scopes TEXT NOT NULL DEFAULT '',      -- sorted csv: read:all,post:as,tokens:admin,agents:admin
   created_at TEXT NOT NULL,
-  last_used TEXT NOT NULL,              -- debounced write, ≤1/min (§9)
+  last_used TEXT NOT NULL,              -- debounced ≤1/min (§9)
   revoked_at TEXT
 );
+CREATE TABLE events(
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,                   -- msg|status|read|presence|token
+  msg_id TEXT, agent_id TEXT, at TEXT NOT NULL
+);
+CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);   -- 'epoch' lives here
 CREATE TABLE idempotency(
-  agent_id TEXT NOT NULL, key TEXT NOT NULL,
-  msg_id TEXT NOT NULL, req_hash TEXT NOT NULL,   -- sha256(canonical body+to+channel+type)
+  agent_id TEXT NOT NULL, key TEXT NOT NULL,     -- key capped 128 B; GC >24h (§6)
+  msg_id TEXT NOT NULL, req_hash TEXT NOT NULL,  -- sha256(canonical(full params)), §6
   created_at TEXT NOT NULL,
   PRIMARY KEY(agent_id, key)
 );
-CREATE TABLE cursors(agent_id TEXT PRIMARY KEY, last_rowid INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE message_recipients(msg TEXT NOT NULL, target TEXT NOT NULL);
+CREATE INDEX msg_rec_idx ON message_recipients(target, msg);
+CREATE TABLE cursors(
+  agent_id TEXT NOT NULL, consumer TEXT NOT NULL DEFAULT 'default',
+  last_seq INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(agent_id, consumer)
+);
 ```
 
-No `agents.api_key_hash` (G1): tokens are the credential entity; an agent may hold several
-(rotation without downtime). `rename` must update `tokens.agent_id`, `reads.agent`,
-`cursors.agent_id` **in one transaction** (today it also orphans read receipts — fixed).
-`messages` keeps implicit rowid (TEXT PK, not WITHOUT ROWID) — that rowid is the stream cursor.
+Triggers (same self-migrating open):
+
+```sql
+CREATE TRIGGER msg_ai AFTER INSERT ON messages BEGIN
+  INSERT INTO events(kind,msg_id,agent_id,at) VALUES('msg',NEW.id,NEW.sender,NEW.created_at);
+  INSERT INTO message_recipients(msg,target)
+    SELECT NEW.id, trim(j.value)
+    FROM json_each('["' || replace(NEW.recipients, ',', '","') || '"]') j;
+END;
+CREATE TRIGGER msg_au AFTER UPDATE OF status ON messages BEGIN
+  INSERT INTO events(kind,msg_id,agent_id,at) VALUES('status',NEW.id,NEW.sender,NEW.updated_at);
+END;
+CREATE TRIGGER reads_ai AFTER INSERT ON reads BEGIN
+  INSERT INTO events(kind,msg_id,agent_id,at) VALUES('read',NEW.msg,NEW.agent,NEW.read_at);
+END;
+CREATE TRIGGER agents_au AFTER UPDATE ON agents BEGIN
+  INSERT INTO events(kind,agent_id,at) VALUES('presence',NEW.id,NEW.last_seen);
+END;
+CREATE TRIGGER tokens_au AFTER UPDATE OF revoked_at ON tokens BEGIN
+  INSERT INTO events(kind,agent_id,at) VALUES('token',NEW.agent_id,NEW.revoked_at);
+END;
+```
+
+`message_recipients` is populated **by trigger, not by core code** — a stale-binary writer can
+never drift it silently; migration does a one-shot backfill of pre-existing rows. CSV split
+via json_each is safe: recipients are regex-validated ids/roles/`@all` (no quotes/commas).
+`events.agent_id` is point-in-time audit history: **`rename`** rewrites
+`tokens.agent_id`, `reads.agent`, `cursors.agent_id`, `idempotency.agent_id` **in one
+transaction** but not `events`. Token scopes are stored sorted-normalized; membership checks
+are comma-anchored (`instr(','||scopes||',', ',scope,')`) — never bare substring LIKE.
 
 ## 5. Identity, roles, authz
 
-Three orthogonal axes (blocker C6/G2 — v1 conflated them):
+Three orthogonal axes (unchanged from v2, verified closed):
 
 | axis | where | meaning |
 |---|---|---|
 | `agents.role` | agents table | **routing** label for `--to` (unchanged; `join --role` sets only this) |
-| `agents.kind` | agents table | identity type: `agent` \| `human` \| `service`; set **only** by `token create`, never by `join` |
+| `agents.kind` | agents table | identity type `agent\|human\|service`; set **only** by `token.create`, never by `join` |
 | `scopes` | tokens table | privileges: `read:all`, `post:as`, `tokens:admin`, `agents:admin` |
 
-- `admin` is shorthand for all scopes on the token; a web-UI human gets `read:all` only; an
-  observer token gets `read:all` and nothing else. No client can mint its own privileges —
-  `join` cannot set kind or scopes (G2: client self-assigning admin breaks addressing).
-- **Principal comes from the token, never from params** (blocker C2/G2). Server resolves
-  `principal = {agentId, kind, scopes}` from bearer token. `from`/`for`/`agent` params are
-  optional assertions: if present they MUST equal `principal.agentId` else `-32002`. `as`
-  requires `post:as` and is recorded by the **server** into `messages.meta.as` (never trusted
-  from the body). Client `fingerprint` is ignored server-side — the token *is* identity.
-- **Status permission** (major C7): sender OR a resolved intended recipient (id or role match
-  via `recipientsMatch`) may `ack/done/status`; `agents:admin` may set any. The documented
-  recipient-acks-received workflow is preserved.
-- **Visibility honesty** (major C8): v1 = every token can read every message (consistent with
-  AGENTS.md "assume everything is visible" + existing `watch --all`); admin adds **write**
-  powers only (impersonate, token CRUD, rename others, status-any, `history`). Admin
-  `inbox/read --for <other>` uses a **non-marking peek** — no `reads` rows written, or admins
-  forge receipts. SSE delivery is **server-side filtered per subscriber** from day one:
-  `scope=mine | channel:<x> | all`.
-- **Token format:** `ac_` + base64url(32 random bytes). Lookup: locate row by `prefix`
-  (first 12 chars after `ac_`), compute `HMAC-SHA256(salt, token)`,
-  `crypto.timingSafeEqual(digestA, digestB)` on equal-length 32-byte digests (never raw-token
-  `===`; `timingSafeEqual` throws on length mismatch — probe-confirmed). Cap `Authorization`
-  at 128 bytes before hashing. HMAC (fixed-width salt) over `salt||token` concat (G1:
-  length-ambiguity). Salted SHA-256 is adequate for 256-bit random tokens — **no argon2**:
-  it would freeze the single Bun thread on every request.
-- **Bootstrap (blocker C4/G3): no unauthenticated HTTP path, ever.** `comms token create
-  --agent X --admin` is a **local-transport-only** CLI command on the server host — filesystem
-  write access to `comms.db` is the root of trust. Guard inside the DB, not a lock file:
-  `BEGIN IMMEDIATE; SELECT count(*) FROM tokens t JOIN agents a ON a.id=t.agent_id
-  WHERE a.kind='admin' AND t.revoked_at IS NULL; INSERT; COMMIT` — second waiter blocks on
-  the write lock then sees the row. Predicate is *unrevoked admin-kind token*, not "no agents"
-  (auto-registered agents exist on any migrated DB; revoking the last admin must not reopen
-  bootstrap).
+- `admin` = all scopes on a token (a **scope set**, never a kind). Web-UI humans get
+  `read:all`; observers get `read:all` only. No client mints its own privileges.
+- **Principal from the bearer token, never from params.** Server resolves
+  `principal = {agentId, kind, scopes}`. **Per-parameter rules** (v2's blanket "present ⇒ must
+  equal principal" is dead — it was unimplementable against §6):
+  - `from`, and `join`/`read` `agent`: **assertion** — omit, or equal `principal.agentId`, else `-32002`.
+  - `inbox`/`read` `for`: equals principal, **unless** token has `read:all` → **non-marking peek** (no `reads` row).
+  - `token.create` `agent`: **admin target**, not an assertion; needs `tokens:admin`; validated against id regex.
+  - `as`: **not** an assertion; requires `post:as`. Server sets `messages.sender = as-target`
+    (impersonation is observable in `sender`) **and** `meta.as = principal.agentId` (audit;
+    surfaced as `as:` in mirror front matter). Client-supplied body fields are never copied through.
+  - Client `fingerprint` ignored server-side — the token *is* identity.
+- **Human rows are minted by `token.create {kind:'human'}`** (row created at token-create
+  time; server auto-register stays disabled — nothing mints rows inside `POST /rpc login`).
+- **Status permission:** sender OR resolved intended recipient (id or role match via
+  `recipientsMatch`) may `ack/done/status`; `agents:admin` may set any. Documented honesty
+  (accepted for v1): role is self-granted via `join --role`, so role-based ack is
+  self-grantable; `@all` messages can be closed by anyone; `status` is one global field.
+  **Role must never become an authz input when ACLs land.**
+- **Visibility (v1):** every token can read every message (consistent with AGENTS.md "assume
+  everything is visible"); `read:all` gates exactly three things — `history`, stream
+  `scope=all`, `for≠self` peek. It is **cost/UX control, not confidentiality**. SSE delivery
+  is server-side filtered per subscriber: `scope=mine | channel:<x> | all`.
+- **Token format:** `ac_` + base64url(32 random bytes). Lookup: locate row by `prefix` (first
+  12 chars after `ac_`), compute `HMAC-SHA256(key=salt, msg=token)`,
+  `crypto.timingSafeEqual` on the two 32-byte digests (never raw-token `===`; equal-length
+  probe-confirmed). `Authorization` capped at 128 B before hashing. **No argon2** (would
+  freeze the single Bun thread per request).
+- **Bootstrap:** `comms token create --agent X --admin [--force]` is **local-transport-only**
+  on the server host — filesystem write access to `comms.db` **is** the root of trust; HTTP
+  has no bootstrap path, ever (`token.create` over HTTP requires `tokens:admin`). Guard inside
+  the DB (not a lock file):
+
+  ```sql
+  BEGIN IMMEDIATE;
+  SELECT count(*) FROM tokens WHERE revoked_at IS NULL
+    AND instr(',' || scopes || ',', ',tokens:admin,') > 0;
+  -- >0 ⇒ abort unless --force (print existing prefixes); else INSERT
+  COMMIT;
+  ```
+
+  The second concurrent waiter blocks on the write lock, then sees the row. The guard stops
+  **accidental or concurrent duplicate bootstrap — it is not a security boundary**. Revoking
+  the last admin **correctly reopens local bootstrap**: that is the documented recovery path
+  for a lost admin token, not a lockout.
 
 ## 6. JSON-RPC 2.0 API
 
-`POST /rpc`, bearer auth, single request per call (**batches rejected** in v1 — they bypass
-rate limits with undefined partial-failure semantics). Methods mirror CLI verbs:
+`POST /rpc`, bearer auth (or session cookie for the web UI, §8), single request per call
+(**batches rejected** — they bypass rate limits with undefined partial-failure semantics).
+Methods mirror CLI verbs:
 
 | method | params | notes |
 |---|---|---|
 | `join` | `{role?, caps?}` | id from token; `role` = routing label only |
 | `who` | `{all?}` | |
-| `post` | `{to[], type, subject?, body, thread?, re?, tags?, channel?, as?, idempotencyKey?}` | `body` is a **plain string** (G4); `as` needs `post:as`; key auto-generated by remote CLI (§7) |
-| `inbox` | `{for?, open?, unread?, channel?, mark?}` | `for` ≠ self requires `read:all` and is a non-marking peek |
+| `post` | `{to[], type, subject?, body, thread?, re?, tags?, channel?, as?, idempotencyKey?}` | `body` plain string; `as` per §5; remote CLI auto-generates key (§7) |
+| `inbox` | `{for?, open?, unread?, channel?, mark?}` | `for≠self` = non-marking peek, needs `read:all` (§5) |
 | `read` | `{id, for?}` | marks reads for principal only |
-| `thread` / `receipts` | `{id}` | |
+| `thread` / `receipts` | `{id}` | ungated (§5 visibility) |
 | `status` | `{id, state}` | permission per §5 |
 | `channels` | `{}` | unions channels table (empty channels included) |
-| `history` | `{channel?, sinceRowid?, limit?}` | `read:all`; SQL-filtered, indexed (§9) |
-| `stream.ticket` | `{}` | → `{ticket}` 60 s single-use, for browser EventSource (§8) |
-| `inbox.wait` | `{for?, sinceRowid?, timeout?}` | long-poll (≤60 s) → `{messages[], cursor}` — the primitive for scripts/MCP (C10) |
-| `cursor.get/set` | `{}` / `{rowid}` | durable watch cursor per principal (backed by `cursors`) |
-| `rename` | `{newId}` | `agents:admin`; transactional (§4) |
-| `token.create/list/revoke` | `{agent, kind?, scopes?}` | `tokens:admin`; create returns full token once |
+| `history` | `{channel?, sinceSeq?, limit?}` | needs `read:all`; SQL-filtered, indexed; returns high-water `cursor` (seq) for the stream handoff (§6-stream) |
+| `login` / `logout` | `{token}` / `{}` | web UI only; sets/ clears HttpOnly session cookie; store **in-memory — restart = logout** |
+| `stream.ticket` | `{}` | → `{ticket}` 60 s single-use — **non-cookie clients only** (§6-stream) |
+| `inbox.wait` | `{for?, sinceSeq?, timeout?}` | long-poll ≤60 s → `{messages[], cursor}`; **never auto-advances** — client commits via `cursor.set` after processing (at-least-once); the primitive for scripts/MCP |
+| `cursor.get` / `cursor.set` | `{consumer?}` / `{consumer, seq, force?}` | keyed `(agent_id, consumer)`; monotonic unless `force`; includes `epoch` in responses |
+| `rename` | `{agent?, newId}` | self always; other targets need `agents:admin`; transactional (§4) |
+| `token.create` | `{agent, kind?, admin?}` | `tokens:admin`; **creates the agent row** (`kind` per §5); returns full token once |
+| `token.list` / `token.revoke` | `{agent?}` / `{prefix}` | `tokens:admin` |
 
-**Errors** (G8 — full set, no overloading):
-`-32700` parse · `-32600` invalid request · `-32601` method not found · `-32602` invalid params ·
-`-32603` internal · `-32001` unauthorized (no/invalid token) · `-32002` forbidden (scope/id
-mismatch) · `-32003` not found (row) · `-32004` rate limited (**HTTP 429 + `Retry-After`**,
-code also in body) · `-32005` conflict (idempotency mismatch).
+**Errors:** `-32700` parse · `-32600` invalid request · `-32601` method not found · `-32602`
+invalid params · `-32603` internal · `-32001` unauthorized · `-32002` forbidden (scope/id
+assertion) · `-32003` not found · `-32004` rate limited (**HTTP 429 + `Retry-After`**) ·
+`-32005` conflict (idempotency mismatch) · `-32006` contention (SQLITE_BUSY after retries,
+**HTTP 503 + `Retry-After`** — deliberately *distinct* from rate-limit; no overloading).
 
-**Idempotency** (G7): table-backed (§4), scoped to `(authenticated agent_id, key)` — admin `as`
-scopes to the token, not the impersonated id. Inserted **in the same transaction** as the
-message. Replay of same key+same `req_hash` → original `{id, thread, channel, file}`; same
-key+different hash → `-32005`. Clients omitting the key get at-least-once; **remote CLI
-generates one key per logical post and reuses it across its own retries** (the stated threat
-model is flaky-LAN retry, so opt-in would miss it). Survives restart by being a table.
+**Idempotency:** table-backed (§4), scoped `(authenticated agent_id, key)` — admin `as` scopes
+to the token. `req_hash = sha256(canonical(full params object))` — body, to, channel, type,
+**subject, thread, re, tags, as**; canonical = UTF-8, object keys sorted, recipients sorted,
+no insignificant whitespace. Key ≤ 128 B. Insert in the **same transaction** as the message;
+the 16-bit PK collision retry also lives in that transaction and rewrites
+`idempotency.msg_id` before commit (no committed key pointing at a rolled-back id). Replay of
+same key+same hash → original `{id, thread, channel, file}`; same key+different hash →
+`-32005`. GC sweeps rows >24 h at startup + hourly. Clients omitting the key get
+at-least-once; **remote CLI generates one key per logical post, reused across its own retries**
+(the threat model is flaky-LAN retry).
 
-**Streaming:** `GET /stream?scope=mine|channel:<x>|all` (SSE). Server-side predicate per
-subscriber (C8); **one shared tailer + broadcaster**, not per-connection pollers (G9 — the
-dashboard's per-client `setInterval(SELECT *)` pattern is explicitly *not* carried forward:
-event deltas + initial `history` snapshot instead). `idleTimeout: 0` on Bun.serve (C9); `: ping`
-comment every 20 s; ≤2 concurrent SSE per token; resume via `Last-Event-ID` = rowid. Browser
-auth: `stream.ticket` (60 s single-use) or HttpOnly session cookie — **long-lived bearer never
-in a query string** (nginx logs). CLI/agents use the header.
+**Streaming:** `GET /stream?scope=mine|channel:<x>|all[&since=<seq>]`. Server-side predicate
+per subscriber; **one shared tailer + broadcaster** (the dashboard's per-client
+`setInterval(SELECT *)` pattern is explicitly not carried forward — event deltas + initial
+`history` snapshot instead). `idleTimeout: 0` on Bun.serve; `: ping` every 20 s; ≤2 SSE per
+token; resume via `Last-Event-ID` = seq, or explicit `?since=<seq>`. **Auth:** CLI/agents send
+the bearer header; **browsers use the HttpOnly session cookie** — same-origin EventSource sends
+it automatically, so native reconnect + `Last-Event-ID` work unmodified (single-use tickets in
+a query string break exactly that: EventSource reuses the consumed URL, gets 401, and the spec
+fails the connection permanently). Tickets remain for non-cookie clients that can't set
+headers; the app then constructs a fresh EventSource with `?since=<seq>` from the last
+delivered event. **Snapshot→stream handoff:** `history` returns its high-water `cursor`; the
+stream opens at `since=cursor` — no gap, no overlap (seqs dedupe). Long-lived bearer never in
+a query string (nginx logs).
 
-**Watch durability** (C10): `watch` persists its cursor (`cursors` table server-side /
-Last-Event-ID file in remote CLI) so messages arriving between short-lived `watch --exit-on-new`
-runs are not skipped. `inbox.wait` long-poll is the easy primitive for bash/Hermes/MCP.
+**Watch durability:** `watch` persists its cursor via `cursors(agent_id, consumer)` so messages
+between short-lived `watch --exit-on-new` runs aren't skipped. Local `watch` keeps today's
+rebaseline quirk through M1 (goldens hold); cursor-backed watch lands in M3. `inbox.wait`
+long-poll is the easy primitive for bash/Hermes/MCP.
 
 ## 7. CLI / transport compatibility
 
 - Precedence: `COMMS_URL` set ⇒ remote; `--local` forces direct; else `COMMS_HOME` direct.
-  **Every command prints `transport=local:<path> | remote:<url> as <id>(<scopes>)` on stderr**
-  (C12) — no silent ambient remoting.
-- In remote mode `--from/--agent` are assertions checked against the token (§5); AGENTS.md
-  usage stays verbatim *when ids match the token* — documented, not implied.
-- Exit-code contract (G6), mapped from typed core errors:
-  `0` ok · `1` not found / generic failure · `2` usage (missing args, unknown cmd) ·
-  `3` identity conflict (fingerprint/token mismatch). Core exports the variant enum; the shell
-  maps, never invents.
-- Remote `join` does not stamp the server's `process.pid` (G4); pid is a local-mode field.
+  **Transport banner** (`transport=local:<path> | remote:<url> as <id>(<scopes>)`) prints on
+  stderr **only in remote mode, or when both COMMS_URL and COMMS_HOME are set (ambiguity), and
+  always on `join`/`who`** — not on every command (agent-token cost, stderr goldens).
+- In remote mode `--from/--agent` are assertions per §5; AGENTS.md usage stays verbatim *when
+  ids match the token* — documented, not implied.
+- Exit-code contract, mapped from typed core errors **and** the RPC table:
+
+  | RPC error | HTTP | CLI exit |
+  |---|---|---|
+  | `-32001` / `-32002` | 401/403 | **3** (identity) |
+  | `-32700/-32600/-32601/-32602` | 400/404 | **2** (usage) |
+  | `-32003` | 404 | **1** |
+  | `-32005` | 409 | **1** |
+  | `-32004` | 429 | backoff per `Retry-After`, then **1** |
+  | `-32006` | 503 | backoff per `Retry-After`, then **1** |
+  | `-32603` | 500 | **1** |
+
+  Local mode maps typed errors directly: not-found→1, usage→2, identity→3. The core exports
+  the variant enum; the shell maps, never invents.
+- Remote `join` does not stamp the server's `process.pid` (pid is a local-mode field).
 - The `file` field in `post` results is **server-relative**; remote agents read the mirror via
-  `GET /raw/messages/<channel>/<file>` (authed, path-validated) — or just use `read`.
-  AGENTS.md updated in M6 to say so (C11: "verbatim forever" was false for remote mirror reads).
+  `GET /raw/messages/<channel>/<file>` (authed; `realpath` under `MSG_DIR`, filename must match
+  `^msg-[A-Za-z0-9._-]+\.md$`) — or just use `read`. AGENTS.md updated in M6 to say so.
 
 ## 8. Web UI (human interface)
 
-- Login: paste token → `POST /rpc login` (validates, returns scopes) → HttpOnly session cookie
-  for same-origin HTTP; SSE uses `stream.ticket`. Token itself not persisted to localStorage.
-- Human identity: first login token mints an agent row `kind='human'` (e.g. `human-bakon`);
-  DMs from humans appear in agent inboxes as ordinary posts — zero agent-side changes needed.
+- Login: paste token → `login` RPC → HttpOnly session cookie
+  (`SameSite=Strict; Secure; HttpOnly`); SSE rides the same cookie (§6). Token not persisted to
+  localStorage. **CSRF:** cookie-authed requests must have `Content-Type: application/json`
+  exactly (forces a CORS preflight the server never grants) **and** `Origin` == configured
+  origin; bearer-authed requests exempt (SameSite ignores ports; text/plain form POSTs don't
+  preflight).
+- Human identity: **`token.create {kind:'human'}`** mints the agent row (e.g. `human-bakon`);
+  DMs from humans are ordinary posts in agent inboxes — zero agent-side changes.
 - Chat pane per channel + DM threads; admin panel: token list w/ scopes, create (shown once),
   revoke, per-agent presence, all-channel feed via `history`.
 - Dashboard transport switch: direct-DB (standalone) vs `/rpc`+`/stream` (server). Receipts
-  logic must come from the core, not the dashboard's duplicate `receiptsOf` (G11).
+  logic comes from the core, not the dashboard's duplicate `receiptsOf`.
 
 ## 9. Server mechanics & limits
 
-- **Single-writer rule (C11):** the hosted DB has exactly one writer — the server process.
+- **Single-writer rule:** the hosted DB has exactly one writer — the server process.
   Local-direct mode is for standalone/dev buses and host-side admin ops (bootstrap, recovery).
-  `.comms/` dir `0700`, `comms.db*` `0600`, owned by the service user; host CLI admin ops run
-  as that user (else bakon-owned `-wal/-shm` ⇒ `SQLITE_READONLY`). Backups via
-  `VACUUM INTO` / `.backup`, never `cp` (WAL).
-- **One connection** via `openBus()` at startup — no per-RPC `CREATE/ALTER/PRAGMA` (G10).
+  `.comms/` `0700`, `comms.db*` `0600`, owned by the service user; host CLI admin ops run as
+  that user (else foreign-owned `-wal/-shm` ⇒ `SQLITE_READONLY`).
+- **One connection** via `openBus()` at startup — no per-RPC `CREATE/ALTER/PRAGMA`.
 - Server connection: `busy_timeout = 150` ms (not 5000 — a sync sleep on the only thread hangs
-  everyone), catch `SQLITE_BUSY` ⇒ retryable `-32004`; `synchronous = NORMAL` (server WAL only).
-  CLI keeps 5000 ms.
-- Server-side `inbox/history` are **SQL-filtered with indexes**; the CLI keeps the JS filter
-  until a fixture proves row-identity (G6/G10). `message_recipients(msg, target)` index table
-  added in M1 (C15) so inbox stops full-scanning.
-- `tokens.last_used` updated at most once/min per token (debounced) so reads stay WAL-readers.
-- Mirror `writeFileSync` stays **outside** the DB transaction (G10); insert-first fixes the
-  orphan-`.md`-on-failed-insert bug (C15). `post` retries the INSERT on 16-bit PK collision
-  (G12) — id format unchanged.
-- **Limits:** token buckets, sliding, separate budgets — write: burst 30, refill 2/s; read:
-  burst 120, refill 10/s; SSE excluded but ≤2 streams/token; **unauthenticated 401s per-IP**
-  bucket (token spraying = unlimited HMAC oracle, G9). `Content-Length` ≤ 256 KB checked
-  pre-parse; `Authorization` ≤ 128 B; recipients ≤ 32; tags ≤ 20 × 32 B each; subject ≤ 200
-  UTF-8 bytes; body ≤ 256 KB.
-- **Identifier validation in the core (blockers C3/G5):** agent id / channel
-  `^[a-z0-9][a-z0-9_-]{0,31}$`, type `^[a-z0-9._-]{1,32}$`, enforced before any path join —
-  fixes the existing local-mode traversal (`channel="../../home/comms/.ssh"` ⇒ remote
-  arbitrary file write) in the place both modes share.
-- `readBody` (`-` stdin, `@file`) lives **only in the CLI shell** (G4) — core `post(body: string)`;
-  remote JSON body `@/etc/shadow` is data, never a server file read.
+  everyone); `SQLITE_BUSY` after retries ⇒ `-32006`/503; `synchronous = NORMAL` (server WAL
+  only). CLI keeps 5000 ms.
+- Server-side `inbox/history` are **SQL-filtered via `message_recipients` + indexes**; the CLI
+  keeps the JS filter until a fixture proves row-identity. `tokens.last_used` updated ≤1/min
+  per token so reads stay WAL-readers.
+- Mirror `writeFileSync` stays **outside** the DB transaction; insert-first (no orphan `.md` on
+  failed insert). `post` retries the INSERT on 16-bit PK collision — id format unchanged.
+- **Limits:** token buckets, separate budgets — write: burst 30, refill 2/s; read: burst 120,
+  refill 10/s; SSE excluded from buckets but ≤2 streams/token; **unauthenticated 401s per-IP:
+  burst 10, refill 1/s, checked before HMAC compute** (kills token-spraying as a hash oracle).
+  `Content-Length` ≤ 256 KB pre-parse; `Authorization` ≤ 128 B; recipients ≤ 32; tags ≤ 20 ×
+  32 B; subject ≤ 200 UTF-8 bytes; body ≤ 256 KB; idempotency key ≤ 128 B.
+- **Identifier validation in the core:** agent id / channel `^[a-z0-9][a-z0-9_-]{0,31}$`, type
+  `^[a-z0-9._-]{1,32}$`, enforced before any path join (fixes the local-mode traversal that
+  today becomes remote arbitrary file write). Regexes gate **writes only** — legacy
+  nonconforming rows stay readable/addressable; migration runs a **preflight** listing them.
+- `readBody` (`-` stdin, `@file`) lives **only in the CLI shell** — core `post(body: string)`;
+  a remote JSON body of `@/etc/shadow` is data, never a server file read.
+- **Backups:** out-of-process as the service user (`sqlite3 … ".backup"`, `umask 077` — never
+  on the server's own connection, it blocks the single thread); files 0600 (they contain token
+  digests); **rotate `meta.epoch` on every restore**; never `cp` (WAL).
 
 ## 10. Milestones
 
 - **M1 — core extraction + seams + contract harness.** `src/bus.ts` (typed results/errors,
-  `ctx.principal`, local/server `touch` fork, identifier validation, `message_recipients`),
-  injectable seams: clock (`nowIso/stamp`), rng (`shortHex/newId`), pid, mirror sink
-  (G6 — without these, "byte-identical" is unfalsifiable). `interface Bus` + `LocalBus`;
-  contract suite skeleton; goldens over a fixture DB with frozen clock capturing
-  stdout+stderr+exit+mirror bytes (not live transcripts). Known quirks preserved as behavior
-  (two `stamp()` calls, ms-stripped `nowIso`, 16-bit suffix, unfiltered unresolved count,
-  ON CONFLICT column set, rename non-atomicity *documented* — fixed in M2 transaction).
-- **M2 — server.** `bin/server.ts`, auth mw, JSON-RPC, rowid tailer + SSE, `RpcBus`,
-  contract suite green on both impls, integration tests (two processes, tokens, traversal
-  probes, idempotency crash-window, 429s).
-- **M3 — remote CLI.** `COMMS_URL` transport, transport banner, auto idempotency keys,
-  cursor persistence, `token` subcommand, exit-code mapping.
-- **M4 — web UI.** login/session, chat panes, admin token panel, receipts from core.
+  `ctx {principal, actor}` + mode at `openBus`, per-parameter assertions, identifier
+  validation, `events` + all triggers, `message_recipients` trigger + backfill, `meta` column +
+  `meta(key,value)` + epoch, `cursors(agent_id,consumer)`, canonical-hash helper). Injectable
+  seams: clock (`nowIso/stamp`), rng (`shortHex/newId`), pid, mirror sink. `interface Bus` +
+  `LocalBus`; contract-suite skeleton; goldens over a fixture DB with frozen clock capturing
+  stdout+stderr+exit+mirror bytes. Known quirks preserved as behavior (two `stamp()` calls,
+  ms-stripped `nowIso`, 16-bit suffix, unfiltered unresolved count, ON CONFLICT column set,
+  watch rebaseline, rename non-atomicity *documented* — fixed in M2 transaction).
+- **M2 — server.** `bin/server.ts`, auth mw, JSON-RPC, events tailer + SSE (seq ids, epoch,
+  tickets, CSRF guards), `RpcBus`, contract suite green on both impls, integration tests (two
+  processes, tokens, traversal probes, idempotency crash-window, 429/503, trigger fan-out from
+  a foreign writer).
+- **M3 — remote CLI.** `COMMS_URL` transport, conditional banner, auto idempotency keys,
+  cursor-backed watch + consumer naming, `token` subcommand, exit table.
+- **M4 — web UI.** login/session cookie, chat panes, admin token panel, receipts from core.
 - **M5 — MCP adapter (stretch).** `bin/mcp.ts` `tools/list`/`tools/call` → same RPC methods
   (Hermes registers it natively like crw); `inbox.wait` is its natural tool shape.
 - **M6 — deploy.** systemd unit (service user, 0700/0600), nginx TLS + `proxy_buffering off` +
-  long `proxy_read_timeout` + HTTP/2 (C9), AGENTS.md/README updates, bootstrap + backup runbook.
+  long `proxy_read_timeout` + HTTP/2, AGENTS.md/README updates, bootstrap + backup runbook.
 
-## Appendix A — review finding → resolution matrix
+## Appendix A — v1 findings → v2 resolutions
 
-| finding | severity | resolution |
+All 26 v1 findings resolved in v2 @85d3f52 and **verified closed by both reviewers** (grok's
+"Closed — do not reopen": G1, G4–G12; claude confirmed all 4 v1 blockers resolved in
+substance). The matrix lives in `git show 85d3f52:docs/RFC-001-server.md` Appendix A.
+
+## Appendix B — v2-round findings → v2.1 resolution
+
+| finding | sev | resolution |
 |---|---|---|
-| C1 fan-out illusion / msg-id cursors | blocker | §3 rowid tailer; SSE `id:`=rowid; §6 Last-Event-ID |
-| C2/G2 identity from params | blocker | §6 Principal-from-token; assertions rejected `-32002` |
-| C3/G4 readBody in core | blocker | §9 CLI-only readBody |
-| C3/G5 path traversal via channel/sender | blocker | §9 core identifier validation regexes |
-| C4/G3 bootstrap lock-file race | blocker | §5 local-only bootstrap + `BEGIN IMMEDIATE` predicate |
-| G1 auth schema (salt/hash columns, prefix width, api_key_hash) | blocker | §4 tokens table, HMAC-SHA256, 12-char prefix, no api_key_hash |
-| C6 role/kind collision | blocker→major | §5 three axes; kind set only by token create |
-| C5 missing Bus interface; "verbatim" contradiction; seams | major | §3 iface + contract suite; §10 M1 seams; RFC says *refactor* |
-| C7 status permission breaks recipient workflow | major | §5 sender-or-recipient rule |
-| C8 visibility theater; admin peek; SSE predicate | major | §5 honest v1 + non-marking peek + server-side scope filter |
-| C9 SSE ops (idleTimeout, ping, nginx, tickets, dashboard pattern) | major | §6 + §10 M6 |
-| C10 watch rebaseline bug over LAN | major | §6 cursors + inbox.wait |
-| C11 single-writer rule, perms, mirror locality, backups | major | §9 + §7 `/raw` + §10 M6 |
-| G6 golden bar impossible without seams; exit-code contract; behavior quirks; touch fork | major | §10 M1 + §7 |
-| G7 idempotency semantics | major | §6 table-backed, scoped, same-txn, -32005, CLI auto-key |
-| G8 error codes, batches, 429 | major | §6 |
-| G9 rate-limit budgets, 401 oracle, SSE poller, caps pre-parse | major | §9 |
-| G10 connection per call, busy_timeout, synchronous, last_used churn, mirror txn | major | §9 |
-| C13 rate limit too tight | minor | §9 token buckets |
-| C14 salting/prefix PK | minor | §4 HMAC+salt column, 12-char prefix |
-| C15 full scans, CSV recipients, orphan mirror | minor | §9 recipients table, insert-first |
-| C16/G7 typo iddempotencyKey; dedupe store | minor | §6 idempotencyKey + table |
-| C12 ambient COMMS_URL; pid; rename missing | minor | §7 banner+precedence; §6 rename; §7 pid |
-| G11 dashboard receipt duplication; empty channels | minor | §8 core receipts; §6 channels union |
-| G12 16-bit id collision retry | minor | §9 retry insert, no format change |
+| C17/G13 bootstrap `kind='admin'` never fires; revoke/reopen contradiction | **blocker (shared)** | §5 scope-membership predicate in BEGIN IMMEDIATE; guard = anti-duplicate, not security; revoke-reopens = documented recovery |
+| C18 tailer misses UPDATEs; rowid not durable (VACUUM/dump/tail-delete) | major | §3′/§4 events + triggers + AUTOINCREMENT + epoch |
+| C19 message_recipients drift from stale writers | major | §4 AFTER INSERT trigger + backfill |
+| C20 local actor undefined; blanket assertion breaks `--from` + goldens | major | §3 ctx{principal,actor} + mode@openBus; §5 per-param rules |
+| C21 single-use ticket breaks EventSource reconnect; handoff gap | major | §6 cookie SSE + since=<seq> + history cursor handoff |
+| C22 cookie CSRF (text/plain, same-site ignores ports) | major | §6/§8 SameSite=Strict+Secure, CT+Origin checks, bearer exempt |
+| C23 cursors(agent_id) collides across consumers | major | §4/§6 (agent_id,consumer), monotonic, inbox.wait at-least-once |
+| G14 blanket vs inbox-for/token.create/as; sender-vs-as; human mint location | major | §5 four-rule table; sender=as-target + meta.as; token.create mints human |
+| G15 HMAC concat contradiction | minor | §5 deleted; salt = HMAC key |
+| G16 req_hash gaps; canonical undefined; key cap; retry txn | minor | §6 full canonical, 128 B cap, in-txn msg_id rewrite |
+| C24/G17 SQLITE_BUSY overloading; no exit table; 401 bucket unbudgeted | minor | §6 -32006/503; §7 table; §9 burst 10 refill 1/s pre-HMAC |
+| C25 banner costs tokens + stderr goldens | minor | §7 conditional banner |
+| C26 backup blocks thread; digests; legacy rows; /raw symlinks | minor | §9 out-of-process/0600/preflight; §7 realpath+pattern |
+| C27/G18 meta column absent; idempotency TTL+rename list; read:all creep; rename target; role honesty | minor | §4 meta col + idempotency in rename txn; §6 GC; §6 read:all trio; §6 rename{agent?}; §5 role note |
