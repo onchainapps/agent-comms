@@ -413,3 +413,14 @@ rebaseline quirk through M1 (goldens hold); cursor-backed watch lands in M3.
   history same-txn cursor + msg_id dedupe (§6), login CSRF + media-type parse (§8),
   identity-flag naming (§3), inbox.wait consumer/reads semantics (§6), per-request identity
   from token row (§5), tokens_ai (§4), prose aligned to UPDATE OF status (§3).
+- **D** — M1 implementation deltas (sanctioned, @6e1f7e6): identifier rejection via
+  `ID_RE`/`CH_RE` fails closed with `usage` (exit 2) *before* any path join or DB write
+  (legacy silently accepted `../` and produced orphan mirrors — golden pins the accepted
+  set byte-identical); `rename` is transactional across reads/tokens/cursors/idempotency
+  with mirror files rewritten after commit (rollback leaves no orphan mirrors; history
+  keeps old sender rows by design); local-root principals are unnameable on
+  `Bus<"server">` at type level (concrete `LocalCtx`/`ServerCtx` — tsc alias-variance
+  shortcut probe @tests/typeprobe.ts) with a runtime `ctxCheck` backstop; bootstrap is
+  local-opener-only (§5) — server-mode `tokenCreate` always traverses scope +
+  duplicate-admin guard; legacy quirks pinned by contract tests: touch-before-validate
+  on post/status, inbox does not mark reads, dangling `--re` lenient in local mode only.
