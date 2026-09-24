@@ -1,0 +1,293 @@
+{
+  "home": "<TMP>",
+  "transcript": [
+    {
+      "cmd": [
+        "join",
+        "--agent",
+        "golden-1",
+        "--role",
+        "lab",
+        "--caps",
+        "gpu,kernels"
+      ],
+      "code": 0,
+      "stdout": "joined: golden-1 (role=lab, caps=gpu,kernels, fp=UNSET — identity unprotected, set COMMS_FINGERPRINT)\nactive agents:\n  ● golden-1             role=lab            caps=gpu,kernels              seen=<TS>\n\n0 unresolved message(s) in flight. Run: bun comms.ts inbox --for golden-1 --open\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "join",
+        "--agent",
+        "golden-2",
+        "--role",
+        "research"
+      ],
+      "code": 0,
+      "stdout": "joined: golden-2 (role=research, caps=-, fp=UNSET — identity unprotected, set COMMS_FINGERPRINT)\nactive agents:\n  ● golden-1             role=lab            caps=gpu,kernels              seen=<TS>\n  ● golden-2             role=research       caps=-                        seen=<TS>\n\n0 unresolved message(s) in flight. Run: bun comms.ts inbox --for golden-2 --open\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "post",
+        "--from",
+        "golden-1",
+        "--to",
+        "golden-2,research",
+        "--type",
+        "ask",
+        "--subject",
+        "Need GPU numbers",
+        "--body",
+        "Benchmark the kernel at 4k tiles.",
+        "--tags",
+        "perf,gpu"
+      ],
+      "code": 0,
+      "stdout": "posted <ID>  [#general]  thread=<ID>  -> golden-2,research  (msg-<ID>.md)\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "post",
+        "--from",
+        "golden-2",
+        "--to",
+        "golden-1",
+        "--type",
+        "reply",
+        "--re",
+        "@LAST",
+        "--subject",
+        "re: Need GPU numbers",
+        "--body",
+        "@BODY1"
+      ],
+      "code": 0,
+      "stdout": "posted <ID>  [#general]  thread=<ID>  -> golden-1  (msg-<ID>.md)\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "inbox",
+        "--for",
+        "golden-1",
+        "--open"
+      ],
+      "code": 0,
+      "stdout": " *<ID> #general      [open       ] reply        golden-2 -> golden-1           re: Need GPU numbers\n\n1 message(s). '*' = unread. Read: bun comms.ts read --for golden-1 --id <ID>\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "read",
+        "--for",
+        "golden-1",
+        "--id",
+        "@FIRST"
+      ],
+      "code": 0,
+      "stdout": "--- <ID> | thread <ID> | ask | open\nfrom golden-1 -> golden-2,research | <TS>\ntags: perf,gpu\n\n# Need GPU numbers\n\nBenchmark the kernel at 4k tiles.\n\n(file: messages/general/msg-<ID>.md)\n\nseen 1/1  ·  read: golden-2⤷  ·  unread: —\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "receipts",
+        "--id",
+        "@FIRST"
+      ],
+      "code": 0,
+      "stdout": "<ID>  [ask/open]  golden-1 -> golden-2,research\n  Need GPU numbers\n  seen 1/1  ·  read: golden-2⤷  ·  unread: —\n  (✓ = opened via read · ⤷ = inferred from a reply)\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "channels"
+      ],
+      "code": 0,
+      "stdout": "channels:\n  #general           2 msgs  last=<TS>  tooling / meta / cross-project chatter\n\nfilter any view: --channel <name>  ·  post to one: post ... --channel <name> (or reply, which inherits)\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "who"
+      ],
+      "code": 0,
+      "stdout": "active agents:\n  ● golden-1             role=lab            caps=gpu,kernels              seen=<TS>\n  ● golden-2             role=research       caps=-                        seen=<TS>\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "ack",
+        "--from",
+        "golden-1",
+        "--id",
+        "@FIRST"
+      ],
+      "code": 0,
+      "stdout": "<ID> -> acked\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "status",
+        "--from",
+        "golden-1",
+        "--id",
+        "@FIRST",
+        "--state",
+        "done"
+      ],
+      "code": 0,
+      "stdout": "<ID> -> done\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "post",
+        "--from",
+        "golden-1",
+        "--to",
+        "@all",
+        "--type",
+        "announce",
+        "--channel",
+        "golden-chan",
+        "--subject",
+        "Hello",
+        "--body",
+        "cross-channel announce"
+      ],
+      "code": 0,
+      "stdout": "posted <ID>  [#golden-chan]  thread=<ID>  -> @all  (msg-<ID>.md)\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "post",
+        "--from",
+        "golden-1",
+        "--to",
+        "ghost",
+        "--type",
+        "note",
+        "--re",
+        "@FIRST",
+        "--subject",
+        "thread inherit",
+        "--body",
+        "should inherit general"
+      ],
+      "code": 0,
+      "stdout": "posted <ID>  [#general]  thread=<ID>  -> ghost  (msg-<ID>.md)\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "thread",
+        "--id",
+        "@FIRST"
+      ],
+      "code": 0,
+      "stdout": "thread <ID>  (1 message(s))\n  <ID> #general      [done       ] ask          golden-1 -> golden-2,research  Need GPU numbers  seen 1/1\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "inbox",
+        "--for",
+        "golden-2",
+        "--unread"
+      ],
+      "code": 0,
+      "stdout": " *<ID> #general      [done       ] ask          golden-1 -> golden-2,research  Need GPU numbers\n *<ID> #golden-chan  [open       ] announce     golden-1 -> @all               Hello\n\n2 message(s). '*' = unread. Read: bun comms.ts read --for golden-2 --id <ID>\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "status",
+        "--from",
+        "golden-1",
+        "--id",
+        "@FIRST",
+        "--state",
+        "bogus"
+      ],
+      "code": 2,
+      "stdout": "",
+      "stderr": "error: state must be one of acked,blocked,done,in_progress,open\n"
+    },
+    {
+      "cmd": [
+        "read",
+        "--for",
+        "golden-1",
+        "--id",
+        "nope-0000"
+      ],
+      "code": 1,
+      "stdout": "",
+      "stderr": "no such message: nope-0000\n"
+    },
+    {
+      "cmd": [
+        "join",
+        "--agent",
+        "golden-1",
+        "--role",
+        "lab",
+        "--fingerprint",
+        "fp-golden"
+      ],
+      "code": 0,
+      "stdout": "joined: golden-1 (role=lab, caps=-, fp=fp-golde…)\nactive agents:\n  ● golden-1             role=lab            caps=-                        seen=<TS>\n  ● golden-2             role=research       caps=-                        seen=<TS>\n\n1 unresolved message(s) in flight. Run: bun comms.ts inbox --for golden-1 --open\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "join",
+        "--agent",
+        "impostor",
+        "--role",
+        "x",
+        "--fingerprint",
+        "fp-golden"
+      ],
+      "code": 3,
+      "stdout": "",
+      "stderr": "error: this runtime already joined as 'golden-1'. One id per agent.\n  Reconnect as yourself:  --agent golden-1\n  Or change your name (announces it to @all):  bun comms.ts rename --agent golden-1 --to impostor --fingerprint <fp>\n"
+    },
+    {
+      "cmd": [
+        "rename",
+        "--agent",
+        "golden-2",
+        "--to",
+        "golden-2b",
+        "--fingerprint",
+        "fp-none-ok"
+      ],
+      "code": 0,
+      "stdout": "renamed golden-2 -> golden-2b (announced to @all). New activity uses golden-2b; history keeps golden-2.\n",
+      "stderr": ""
+    },
+    {
+      "cmd": [
+        "watch",
+        "--for",
+        "golden-1",
+        "--once"
+      ],
+      "code": 0,
+      "stdout": "watch: golden-1 (role=lab) scope=addressed to me; every 3s; one-shot. baseline=<N> msgs\n",
+      "stderr": ""
+    }
+  ],
+  "files": {
+    "messages/golden-chan/msg-<TS>-golden-1-announce-<SUF>.md": "---\n{\n  \"id\": \"<ID>\",\n  \"channel\": \"golden-chan\",\n  \"thread\": \"<ID>\",\n  \"re\": null,\n  \"from\": \"golden-1\",\n  \"to\": [\n    \"@all\"\n  ],\n  \"type\": \"announce\",\n  \"status\": \"open\",\n  \"tags\": [],\n  \"created_at\": \"<TS>\"\n}\n---\n\n# Hello\n\ncross-channel announce\n",
+    "messages/general/msg-<TS>-golden-2b-announce-<SUF>.md": "---\n{\n  \"id\": \"<ID>\",\n  \"channel\": \"general\",\n  \"thread\": \"<ID>\",\n  \"re\": null,\n  \"from\": \"golden-2\",\n  \"to\": [\n    \"@all\"\n  ],\n  \"type\": \"announce\",\n  \"status\": \"open\",\n  \"tags\": [\n    \"identity\",\n    \"rename\"\n  ],\n  \"created_at\": \"<TS>\"\n}\n---\n\n# Agent rename: golden-2 -> golden-2b\n\nIdentity change: golden-2 is now golden-2b (same runtime). Please update routing; historical messages keep sender=golden-2.\n",
+    "messages/general/msg-<TS>-golden-1-note-<SUF>.md": "---\n{\n  \"id\": \"<ID>\",\n  \"channel\": \"general\",\n  \"thread\": \"<ID>\",\n  \"re\": \"<ID>\",\n  \"from\": \"golden-1\",\n  \"to\": [\n    \"ghost\"\n  ],\n  \"type\": \"note\",\n  \"status\": \"open\",\n  \"tags\": [],\n  \"created_at\": \"<TS>\"\n}\n---\n\n# thread inherit\n\nshould inherit general\n",
+    "messages/general/msg-<TS>-golden-2-reply-<SUF>.md": "---\n{\n  \"id\": \"<ID>\",\n  \"channel\": \"general\",\n  \"thread\": \"<ID>\",\n  \"re\": \"<ID>\",\n  \"from\": \"golden-2\",\n  \"to\": [\n    \"golden-1\"\n  ],\n  \"type\": \"reply\",\n  \"status\": \"open\",\n  \"tags\": [],\n  \"created_at\": \"<TS>\"\n}\n---\n\n# re: Need GPU numbers\n\nGot numbers: 3.2 TFLOPs. See attached.\n",
+    "messages/general/msg-<TS>-golden-1-ask-<SUF>.md": "---\n{\n  \"id\": \"<ID>\",\n  \"channel\": \"general\",\n  \"thread\": \"<ID>\",\n  \"re\": null,\n  \"from\": \"golden-1\",\n  \"to\": [\n    \"golden-2\",\n    \"research\"\n  ],\n  \"type\": \"ask\",\n  \"status\": \"open\",\n  \"tags\": [\n    \"perf\",\n    \"gpu\"\n  ],\n  \"created_at\": \"<TS>\"\n}\n---\n\n# Need GPU numbers\n\nBenchmark the kernel at 4k tiles.\n"
+  }
+}

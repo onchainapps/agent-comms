@@ -342,7 +342,7 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
   // ---------- commands ----------
 
   function joinAgent(ctx: Ctx, p: { agent: string; role: string; caps?: string; fingerprint?: string | null }): Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number }> {
-    if (!p.agent || !p.role) return { error: "usage", detail: "join requires agent and role" };
+    if (!p.agent || !p.role) return { error: "usage", detail: "error: join requires --agent and --role" };
     if (!ID_RE.test(p.agent)) return { error: "usage", detail: `invalid agent id: ${p.agent}` };
     if (mode === "server" && p.agent !== ctx.principal.agentId)
       return { error: "forbidden", detail: `agent assertion '${p.agent}' != principal '${ctx.principal.agentId}'` };
@@ -351,10 +351,13 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
     if (fp) {
       const byFp = d.query("SELECT id FROM agents WHERE fingerprint=?").get(fp) as any;
       if (byFp && byFp.id !== p.agent)
-        return { error: "identity_conflict", detail: `this runtime already joined as '${byFp.id}'. One id per agent.` };
+        return { error: "identity_conflict", detail:
+          `error: this runtime already joined as '${byFp.id}'. One id per agent.\n` +
+          `  Reconnect as yourself:  --agent ${byFp.id}\n` +
+          `  Or change your name (announces it to @all):  bun comms.ts rename --agent ${byFp.id} --to ${p.agent} --fingerprint <fp>` };
       const byId = d.query("SELECT fingerprint FROM agents WHERE id=?").get(p.agent) as any;
       if (byId && byId.fingerprint && byId.fingerprint !== fp)
-        return { error: "identity_conflict", detail: `id '${p.agent}' is already claimed by another runtime.` };
+        return { error: "identity_conflict", detail: `error: id '${p.agent}' is already claimed by another runtime. Pick a different id, or coordinate a rename.` };
     }
     d.run(
       `INSERT INTO agents(id,role,caps,pid,joined_at,last_seen,meta,fingerprint,kind) VALUES(?,?,?,?,?,?,?,?,?)
@@ -373,7 +376,7 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
   }
 
   function listAgents(activeOnly: boolean): AgentRow[] {
-    return (d.query("SELECT * FROM agents ORDER BY last_seen DESC").all() as AgentRow[])
+    return (d.query("SELECT * FROM agents ORDER BY last_seen DESC, rowid ASC").all() as AgentRow[])
       .filter((r) => !!r.id)
       .filter((r) => (activeOnly ? isActive(r.last_seen ?? "") : true));
   }
@@ -383,9 +386,9 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
     thread?: string | null; re?: string | null; tags?: string; channel?: string | null;
     as?: string | null; idempotencyKey?: string | null;
   }): Res<{ id: string; channel: string; thread: string; file: string }> {
-    if (!p.from || !p.to) return { error: "usage", detail: "post requires from and to" };
+    if (!p.from || !p.to) return { error: "usage", detail: "error: post requires --from and --to" };
     if (!ID_RE.test(p.from)) return { error: "usage", detail: `invalid from id: ${p.from}` };
-    if (!MSG_TYPES.includes(p.type as any)) return { error: "usage", detail: `--type must be one of ${MSG_TYPES.join(",")}` };
+    if (!MSG_TYPES.includes(p.type as any)) return { error: "usage", detail: `error: --type must be one of ${MSG_TYPES.join(",")}` };
     if (!TYPE_RE.test(p.type)) return { error: "usage", detail: `invalid type: ${p.type}` };
     if (p.channel !== undefined && p.channel !== null && !ID_RE.test(p.channel))
       return { error: "usage", detail: `invalid channel: ${p.channel}` };
@@ -480,7 +483,8 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
     }
 
     const content = renderMd(m);
-    file = seams.mirror(join(MSG_DIR, channel), fname, content);
+    seams.mirror(join(MSG_DIR, channel), fname, content);
+    file = join("messages", channel, fname); // display path, relative to home (old contract)
     d.run("UPDATE messages SET file=? WHERE id=?", [file, m.id]);
     m.file = file;
     return { value: { id: m.id, channel, thread, file } };
@@ -527,7 +531,7 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
   }
 
   function setStatus(ctx: Ctx, p: { agent: string; id: string; state: string }): Res<{ id: string; status: string }> {
-    if (!STATES.includes(p.state as any)) return { error: "usage", detail: `state must be one of ${STATES.join(",")}` };
+    if (!STATES.includes(p.state as any)) return { error: "usage", detail: `error: state must be one of ${STATES.join(",")}` };
     const r = d.query("SELECT * FROM messages WHERE id=?").get(p.id) as MsgRow | null;
     if (!r) return { error: "not_found", detail: `no such message: ${p.id}` };
     if (mode === "local") touch(p.agent);
@@ -553,19 +557,19 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
   }
 
   function rename(ctx: Ctx, p: { agent: string; to: string; fingerprint?: string | null }): Res<{ announced: MsgRow }> {
-    if (!p.agent || !p.to) return { error: "usage", detail: "rename requires agent and to" };
+    if (!p.agent || !p.to) return { error: "usage", detail: "error: rename requires --agent <old> --to <new>" };
     if (!ID_RE.test(p.to)) return { error: "usage", detail: `invalid new id: ${p.to}` };
     const old = d.query("SELECT * FROM agents WHERE id=?").get(p.agent) as any;
-    if (!old) return { error: "not_found", detail: `no such agent '${p.agent}'` };
+    if (!old) return { error: "not_found", detail: `error: no such agent '${p.agent}'` };
     if (mode === "server") {
       const isAdmin = ctx.principal.scopes.includes("agents:admin");
       if (p.agent !== ctx.principal.agentId && !isAdmin)
         return { error: "forbidden", detail: "renaming others requires agents:admin" };
     } else if (old.fingerprint && old.fingerprint !== (p.fingerprint ?? null)) {
-      return { error: "identity_conflict", detail: `rename of '${p.agent}' must come from the same runtime (fingerprint mismatch).` };
+      return { error: "identity_conflict", detail: `error: rename of '${p.agent}' must come from the same runtime (fingerprint mismatch).` };
     }
     if (d.query("SELECT id FROM agents WHERE id=?").get(p.to))
-      return { error: "identity_conflict", detail: `id '${p.to}' already exists — pick a free name.` };
+      return { error: "identity_conflict", detail: `error: id '${p.to}' already exists — pick a free name.` };
     const t = nowIso();
     ensureChannel("general", p.to);
     const mid = newId(String(p.to).split("-")[0]);
@@ -578,7 +582,8 @@ function openBusCore({ home, mode, seams = defaultSeams, busyTimeoutMs }: BusOpt
       file: "", created_at: t, updated_at: t, channel: "general", meta: null,
     };
     // QUIRK preserved: mirror written BEFORE the agents UPDATE (announce msg first).
-    m.file = seams.mirror(join(MSG_DIR, "general"), fname, renderMd(m));
+    seams.mirror(join(MSG_DIR, "general"), fname, renderMd(m));
+    m.file = join("messages", "general", fname);
     // §4: single transaction — announce + id move + dependent rows
     try {
       d.exec("BEGIN IMMEDIATE");
