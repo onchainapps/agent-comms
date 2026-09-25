@@ -480,6 +480,9 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const t = nowIso();
     const r = d.run("UPDATE agents SET last_seen=? WHERE id=?", [t, agent]);
     if (r.changes === 0 && mode === "local") {
+      // G6 one-way door: touch() is an agents-insert path too — a RETIRED id
+      // must never be resurrected by post/inbox/read/setStatus touching (B1).
+      if (d.query("SELECT 1 FROM agent_retired WHERE id=?").get(agent)) return;
       d.run(
         "INSERT OR IGNORE INTO agents(id,role,caps,pid,joined_at,last_seen,meta) VALUES(?,?,?,?,?,?,?)",
         [agent, agent, "", seams.pid(), t, t, "{}"],
@@ -586,14 +589,11 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     }
   }
 
-  /** G2w-v branch of (iv): pair lookup first; missing ⇒ create iff the FINAL
-   *  sender ∈ {lo,hi} AND both ids exist as agents AND neither is retired.
-   *  Every other outcome is the SAME not_found as a non-party naming an
-   *  existing dm channel — channel existence is never an oracle. UNIQUE name
-   *  collision ⇒ rollback, re-read the pair, post into the winner if member. */
-  function dmResolvePair(lo: string, hi: string, sender: string, requireAgents = true): Res<{ channel: string; members: string[] }> {
-    const hit = dmChannelForPair(lo, hi);
-    if (hit) return { value: { channel: hit, members: dmMembers(hit) } };
+  /** M2/M3 split of dmResolvePair: the GATE is a pure predicate (no writes) so
+   *  post() can defer channel creation into the message txn. not_found detail
+   *  is built from the REQUESTED pair's canonical name — never a stored name —
+   *  so channel existence is never an oracle (G2w-v). */
+  function dmGate(lo: string, hi: string, sender: string, requireAgents = true): BusError | null {
     const agentExists = (id: string) => d.query("SELECT 1 FROM agents WHERE id=?").get(id) !== null;
     // requireAgents = the server-mode oracle closure (G2w-v). Local mode is the
     // bypass (host = root; ids mint implicitly everywhere), so only the retired
@@ -601,9 +601,34 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     if (!sender || sender !== lo && sender !== hi || (requireAgents && (!agentExists(lo) || !agentExists(hi))) ||
         d.query("SELECT 1 FROM agent_retired WHERE id IN (?,?)").get(lo, hi))
       return { error: "not_found", detail: `no such channel: ${dmChannelName(lo, hi)}` };
+    return null;
+  }
+
+  /** G2w-v branch of (iv): pair lookup first; missing ⇒ gate then create. */
+  function dmResolvePair(lo: string, hi: string, sender: string, requireAgents = true): Res<{ channel: string; members: string[] }> {
+    const hit = dmChannelForPair(lo, hi);
+    if (hit) return { value: { channel: hit, members: dmMembers(hit) } };
+    const g = dmGate(lo, hi, sender, requireAgents);
+    if (g) return g;
     const en = dmEnsure(lo, hi, sender);
     if (en.error) return en;
     return { value: { channel: en.value.channel, members: dmMembers(en.value.channel) } };
+  }
+
+  /** M3: txn-LESS channel creation for the message's IMMEDIATE txn. Caller is
+   *  already inside BEGIN IMMEDIATE. ~n allocation stays inside this txn only. */
+  function dmCreateInTxn(lo: string, hi: string, by: string): string {
+    const t = nowIso();
+    let chan = dmChannelName(lo, hi);
+    if (d.query("SELECT 1 FROM channels WHERE name=?").get(chan)) {
+      let n = 1;
+      while (d.query("SELECT 1 FROM channels WHERE name=?").get(`dm~${lo}~${hi}~${n}`)) n++;
+      chan = `dm~${lo}~${hi}~${n}`;
+    }
+    d.run("INSERT INTO channels(name,purpose,created_at,created_by) VALUES(?,?,?,?)", [chan, "", t, by]);
+    d.run("INSERT INTO channel_members(channel,agent_id) VALUES(?,?)", [chan, lo]);
+    d.run("INSERT INTO channel_members(channel,agent_id) VALUES(?,?)", [chan, hi]);
+    return chan;
   }
 
   // ---------- F: group operations (self-organizing — NO scope to create/join/leave) ----------
@@ -613,24 +638,34 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   function groupEnsure(name: string, by: string): Res<{ name: string; created: boolean }> {
     const ex = d.query("SELECT name FROM groups WHERE name=?").get(name);
     if (ex) return { value: { name, created: false } };
-    const t = nowIso();
+    let created = false;
     try {
       d.exec("BEGIN IMMEDIATE");
       try {
-        if (d.query("SELECT name FROM groups WHERE name=?").get(name)) { d.exec("COMMIT"); return { value: { name, created: false } }; }
-        const tomb = (d.query("SELECT deleted_at FROM group_tombstones WHERE name=?").get(name) as any)?.deleted_at as string | undefined;
-        if (tomb !== undefined && t <= tomb) { d.exec("ROLLBACK"); return { error: "contention", detail: `group '${name}' deleted <1s ago; retry after the second boundary` }; }
-        const created = (d.query("SELECT count(*) c FROM groups WHERE created_by=?").get(by) as any).c;
-        if (created >= 64) { d.exec("ROLLBACK"); return { error: "usage", detail: "group squatting cap: 64 groups created per agent" }; }
-        d.run("INSERT INTO groups(name,created_by,created_at) VALUES(?,?,?)", [name, by, t]);
+        const r = groupEnsureInTxn(name, by);
+        if ("error" in r) { d.exec("ROLLBACK"); return r; }
+        created = r.created;
         d.exec("COMMIT");
       } catch (e) { d.exec("ROLLBACK"); throw e; }
-      return { value: { name, created: true } };
+      return { value: { name, created } };
     } catch (e: any) {
       const msg = String(e?.message ?? e);
       if (msg.includes("SQLITE_BUSY")) return { error: "contention", detail: "busy" };
       return { error: "internal", detail: `groupEnsure: ${msg}` };
     }
+  }
+
+  /** txn-LESS core — caller already holds BEGIN IMMEDIATE (m9: groupJoin runs
+   *  ensure+cap+insert as ONE txn so a concurrent delete can't orphan us). */
+  function groupEnsureInTxn(name: string, by: string): { created: boolean } | BusError {
+    if (d.query("SELECT name FROM groups WHERE name=?").get(name)) return { created: false };
+    const t = nowIso();
+    const tomb = (d.query("SELECT deleted_at FROM group_tombstones WHERE name=?").get(name) as any)?.deleted_at as string | undefined;
+    if (tomb !== undefined && t <= tomb) return { error: "contention", detail: `group '${name}' deleted <1s ago; retry after the second boundary` };
+    const created = (d.query("SELECT count(*) c FROM groups WHERE created_by=?").get(by) as any).c;
+    if (created >= 64) return { error: "usage", detail: "group squatting cap: 64 groups created per agent" };
+    d.run("INSERT INTO groups(name,created_by,created_at) VALUES(?,?,?)", [name, by, t]);
+    return { created: true };
   }
 
   function groupCreate(ctx: Ctx<M>, p: { name: string; agent?: string }): Res<{ name: string; created: boolean }> {
@@ -642,20 +677,39 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     return groupEnsure(p.name, self);
   }
 
-  /** join = create-if-missing + add self. Caps: <=64 groups/agent, <=512 members/group. */
+  /** join = create-if-missing + add self. Caps: <=64 groups/agent (counting
+   *  NEW memberships only — m8: re-joining an existing group must not fail at
+   *  the cap), <=512 members/group (m1). m9: ensure+cap+insert in ONE txn so a
+   *  concurrent groupDelete cannot orphan a membership onto the NEXT
+   *  incarnation, and the cap is not TOCTOU. */
   function groupJoin(ctx: Ctx<M>, p: { name: string; agent?: string }): Res<{ name: string; members: string[] }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (!ID_RE.test(p.name)) return { error: "usage", detail: `invalid group name: ${p.name}` };
     const self = p.agent ?? ctx.principal.agentId;
     if (self !== ctx.principal.agentId && !isRootCtx(ctx))
       return { error: "forbidden", detail: "group agent is an assertion — self only (else anyone subscribes others to 500 groups)" };
-    const en = groupEnsure(p.name, self);
-    if (en.error) return en;
-    const nGroups = (d.query("SELECT count(*) c FROM group_members WHERE agent_id=?").get(self) as any).c;
-    if (nGroups >= 64) return { error: "usage", detail: "cap: 64 groups per agent (bounds the delivery arm's seeks)" };
     const t = nowIso();
-    d.run("INSERT OR IGNORE INTO group_members(grp,agent_id,joined_at,created_by) VALUES(?,?,?,?)", [p.name, self, t, self]);
-    return { value: { name: p.name, members: dmMembersLike(p.name) } };
+    try {
+      d.exec("BEGIN IMMEDIATE");
+      try {
+        const en = groupEnsureInTxn(p.name, self);
+        if ("error" in en) { d.exec("ROLLBACK"); return en; }
+        const already = d.query("SELECT 1 FROM group_members WHERE grp=? AND agent_id=?").get(p.name, self);
+        if (!already) {
+          const nGroups = (d.query("SELECT count(*) c FROM group_members WHERE agent_id=?").get(self) as any).c;
+          if (nGroups >= 64) { d.exec("ROLLBACK"); return { error: "usage", detail: "cap: 64 groups per agent (bounds the delivery arm's seeks)" }; }
+          const nMembers = (d.query("SELECT count(*) c FROM group_members WHERE grp=?").get(p.name) as any).c;
+          if (nMembers >= 512) { d.exec("ROLLBACK"); return { error: "usage", detail: "cap: 512 members per group" }; }
+          d.run("INSERT INTO group_members(grp,agent_id,joined_at,created_by) VALUES(?,?,?,?)", [p.name, self, t, self]);
+        }
+        d.exec("COMMIT");
+      } catch (e) { d.exec("ROLLBACK"); throw e; }
+      return { value: { name: p.name, members: dmMembersLike(p.name) } };
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      if (msg.includes("SQLITE_BUSY")) return { error: "contention", detail: "busy" };
+      return { error: "internal", detail: `groupJoin: ${msg}` };
+    }
   }
 
   const dmMembersLike = (grp: string) =>
@@ -736,8 +790,12 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const readMap = new Map<string, string | null>();
     for (const r of d.query("SELECT agent, read_at FROM reads WHERE msg=?").all(msg.id) as any[])
       readMap.set(r.agent, r.read_at);
-    for (const r of d.query("SELECT DISTINCT sender FROM messages WHERE re=?").all(msg.id) as any[])
-      if (!readMap.has(r.sender)) readMap.set(r.sender, null);
+    // m7 (claude): reply-inference must respect canSee — a reply hidden in a DM
+    // must not mark its sender "seen (replied)" to a caller who cannot read the
+    // REPLY row itself. Rule: inference only from rows the caller can see.
+    for (const r of d.query("SELECT sender, channel FROM messages WHERE re=?").all(msg.id) as any[])
+      if (!readMap.has(r.sender) && (!ctx || mode === "local" || canSeeChannel(ctx, r.channel)))
+        readMap.set(r.sender, null);
     return {
       intended,
       readers: intended.filter((id) => readMap.has(id)).map((id) => ({ id, at: readMap.get(id) ?? null })),
@@ -855,19 +913,40 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       }
       const isNew = !d.query("SELECT id FROM agents WHERE id=?").get(p.agent);
       // §5 role grammar applies to EVERY join (both modes); mint checks only on
-      // the INSERT branch (m-b).
+      // the INSERT branch (m-b). m3 (claude): checks + INSERT in ONE IMMEDIATE
+      // txn (m-c parity with the server branch) so a concurrent rename cannot
+      // TOCTOU between the retired/role read and the write.
       const rc = roleWriteChecks(p.role, p.agent);
       if (rc?.error) return rc.error;
-      const mc = isNew ? idMintChecks(p.agent) : null;
-      if (mc?.error) return mc.error;
-      for (const w of [...(mc?.warnings ?? []), ...(rc?.warnings ?? [])]) seams.warn?.(w);
-      d.run(
-        `INSERT INTO agents(id,role,caps,pid,joined_at,last_seen,meta,fingerprint,kind) VALUES(?,?,?,?,?,?,?,?,?)
-         ON CONFLICT(id) DO UPDATE SET role=excluded.role, caps=excluded.caps, pid=excluded.pid, last_seen=excluded.last_seen,
-           fingerprint=COALESCE(excluded.fingerprint, agents.fingerprint)`,
-        [p.agent, p.role, p.caps ?? "", seams.pid(), t, t, "{}", fp,
-         (d.query("SELECT kind FROM agents WHERE id=?").get(p.agent) as any)?.kind ?? "agent"],
-      );
+      if (isNew) {
+        const mc = idMintChecks(p.agent);
+        if (mc?.error) return mc.error;
+        for (const w of [...(mc?.warnings ?? []), ...(rc?.warnings ?? [])]) seams.warn?.(w);
+        try { d.exec("BEGIN IMMEDIATE"); } catch (e: any) {
+          if (String(e?.message ?? e).includes("SQLITE_BUSY")) return { error: "contention", detail: "busy" };
+          return { error: "internal", detail: `join: ${String(e?.message ?? e)}` };
+        }
+        try {
+          if (d.query("SELECT 1 FROM agent_retired WHERE id=?").get(p.agent)) { d.exec("ROLLBACK"); return { error: "identity_conflict", detail: `agent id '${p.agent}' is retired (renamed away) — one-way door (G6)` }; }
+          d.run(
+            `INSERT INTO agents(id,role,caps,pid,joined_at,last_seen,meta,fingerprint,kind) VALUES(?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(id) DO UPDATE SET role=excluded.role, caps=excluded.caps, pid=excluded.pid, last_seen=excluded.last_seen,
+               fingerprint=COALESCE(excluded.fingerprint, agents.fingerprint)`,
+            [p.agent, p.role, p.caps ?? "", seams.pid(), t, t, "{}", fp,
+             (d.query("SELECT kind FROM agents WHERE id=?").get(p.agent) as any)?.kind ?? "agent"],
+          );
+          d.exec("COMMIT");
+        } catch (e) { d.exec("ROLLBACK"); throw e; }
+      } else {
+        for (const w of rc?.warnings ?? []) seams.warn?.(w);
+        d.run(
+          `INSERT INTO agents(id,role,caps,pid,joined_at,last_seen,meta,fingerprint,kind) VALUES(?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(id) DO UPDATE SET role=excluded.role, caps=excluded.caps, pid=excluded.pid, last_seen=excluded.last_seen,
+             fingerprint=COALESCE(excluded.fingerprint, agents.fingerprint)`,
+          [p.agent, p.role, p.caps ?? "", seams.pid(), t, t, "{}", fp,
+           (d.query("SELECT kind FROM agents WHERE id=?").get(p.agent) as any)?.kind ?? "agent"],
+        );
+      }
     }
     const row = d.query("SELECT * FROM agents WHERE id=?").get(p.agent) as AgentRow;
     // n6 (claude): unresolved count under canSee — a non-party's DM traffic must
@@ -919,6 +998,9 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     if (p.channel !== undefined && p.channel !== null && !validChannelName(p.channel))
       return { error: "usage", detail: `invalid channel: ${p.channel}` };
 
+    // m1 (claude/grok): §9 recipients cap — group: tokens count as one target.
+    if (csv(p.to).length > 32) return { error: "usage", detail: "recipients cap: 32 targets per message" };
+
     // F n3: post addressed to group:<nonexistent> is rejected up front — nobody
     // pre-addresses a name and squats traffic by creating the group later.
     for (const t0 of csv(p.to))
@@ -947,6 +1029,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
         body: p.body, to: csv(p.to).sort(), channel: p.channel ?? null, type: p.type,
         subject: p.subject ?? "", thread: p.thread ?? null, re: p.re ?? null,
         tags: p.tags ?? "", as: p.as ?? null,
+        // m5 (claude): dm participates in the hash ONLY when set, so hashes of
+        // pre-M1.5 rows stay stable across the upgrade (same-key dm:bob vs
+        // dm:carol must conflict per §6).
+        ...(p.dm !== undefined && p.dm !== null ? { dm: p.dm } : {}),
       }));
       idem = { key, hash };
       const prev = d.query("SELECT msg_id, req_hash FROM idempotency WHERE agent_id=? AND key=?")
@@ -1002,22 +1088,42 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     }
 
     // G1 dm sugar: channel + recipients = the peer (pair-keyed, like everything dm).
+    // M3 (claude/grok round 1): creation writes are DEFERRED into the message's
+    // IMMEDIATE txn — a usage reject must leave NO channel row. Channel writes
+    // for a missing pair happen only after every validation has passed.
     let dmMembersResolved: string[] | null = null;
+    let dmPending: { lo: string; hi: string } | null = null;
+    let requestedChannel = channel; // M2: not_found detail is request-derived, never stored-name
     if (p.dm !== undefined && p.dm !== null) {
       const me = sender, peer = p.dm;
       if (me === peer) return { error: "usage", detail: "self-DM rejected (lo == hi)" };
+      // m6 (claude): dm is mutually exclusive with channel; to must be omitted
+      // or equal the peer — a silent reroute public→dm (or to=@all) is a footgun.
+      if (p.channel !== undefined && p.channel !== null)
+        return { error: "usage", detail: "dm and channel are mutually exclusive" };
+      const toToks = csv(p.to);
+      if (toToks.length && (toToks.length !== 1 || toToks[0] !== peer))
+        return { error: "usage", detail: `with dm, to must be omitted or equal the peer: ${p.to}` };
       const [lo, hi] = me < peer ? [me, peer] : [peer, me];
-      const en = dmResolvePair(lo, hi, sender, dmRules);
-      if (en.error) return en;
-      channel = en.value.channel;
-      dmMembersResolved = en.value.members;
+      const hit = dmChannelForPair(lo, hi);
+      if (hit) {
+        channel = hit;
+        dmMembersResolved = dmMembers(hit);
+      } else {
+        const g = dmGate(lo, hi, sender, dmRules);
+        if (g) return g;
+        dmPending = { lo, hi };
+        channel = dmChannelName(lo, hi); // tentative; ~n may allocate inside the txn
+        dmMembersResolved = [lo, hi];
+      }
+      requestedChannel = dmChannelName(lo, hi);
       p = { ...p, to: peer };
     }
 
     // dm-shaped channel: an EXISTING channel row is used under its stored name
     // as-is — the name is a frozen label and channel_members is the authority
     // (G0: never re-sort current ids into a name after rename). Only a MISSING
-    // dm channel routes through the pair-keyed creation helper (client ~n is
+    // dm channel routes through the pair-keyed creation path (client ~n is
     // stripped there — the pair, not the name, is the key).
     if (channel !== null && DM_SHAPED_RE.test(channel) && dmMembersResolved === null) {
       if (d.query("SELECT 1 FROM channels WHERE name=?").get(channel)) {
@@ -1027,10 +1133,17 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
         if (!dm) return { error: "usage", detail: `invalid dm channel name: ${channel}` };
         const [lo, hi] = dm[1] < dm[2] ? [dm[1], dm[2]] : [dm[2], dm[1]];
         if (lo === hi) return { error: "usage", detail: "self-DM channel rejected (lo == hi)" };
-        const en = dmResolvePair(lo, hi, sender, dmRules);
-        if (en.error) return en;
-        channel = en.value.channel;
-        dmMembersResolved = en.value.members;
+        const hit = dmChannelForPair(lo, hi); // stored-name reuse under the frozen label
+        if (hit) {
+          channel = hit;
+          dmMembersResolved = dmMembers(hit);
+        } else {
+          const g = dmGate(lo, hi, sender, dmRules);
+          if (g) return g;
+          dmPending = { lo, hi };
+          channel = dmChannelName(lo, hi);
+          dmMembersResolved = [lo, hi];
+        }
       }
     }
 
@@ -1045,8 +1158,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     if (channel !== null && DM_SHAPED_RE.test(channel)) {
       const members = dmMembersResolved ?? dmMembers(channel);
       if (dmRules) {
+        // M2: detail is REQUEST-derived (requestedChannel), never the stored
+        // frozen name — a non-party must not learn the DM exists or its label.
         if (!members.includes(sender))
-          return { error: "not_found", detail: `no such channel: ${channel}` }; // == missing
+          return { error: "not_found", detail: `no such channel: ${requestedChannel ?? channel}` }; // == missing
         for (const t0 of csv(p.to)) {
           if (t0 === "@all" || t0.startsWith("group:") || !members.includes(t0))
             return { error: "usage", detail: `dm recipients must be literal member ids (subset of members; no @all/group/wildcards): ${t0}` };
@@ -1075,6 +1190,28 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     try {
       d.exec("BEGIN IMMEDIATE");
       try {
+        // M3: missing-pair dm creation happens HERE — channel row + exactly 2
+        // members + message in ONE txn (G2w-v). A reject before this point left
+        // no channel row; a UNIQUE collision here re-reads the pair and posts
+        // into the winner (never internal).
+        if (dmPending) {
+          const win = dmChannelForPair(dmPending.lo, dmPending.hi);
+          if (win) channel = win;
+          else {
+            try { channel = dmCreateInTxn(dmPending.lo, dmPending.hi, sender); }
+            catch (e: any) {
+              if (!String(e?.message ?? e).includes("UNIQUE")) throw e;
+              const w2 = dmChannelForPair(dmPending.lo, dmPending.hi);
+              if (!w2) throw e;
+              channel = w2;
+            }
+          }
+          m.channel = channel;
+          if (!dmMembers(channel).includes(sender)) {
+            d.exec("ROLLBACK"); // never return out of an open txn
+            return { error: "not_found", detail: `no such channel: ${requestedChannel ?? channel}` };
+          }
+        }
         let id = mid, tries = 0;
         for (;;) {
           try {
@@ -1130,9 +1267,13 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     // G2: confidentiality subject is the CALLER. A for≠self peek (read:all)
     // sees the other's DM rows only with read:dm too; a self inbox sees own DMs
     // as member. Local mode: see-all quirk (canSeeChannel returns true).
+    // n2 (claude): one peek rule everywhere — a DM row is peek-visible when the
+    // CALLER holds read:dm OR is itself a member of that channel (matching the
+    // read/waitStep behavior; the party exemption was missing only here).
     const callerSeesDm = (ch: string) =>
       canSeeChannel(ctx, ch) &&
-      (p.agent === ctx.principal.agentId || isRootCtx(ctx) || !DM_SHAPED_RE.test(ch) || hasScope(ctx, "read:dm"));
+      (p.agent === ctx.principal.agentId || isRootCtx(ctx) || !DM_SHAPED_RE.test(ch) || hasScope(ctx, "read:dm") ||
+       dmMembers(ch).includes(ctx.principal.agentId));
     const rows = d.query("SELECT * FROM messages ORDER BY created_at ASC, rowid ASC").all() as MsgRow[];
     const readIds = new Set((d.query("SELECT msg FROM reads WHERE agent=?").all(p.agent) as any[]).map((x) => x.msg));
     const out = rows.filter((r) => {
@@ -1243,6 +1384,11 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     // agent may hold role == the new id.
     if (d.query("SELECT 1 FROM agent_retired WHERE id=?").get(p.to))
       return { error: "identity_conflict", detail: `error: id '${p.to}' was retired by an earlier rename — one-way door (G6).` };
+    // B1 extension (claude probe 3): a legacy row resurrected by the old
+    // touch() bug must get identity_conflict here, not internal UNIQUE failure
+    // on agent_retired.id — the half-open door must refuse, not crash.
+    if (d.query("SELECT 1 FROM agent_retired WHERE id=?").get(p.agent))
+      return { error: "identity_conflict", detail: `error: id '${p.agent}' is retired (renamed away) — cannot rename a retired id.` };
     if ((d.query("SELECT id FROM agents WHERE role=? AND id!=?").get(p.to, p.agent) as any)?.id)
       return { error: "identity_conflict", detail: `error: '${p.to}' is held as a role by another agent (N3) — pick a free name.` };
     const t = nowIso();
@@ -1266,6 +1412,12 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
           [m.id, m.thread, m.re, m.sender, m.recipients, m.type, m.status, m.tags, m.subject, m.body, m.file, m.created_at, m.updated_at, m.channel, null],
         );
         d.run("UPDATE agents SET id=?, last_seen=? WHERE id=?", [p.to, t, p.agent]);
+        // M5 (claude NEW, ruling adopted): an implicit role==own-former-id is
+        // an alias arm through the bare-token role match — contradicts C + R1
+        // (no agent may hold role == a retired id) and floods preflight noise.
+        // Rewrite the DEFAULT role (role == old id) to the new id. Explicit
+        // roles are untouched. Golden unaffected (fixture roles != ids).
+        d.run("UPDATE agents SET role=? WHERE id=? AND role=?", [p.to, p.to, p.agent]);
         d.run("UPDATE reads SET agent=? WHERE agent=?", [p.to, p.agent]);
         d.run("UPDATE tokens SET agent_id=? WHERE agent_id=?", [p.to, p.agent]);
         d.run("UPDATE cursors SET agent_id=? WHERE agent_id=?", [p.to, p.agent]);
@@ -1339,6 +1491,13 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
         // held as another agent's role hard-rejects (server) — local root is
         // the bootstrap path, so checks apply here too (INSERT OR IGNORE means
         // an EXISTING row is not a mint: checks only fire for new ids).
+        // G6/N3 + B1: the retired check runs EVEN IF an agents row exists —
+        // the exists-skip is the latch that let a touch()-resurrected id get
+        // credentialed. A row this bug already created must not be mintable.
+        if (d.query("SELECT 1 FROM agent_retired WHERE id=?").get(p.agent)) {
+          d.exec("ROLLBACK");
+          return { error: "identity_conflict", detail: `agent id '${p.agent}' is retired (renamed away) — cannot mint a token for it` };
+        }
         if (!d.query("SELECT 1 FROM agents WHERE id=?").get(p.agent)) {
           const mc = idMintChecks(p.agent);
           if (mc?.error) { d.exec("ROLLBACK"); return mc.error; }
@@ -1602,7 +1761,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     });
   }
 
-  function preflight(): { badIds: string[]; badChannels: string[]; zeroMemberDms: string[]; roleCollisions: string[] } {
+  function preflight(): { badIds: string[]; badChannels: string[]; zeroMemberDms: string[]; roleCollisions: string[]; phantomMembers: string[] } {
     const badIds = (d.query("SELECT DISTINCT id FROM agents").all() as any[])
       .map((r) => r.id).filter((id: string) => id && !ID_RE.test(id));
     // G1: preflight uses the SAME widened write-gate helper as post() — else
@@ -1619,8 +1778,13 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const roleCollisions = (d.query("SELECT id, role FROM agents WHERE role IS NOT NULL").all() as any[])
       .filter((r) => d.query("SELECT 1 FROM agents WHERE id=? AND id!=?").get(r.role, r.id) || d.query("SELECT 1 FROM agent_retired WHERE id=?").get(r.role))
       .map((r) => `${r.id}!role=${r.role}`);
-    return { badIds, badChannels: [...new Set(badChannels)], zeroMemberDms, roleCollisions };
+    return { badIds, badChannels: [...new Set(badChannels)], zeroMemberDms, roleCollisions, phantomMembers };
   }
+  // n1 (claude nit): channel_members rows pointing at non-agents (decision A
+  // allows a local DM to a not-yet-minted id) — listed so hosts can repair.
+  const phantomMembers = (d.query("SELECT DISTINCT agent_id FROM channel_members").all() as any[])
+    .map((r) => r.agent_id)
+    .filter((id: string) => !d.query("SELECT 1 FROM agents WHERE id=?").get(id));
 
   // local watch helpers (finding 9: no SQL above the core)
   function allMessages(): MsgRow[] {

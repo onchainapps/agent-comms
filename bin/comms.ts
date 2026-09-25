@@ -104,6 +104,16 @@ function cmdDm(a: Args) {
   console.log(`dm ${v.id}  [#${v.channel}]  thread=${v.thread}  -> ${a.to}  (${basename(v.file)})`);
 }
 
+// G4: dms --for <agent> — the agent's dm channels (member view), newest first.
+function cmdDms(a: Args) {
+  const who = a.agent ?? a.for;
+  if (!who) { console.error("error: dms requires --for"); process.exit(2); }
+  const chans = unwrap(bus.channels(localCtx(who))).filter((c: any) => String(c.name).startsWith("dm~"));
+  const mine = chans.filter((c: any) => bus.dmMembers(c.name).includes(who));
+  for (const c of mine) console.log(`#${c.name}  ${c.n} msg(s)  last=${c.last ?? "?"}  members=${bus.dmMembers(c.name).join(",")}`);
+  console.log(mine.length ? `\n${mine.length} dm channel(s) for ${who}. Read one: bun comms.ts inbox --for ${who} --channel <name>` : `(no DM channels for ${who})`);
+}
+
 // M1.5 F: group verbs (self-organizing; delete needs agents:admin — local root is).
 function cmdGroup(a: Args) {
   const sub = a._pos?.[0];
@@ -263,6 +273,7 @@ async function main() {
     case "who": return printWho(!a.all);
     case "post": return cmdPost(a);
     case "dm": return cmdDm(a);
+    case "dms": return cmdDms(a);
     case "group": return cmdGroup(a);
     case "inbox": return cmdInbox(a);
     case "read": return cmdRead(a);

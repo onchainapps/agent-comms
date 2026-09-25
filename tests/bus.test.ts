@@ -601,23 +601,28 @@ describe("M1.5 F/G — local direction + mechanics (unit)", () => {
     bus.close(); rmSync(home, { recursive: true, force: true });
   });
 
-  test("agent_retired chains (alice→bob then bob→carol ⇒ both renamed_to=carol); retired ids hard-reject mint + role", () => {
+  test("agent_retired chains (a→b then b⇒c ⇒ BOTH rows renamed_to=c); retired ids hard-reject mint + role", () => {
     const home = tmp();
     const bus = loc(home);
     const r = localCtx("x-root");
     bus.joinAgent(r, { agent: "ar-a", role: "a" });
-    bus.joinAgent(r, { agent: "ar-b", role: "b" });
-    expect(bus.rename(r, { agent: "ar-a", to: "ar-b2" }).error).toBeUndefined();
+    // REAL chain (m2): ar-a→ar-b, then the SAME agent (now ar-b)→ar-c. A
+    // swapped UPDATE bind (old,new vs new,old) would leave ar-a>ar-b here.
+    expect(bus.rename(r, { agent: "ar-a", to: "ar-b" }).error).toBeUndefined();
     expect(bus.rename(r, { agent: "ar-b", to: "ar-c" }).error).toBeUndefined();
     const rows = bus.testDb.query("SELECT id, renamed_to FROM agent_retired ORDER BY id").all() as any[];
-    expect(rows.map((x) => `${x.id}>${x.renamed_to}`).sort()).toEqual(["ar-a>ar-b2", "ar-b>ar-c"]);
+    expect(rows.map((x) => `${x.id}>${x.renamed_to}`).sort()).toEqual(["ar-a>ar-c", "ar-b>ar-c"]);
     // one-way door: re-mint retired id (local join INSERT path, m-b)
     expect(bus.joinAgent(r, { agent: "ar-a", role: "z" }).error).toBe("identity_conflict");
     // role == retired id rejected in local mode too (grok: never weakened)
     bus.joinAgent(r, { agent: "ar-mal", role: "ar-a" });
     expect((bus.joinAgent(r, { agent: "ar-mal", role: "ar-a" }) as any).error).toBe("identity_conflict");
     // rename BACK to a retired id refused
-    expect(bus.rename(r, { agent: "ar-b2", to: "ar-a" }).error).toBe("identity_conflict");
+    expect(bus.rename(r, { agent: "ar-c", to: "ar-a" }).error).toBe("identity_conflict");
+    // B1 extension: renaming a RETIRED id (legacy resurrected row) refuses
+    // identity_conflict, not internal UNIQUE failure.
+    bus.testDb.run("INSERT OR IGNORE INTO agents(id,role,caps,pid,joined_at,last_seen,meta) VALUES('ar-a','ar-a','',0,?,?,'{}')", [bus.nowIso(), bus.nowIso()]);
+    expect(bus.rename(r, { agent: "ar-a", to: "ar-d" }).error).toBe("identity_conflict");
     bus.close(); rmSync(home, { recursive: true, force: true });
   });
 

@@ -525,6 +525,124 @@ export function contractSuite(name: string, make: Factory) {
       });
     });
 
+    // ---- M1.5 round-1 review fixes (claude 572b / grok 8ea5) ----
+
+    test("M2: non-party dm not_found detail is REQUEST-derived, never the stored frozen name", async () => {
+      await withBus(async (h, root) => {
+        const a = ((await seedAgent(h, root, "o-alice", "oa")) as any).value.session as Session;
+        const b = ((await seedAgent(h, root, "o-bob", "ob")) as any).value.session as Session;
+        const mal = ((await seedAgent(h, root, "o-mal", "om")) as any).value.session as Session;
+        expect((await a.post({ from: "o-alice", to: "o-bob", type: "note", body: "hi", dm: "o-bob" })).error).toBeUndefined();
+        expect((await root.rename({ agent: "o-bob", to: "o-bob2" })).error).toBeUndefined();
+        // mallory names the re-derived (nonexistent) channel: detail must NOT
+        // reveal the stored dm~o-alice~o-bob — same shape as a never-existing pair.
+        const r1 = await mal.post({ from: "o-mal", to: "o-alice", type: "note", body: "x", channel: "dm~o-alice~o-bob2" });
+        const r2 = await mal.post({ from: "o-mal", to: "o-alice", type: "note", body: "x", channel: "dm~o-alice~o-zzz" });
+        expect(r1.error).toBe("not_found"); expect(r2.error).toBe("not_found");
+        // SAME shape: request-echo only. r1 must echo the REQUESTED name, and
+        // the stored frozen name (dm~o-alice~o-bob, no suffix) must not leak
+        // as a distinct string — detail equals "no such channel: <requested>".
+        expect((r1 as any).detail).toBe(`no such channel: dm~o-alice~o-bob2`);
+        expect((r2 as any).detail).toBe(`no such channel: dm~o-alice~o-zzz`);
+      });
+    });
+
+    test("M3: usage-rejected first dm post leaves NO channel row; party post writes all three rows", async () => {
+      await withBus(async (h, root) => {
+        const raw = (h as any).raw;
+        const a = ((await seedAgent(h, root, "u-alice", "ua")) as any).value.session as Session;
+        await seedAgent(h, root, "u-carol", "uc");
+        const r = await a.post({ from: "u-alice", to: "@all", type: "note", body: "x", channel: "dm~u-alice~u-carol" });
+        expect(r.error).toBe("usage"); // wildcard recipient
+        expect(raw.testDb.query("SELECT count(*) c FROM channels WHERE name='dm~u-alice~u-carol'").get().c).toBe(0); // rolled back
+        expect(raw.testDb.query("SELECT count(*) c FROM channel_members").get().c).toBe(0);
+        const ok = await a.post({ from: "u-alice", to: "u-carol", type: "note", body: "x", channel: "dm~u-alice~u-carol" });
+        expect(ok.error).toBeUndefined();
+        expect(raw.testDb.query("SELECT count(*) c FROM channels WHERE name='dm~u-alice~u-carol'").get().c).toBe(1);
+        expect(raw.testDb.query("SELECT count(*) c FROM channel_members WHERE channel='dm~u-alice~u-carol'").get().c).toBe(2);
+      });
+    });
+
+    test("m5: idempotency hash includes dm when set — same key, dm:bob vs dm:carol ⇒ conflict", async () => {
+      await withBus(async (h, root) => {
+        const a = ((await seedAgent(h, root, "i-alice", "ia")) as any).value.session as Session;
+        await seedAgent(h, root, "i-bob", "ib"); await seedAgent(h, root, "i-carol", "ic");
+        const p1 = await a.post({ from: "i-alice", to: "i-bob", type: "note", body: "b", dm: "i-bob", idempotencyKey: "k1" });
+        expect(p1.error).toBeUndefined();
+        const p2 = await a.post({ from: "i-alice", to: "i-carol", type: "note", body: "b", dm: "i-carol", idempotencyKey: "k1" });
+        expect(p2.error).toBe("conflict"); // dm participates in the hash (only when set)
+      });
+    });
+
+    test("m6: dm sugar is mutually exclusive with channel; to must be omitted or the peer", async () => {
+      await withBus(async (h, root) => {
+        const a = ((await seedAgent(h, root, "x-alice", "xa")) as any).value.session as Session;
+        await seedAgent(h, root, "x-bob", "xb");
+        expect((await a.post({ from: "x-alice", to: "x-bob", type: "note", body: "b", dm: "x-bob", channel: "general" })).error).toBe("usage");
+        expect((await a.post({ from: "x-alice", to: "@all", type: "note", body: "b", dm: "x-bob" })).error).toBe("usage");
+        const r = await a.post({ from: "x-alice", to: "x-bob", type: "note", body: "b", dm: "x-bob" });
+        expect(r.error).toBeUndefined();
+        expect((r as any).value.channel).toBe("dm~x-alice~x-bob");
+      });
+    });
+
+    test("m7: a DM reply does not leak 'seen (replied)' receipts to a caller who cannot see it", async () => {
+      await withBus(async (h, root) => {
+        const raw = (h as any).raw;
+        const mal = ((await seedAgent(h, root, "r-mal", "rm")) as any).value.session as Session;
+        const bob = ((await seedAgent(h, root, "r-bob", "rb")) as any).value.session as Session;
+        await seedAgent(h, root, "r-carol", "rc");
+        const pub = await mal.post({ from: "r-mal", to: "r-bob", type: "ask", body: "q", channel: "pub-m7" });
+        const pid = (pub as any).value.id;
+        // bob replies INSIDE a DM with carol — mal is NOT a party there.
+        const dm = await bob.post({ from: "r-bob", to: "r-carol", type: "note", body: "s", dm: "r-carol", re: pid });
+        expect(dm.error).toBeUndefined();
+        expect(raw.canSeeChannel({ principal: { agentId: "r-mal", kind: "agent", scopes: [] }, actor: "r-mal" } as any, (dm as any).value.channel)).toBe(false);
+        const rec = (await mal.receipts(pid)) as any;
+        expect(rec.error).toBeUndefined();
+        // the reply row is invisible to mal ⇒ no inference leak
+        expect(rec.value.receipts.readers.map((x: any) => x.id)).not.toContain("r-bob");
+        expect(rec.value.receipts.unread).toContain("r-bob");
+      });
+    });
+
+    test("M5: rename rewrites the DEFAULT role (role==old id) — no implicit alias arm, no preflight noise", async () => {
+      await withBus(async (h, root) => {
+        const raw = (h as any).raw;
+        // default-role agent: token.create mints role == id (NOT seedAgent's explicit role)
+        const tc = await root.tokenCreate({ agent: "d-bob" });
+        expect(tc.error).toBeUndefined();
+        const bob = h.session({ token: (tc as any).value.token });
+        const p = await root.post({ from: "root", to: "d-bob", type: "note", body: "literal" });
+        expect(p.error).toBeUndefined();
+        expect((await bob.inbox({ agent: "d-bob" }) as any).value.rows.length).toBe(1);
+        expect((await root.rename({ agent: "d-bob", to: "d-bobby" })).error).toBeUndefined();
+        // role rewritten: bare-token role match must NOT deliver old-id mail
+        const row = raw.testDb.query("SELECT role FROM agents WHERE id='d-bobby'").get() as any;
+        expect(row.role).toBe("d-bobby"); // not "d-bob" (== retired id ⇒ R1 violation)
+        const bobby = h.session({ token: (tc as any).value.token });
+        expect((await bobby.inbox({ agent: "d-bobby" }) as any).value.rows.map((r: any) => r.id)).not.toContain((p as any).value.id);
+        // post --to <retired id> no longer lands on the renamed agent via role
+        const q = await root.post({ from: "root", to: "d-bob", type: "note", body: "after" });
+        expect(q.error).toBeUndefined();
+        expect((await bobby.inbox({ agent: "d-bobby" }) as any).value.rows.map((r: any) => r.id)).not.toContain((q as any).value.id);
+        expect(raw.preflight().roleCollisions.filter((c: string) => c.startsWith("d-bobby!"))).toEqual([]);
+      });
+    });
+
+    test("m8: re-joining an existing group at the 64-group cap succeeds (cap counts NEW memberships)", async () => {
+      await withBus(async (h, root) => {
+        const a = ((await seedAgent(h, root, "cap-a", "ca")) as any).value.session as Session;
+        for (let i = 0; i < 64; i++) {
+          const g = "cg" + i;
+          expect((await a.groupCreate({ name: g })).error).toBeUndefined();
+          expect((await a.groupJoin({ name: g })).error).toBeUndefined();
+        }
+        expect((await a.groupJoin({ name: "cg0" })).error).toBeUndefined(); // idempotent at cap
+        expect((await a.groupJoin({ name: "cg64" })).error).toBe("usage");   // new membership fails
+      });
+    });
+
     // ================= M1.5 F — work-groups matrix (server direction) =================
 
     test("F late joiner sees earlier group traffic; leave stops delivery (delivery-time resolution)", async () => {

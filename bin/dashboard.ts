@@ -38,16 +38,19 @@ const OMNIVIEW = process.argv.includes("--omniview");
 
 const db = new Database(DB_PATH, { readonly: true });
 db.exec("PRAGMA busy_timeout = 3000");
-const dmStrip = !OMNIVIEW && !!db.query("SELECT 1 FROM channels WHERE name GLOB 'dm~*' LIMIT 1").get();
-if (dmStrip) console.error("dashboard: dm-shaped channels present — dm rows hidden (direct-DB pre-G binary); pass --omniview to show, or use the M4 web UI");
+// M4 (claude NEW): NO startup latch — the filter is ALWAYS on unless
+// --omniview. A startup-time probe let a dashboard started before the first DM
+// serve DM bodies forever (probe: "dm body served after startup: true"). When
+// no DMs exist the filter is a no-op, so there is nothing to latch.
+if (!OMNIVIEW) console.error("dashboard: dm rows hidden (direct-DB pre-G binary); pass --omniview to show, or use the M4 web UI");
 
 function state() {
-  const agents = db.query("SELECT id, role, caps, last_seen, joined_at FROM agents WHERE id IS NOT NULL ORDER BY last_seen DESC").all();
+  const agents = db.query("SELECT id, role, caps, last_seen, joined_at FROM agents WHERE id IS NOT NULL ORDER BY last_seen DESC").all() as any[];
   const messages = db.query(
     "SELECT id, thread, re, sender, recipients, type, status, tags, subject, body, created_at, updated_at, channel FROM messages ORDER BY created_at ASC"
-  ).all();
-  const reads = db.query("SELECT agent, msg, read_at FROM reads").all();
-  const channels = db.query("SELECT channel name, COUNT(*) n FROM messages GROUP BY channel ORDER BY n DESC").all();
+  ).all() as any[];
+  const reads = db.query("SELECT agent, msg, read_at FROM reads").all() as any[];
+  const channels = db.query("SELECT channel name, COUNT(*) n FROM messages GROUP BY channel ORDER BY n DESC").all() as any[];
   // F: receipts call site must resolve group: targets — same incarnation guard
   // as the core (grp -> {created_at, members}).
   const groups = db.query("SELECT name, created_at FROM groups").all();
@@ -55,7 +58,18 @@ function state() {
   const gmap: Record<string, { at: string; members: string[] }> = {};
   for (const g of groups as any[]) gmap[g.name] = { at: g.created_at, members: [] };
   for (const r of gm as any[]) gmap[r.grp]?.members.push(r.agent_id);
-  return { now: new Date().toISOString(), agents, messages: dmStrip ? (messages as any[]).filter((m) => !String(m.channel).startsWith("dm~")) : messages, reads, channels, groups: gmap };
+  let M = messages, R = reads, C = channels;
+  if (!OMNIVIEW) {
+    // M4: strip dm-shaped rows from EVERY list the payload carries — messages
+    // (bodies), channels (the NAME dm~a~b is the participant pair), and reads
+    // (who read what on a hidden channel).
+    const isDm = (ch: unknown) => String(ch ?? "").startsWith("dm~");
+    M = messages.filter((m) => !isDm(m.channel));
+    const dmIds = new Set(messages.filter((m) => isDm(m.channel)).map((m) => m.id));
+    R = reads.filter((r) => !dmIds.has(r.msg));
+    C = channels.filter((c) => !isDm(c.name));
+  }
+  return { now: new Date().toISOString(), agents, messages: M, reads: R, channels: C, groups: gmap };
 }
 
 const HTML = /* html */ `<!doctype html>
