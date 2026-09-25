@@ -244,11 +244,13 @@ Three orthogonal axes:
   check-then-write across two connections (server + host CLI on one file) lets both writes
   land (claude m-c, probe: guarded form lets exactly one win).** Checks are
   write-path only; legacy rows stay; preflight lists collisions. **Local-mode byte-parity
-  note:** legacy roles like `x:y` exist and local = root, so local mode warns (golden-safe)
-  rather than failing closed on the grammar. The same two NEW-ID checks (role==id
-  collisions, claude m-b) run in local `joinAgent`'s INSERT branch — it is a minting path
-  by the paragraph's own reasoning; warn-not-fail keeps golden safe. Recipient-token
-  grammar pinned (§4):
+  note:** legacy roles like `x:y` exist and local = root, so local mode warns (golden-safe;
+  **hit-only** — no stderr on clean joins, so golden bytes don't move) rather than failing
+  closed on the GRAMMAR and the role==id collision check (claude m-b: local `joinAgent`'s
+  INSERT branch is a minting path by the paragraph's own reasoning, so both checks run
+  there too). **The `agent_retired` check is NOT part of the warning: it rejects with
+  `identity_conflict` in BOTH modes (grok: do not weaken R1 into the warning).**
+  Recipient-token grammar pinned (§4):
   `'@all' | 'group:' ID | bare ID-or-role`.
 - **Token format:** `ac_` + base64url(32 random bytes). Lookup: locate row by `prefix` (first
   12 chars after `ac_`), compute `HMAC-SHA256(key=salt, msg=token)`,
@@ -807,10 +809,12 @@ post is the zero-member window G5 fail-closes. The helper is the other branch of
   in the previous sentence is this `not_found`, not a second code.
 - One IMMEDIATE txn: channel row (`created_at = nowIso()`) + exactly 2
   `channel_members` rows + the message insert. Never call `ensureChannel` on a
-  dm-shaped name. `~n` is allocated inside this txn only when the canonical name is
-  taken by a different pair; an explicit post naming a nonexistent `~n` is rejected
-  (claude m-e — either party minting a fresh duplicate + newest-created_at tie-break
-  would silently re-route `--dm` for both = split conversation). With `agent_retired`
+  dm-shaped name. **Client-supplied `~n` is ignored (stripped before canonicalization),
+  NOT a distinct reject (grok v4 binding)** — the pair, not the name, is the key, so
+  naming `dm~x~y~1` resolves through the pair lookup like any spelling. `~n` is allocated
+  ONLY inside the helper txn when the canonical name is taken by a DIFFERENT pair
+  (claude m-e: a party minting a fresh duplicate + newest-created_at tie-break would
+  silently re-route `--dm` for both = split conversation). With `agent_retired`
   blocking id reuse, the `~n` path is unreachable on server-mode DBs (it exists only
   for legacy/local ones); say so in the runbook. Renaming BACK to a retired id (the
   undo) is impossible by design — one-way door. On `UNIQUE` name collision: rollback, re-read the pair
