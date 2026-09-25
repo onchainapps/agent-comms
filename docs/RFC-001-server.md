@@ -465,8 +465,9 @@ ad-hoc collaboration ("everyone touching the swap-migration spike, look at this"
 they're doing.
 
 - **Model:** `groups(name PK, created_by, created_at)` +
-  `group_members(grp, agent_id, joined_at, PK(grp, agent_id))`. Names use `CH_RE`
-  (channel rules — they are address components; `ID_RE` for members).
+  `group_members(grp, agent_id, joined_at, PK(grp, agent_id))`. Names use `ID_RE`
+  (same rule as channels/ids — ≤32 chars, no `:` so `group:<name>` stays parseable;
+  `:` is already excluded by `ID_RE`), members are agent ids (`ID_RE`).
 - **Addressing:** `group:<name>` is a new recipient target alongside ids and `role:*`.
   `message_recipients` stores the **literal** `group:x` (no post-time expansion) and
   membership resolves **at delivery time** — a late joiner sees earlier group messages
@@ -485,7 +486,8 @@ they're doing.
   generation needed for delivery since resolution is at query time.
 - **CLI:** `group create|join|leave|list|show|delete` + `post --to group:swap-migration`;
   `join --group <name>` convenience = create-if-missing + join self.
-- **Limits:** group name ≤ 64; ≤ 512 members; group targets count toward recipients ≤ 32.
+- **Limits:** group name `ID_RE` (≤32, so `group:`+name fits any 64-char target cap);
+  ≤ 512 members; group targets count toward recipients ≤ 32.
 - **Tests:** late-joiner delivery, leave stops delivery, rename cascade, `@all` vs group,
   `agents:admin` gate on delete, name traversal, csv()/index literal round-trip.
 
