@@ -233,10 +233,22 @@ Three orthogonal axes:
   structured target via the bare-token match) and rejects `role == <another agent's id>`.
   **Symmetrically (claude N3, probe T2):** `token.create` and `rename` reject a NEW id when
   any OTHER agent holds `role ==` that id ⇒ `identity_conflict` — otherwise mallory takes
-  `role=zed` first and inherits `alice→zed` mail when zed is later minted. Checks are
+  `role=zed` first and inherits `alice→zed` mail when zed is later minted. **AND (claude
+  R1, probe zz_fg3_retired_role.ts — reproduced on real code):** since G6 keeps old mail
+  addressed to the retired id, `joinAgent` (both modes) ALSO rejects a `role` equal to any
+  `agent_retired.id` ⇒ `identity_conflict` — else bob→carol frees the name `bob`, mallory
+  takes `role=bob`, and the bare-token role arm delivers AND lets her ack every pre-rename
+  alice→bob message. Triangle closed: id≠role, role≠id, role≠retired-id; preflight lists
+  legacy roles colliding with retired ids. **All identity checks run INSIDE the write's
+  IMMEDIATE txn, or as a single guarded statement (`INSERT … SELECT … WHERE NOT EXISTS`) —
+  check-then-write across two connections (server + host CLI on one file) lets both writes
+  land (claude m-c, probe: guarded form lets exactly one win).** Checks are
   write-path only; legacy rows stay; preflight lists collisions. **Local-mode byte-parity
   note:** legacy roles like `x:y` exist and local = root, so local mode warns (golden-safe)
-  rather than failing closed on the grammar. Recipient-token grammar pinned (§4):
+  rather than failing closed on the grammar. The same two NEW-ID checks (role==id
+  collisions, claude m-b) run in local `joinAgent`'s INSERT branch — it is a minting path
+  by the paragraph's own reasoning; warn-not-fail keeps golden safe. Recipient-token
+  grammar pinned (§4):
   `'@all' | 'group:' ID | bare ID-or-role`.
 - **Token format:** `ac_` + base64url(32 random bytes). Lookup: locate row by `prefix` (first
   12 chars after `ac_`), compute `HMAC-SHA256(key=salt, msg=token)`,
@@ -512,6 +524,14 @@ they're doing.
   **Receipts honesty (claude m6):** group receipts are NOT historical — late joiners show
   as unread on old group messages, leavers drop out; the intended set is current members
   of the incarnation that existed when the message was posted, excluding sender (grok B2).
+  That set is this query, not a snapshot of who was a member at post time (no
+  membership-history table — do not add one; a recreated group contributes nobody):
+  ```sql
+  SELECT gm.agent_id FROM group_members gm
+  JOIN groups g ON g.name = gm.grp
+  WHERE gm.grp = ? AND g.created_at <= ? AND gm.agent_id != ?
+  -- .all(groupName, message.created_at, sender)
+  ```
 - **Delivery SQL (both reviewers independently measured the draft's OR+LIKE+EXISTS form at
   SCAN, 145× slower at 300k rows; the draft's `'role:'||:role` arm also never matched —
   roles are stored BARE, and `@all` was missing entirely):**
@@ -535,10 +555,34 @@ they're doing.
   timestamp and a stripped timestamp of the same instant compare false
   (`"2026-06-01T00:00:00.000Z" >= "2026-06-01T00:00:00Z"`). Resolution is one second:
   a delete+recreate in the same second as a backlog row inherits that row, and an NTP
-  step-back widens the window. **Tombstone fix (claude n5):** `group_tombstones(name,
-  deleted_at)` written at delete; at create, `created_at = max(nowIso(), deleted_at +
-  1s)` — the boundary stays inclusive, the +1s closes the same-second leak without a
-  exclusive-comparison split between JS and SQL.
+  step-back widens the window. **Tombstone (claude n5) — `deleted_at + 1s` is not an
+  operation, and `datetime(deleted_at, '+1 second')` is the wrong one.** That function
+  returns `YYYY-MM-DD HH:MM:SS`. An ISO `messages.created_at` compares `>=` that string
+  even when the message is older (probe, bun:sqlite 1.4.2:
+  `'2026-06-01T00:00:00Z' >= '2026-06-01 00:00:01'` is 1). The guard fails OPEN and the
+  previous incarnation's backlog is inherited — the leak this tombstone was added to
+  close. `+1s` is `strftime('%Y-%m-%dT%H:%M:%SZ', deleted_at, '+1 second')`, or the JS
+  equivalent of `nowIso` (parse, +1000 ms, strip millis). Both sides stay `>=` on that
+  shape. A second delete must upsert the PK, not insert a sibling — a lookup that is
+  not the PK (or `MAX(deleted_at)`) reads an arbitrary row and the +1s does not apply.
+  ```sql
+  CREATE TABLE IF NOT EXISTS group_tombstones(
+    name TEXT PRIMARY KEY, deleted_at TEXT NOT NULL);
+  -- inside the group-delete txn, same txn as DELETE FROM group_members:
+  INSERT INTO group_tombstones(name, deleted_at) VALUES(?, ?)
+    ON CONFLICT(name) DO UPDATE SET deleted_at = excluded.deleted_at
+    WHERE excluded.deleted_at > group_tombstones.deleted_at;
+  -- at create. No tombstone row: created_at = nowIso(). Else (claude m-a — do NOT stamp
+  -- a FUTURE created_at via):
+  SELECT max(?, strftime('%Y-%m-%dT%H:%M:%SZ', ?, '+1 second'));
+  -- .get(nowIso(), tombstone.deleted_at). Both binds are ISO-Z. Never datetime().
+  -- m-a resolution: if nowIso() <= deleted_at, REJECT the create with `contention`
+  -- (retry in <=1s) instead of stamping created_at = T+1s — a future stamp silently
+  -- drops the NEW incarnation's own posts in second T (delete; join; post scripts) via
+  -- the same >= guard. The contention reject closes the same-second leak and the NTP
+  -- step-back window without ever timestamping ahead of the clock; max()+strftime stays
+  -- as the arithmetic if an implementation prefers stamping, but reject is the rule.
+  ```
   **Bind:** bun:sqlite 1.4.2 does not bind `:agent` from `{agent}` or `{$agent}` —
   that call returns only the literal `'@all'` arm. **All RFC SQL is illustrative; code
   uses positional `?` (house style) — never copy named params into `.all({agent})` (n7).**
@@ -563,7 +607,11 @@ they're doing.
   `msgCreatedAt >= memberships.get(x)`. A name set cannot express the per-message
   comparison, so the required fixture cannot pass against the SQL arm. The server computes
   the SQL group arm **from the same Map** the JS arm reads, so the two sides cannot drift
-  (claude B2 refinement). A contract fixture
+  (claude B2 refinement). That Map is the JOIN's membership read, taken in the same
+  snapshot as the arm (`BEGIN`, then `SELECT gm.grp, g.created_at FROM group_members gm
+  JOIN groups g ON g.name = gm.grp WHERE gm.agent_id = ?`). A cache filled on an earlier
+  tick is not the Map — the rename path already requires a miss to load from the DB.
+  A contract fixture
   proves JS ≡ SQL row sets (both directions), including old-incarnation exclusion.
 - **Authz:** groups are self-organizing — **no scope** to create/join/leave; membership is
   delivery, NEVER a `canSee` input (extends the §5 role rule). `group.join/leave` take
@@ -572,7 +620,13 @@ they're doing.
   ack/done/status on group-addressed messages (delivery-time resolved, includes earlier
   ones). `delete` requires `agents:admin`. **No group rename in v1** (claude M4 ruling):
   rename would rewrite history (recipients CSV + index, which `msg_ai` won't re-fire);
-  use delete+create — the `created_at` guard makes it safe.
+  use delete+create — the `created_at` guard makes it safe. **Two documented consequences
+  (claude n3/n4):** post addressed to `group:<nonexistent>` is rejected `usage` —
+  otherwise anyone pre-addresses a name and creates the group later to squat traffic
+  (groups are not a confidentiality boundary, so the usage-vs-not_found existence oracle
+  that G2w-v forbids for DM channels is acceptable here); and deleting a group with
+  unresolved backlog DROPS that backlog from members' inboxes — mailing-list semantics,
+  not a bug.
 - **Lifecycle:** `group_members.agent_id` cascades in the §4 rename txn; `groups` rows
   survive member renames. `delete` DELETEs `group_members` in the SAME txn (delivery reads
   members, not groups — orphans still receive).
@@ -608,17 +662,27 @@ The name is a frozen label chosen at creation; `channel_members` is the authorit
 ids belong to (including `general`) and treats "both queried ids are members" as
 "the channel has two members" (a third member still matches). Use:
 ```sql
-SELECT cm.channel FROM channel_members cm INDEXED BY cm_agent
+SELECT c.name FROM channel_members cm INDEXED BY cm_agent
+JOIN channels c ON c.name = cm.channel
 WHERE cm.agent_id IN (?, ?) AND cm.channel GLOB 'dm~*'
-GROUP BY cm.channel
+GROUP BY c.name
 HAVING count(*) = 2
-   AND (SELECT count(*) FROM channel_members x WHERE x.channel = cm.channel) = 2
+   AND (SELECT count(*) FROM channel_members x WHERE x.channel = c.name) = 2
+ORDER BY c.created_at DESC, c.rowid DESC
+LIMIT 1
 ```
-GLOB on `cm_agent` is a range seek (`channel>? AND channel<?`), not LIKE. The
-cardinality subquery is a PK seek. Invariant, written in the same txn as the channel
+The statement without the join and without `ORDER BY` returns every match — probe
+(bun:sqlite 1.4.2): one pair that sits in `dm~alice~bob` and `dm~alice~bob~1` returns
+both rows. `.get()` on that result is not deterministic, which contradicts the
+tie-break below. This form picks the newest `channels.created_at`; `rowid` breaks a
+same-second tie (`nowIso` is one-second resolution). Plan: SEARCH `cm_agent` on
+`agent_id` (the GLOB is a filter on that seek, not a table scan), SEARCH channels by
+PK, cardinality subquery is a PK seek. `channels.created_at` for a DM is `nowIso`,
+never `''` (that empty string is only the seeded `general` row, bus.ts:344).
+Invariant, written in the same txn as the channel
 row: a dm-shaped channel has exactly two `channel_members` rows. Tie-break when several dm channels match one pair (possible after rename +
-`~n` reuse — at least one was created for a different incarnation): pick the channel with
-the **newest `channels.created_at`**, deterministic, no error (claude n1). After rename, history
+`~n` reuse — at least one was created for a different incarnation): the `ORDER BY`
+above, deterministic, no error (claude n1). After rename, history
 `{channel}`, `scope=channel:`, and `/raw` use the stored name from this lookup — never
 re-sort current ids into a name. (b) **Group-DM form dropped** (both): `dm~<creator>~<slug>`
 is shape-indistinguishable from `dm~<lo>~<hi>`; multi-party = Appendix F groups on an
@@ -689,6 +753,9 @@ WHERE m.channel NOT GLOB 'dm~*'
    OR ? = 1
 ORDER BY m.created_at DESC, rowid DESC LIMIT ?
 -- since mode: same predicate on the joined message; events.seq stays the PK range.
+-- The predicate goes in the WHERE, BEFORE LIMIT — NEVER a post-LIMIT JS filter
+-- (claude m-d: bus.ts:950-954 post-filters today; a page entirely hidden would return
+-- 0 rows with an unadvanced cursor and livelock).
 -- history{channel}: canSee the channel ONCE, then the existing channel query.
 -- A hidden dm channel returns the same empty page as a missing channel, not a new error.
 ```
@@ -701,19 +768,57 @@ ORDER BY m.created_at DESC, rowid DESC LIMIT ?
 `usage` -32602) — this is the rule the enforcement code checks; the `dm` CLI sugar sets
 recipients to exactly the peer (G1), which satisfies it (C2 reconciliation: subset is the
 predicate, equality is only what the sugar emits). (iii) parent lookup per G2.
-(iv) **`thread` is an anchor too (claude N1, probe T1 — today `thread=<any id>` is never
-validated and a public post can squat inside a party's DM thread view):** in server mode
-the thread root must reference an existing message that passes canSee, else `not_found`
-byte-identical to a missing `re` (kills both the injection and the future-id squat);
-if the thread root's channel is dm-shaped, the post's RESOLVED channel must EQUAL it —
-no cross-channel attach into a DM thread. (iii)/(ii) and the G2w-i membership check run on
-the RESOLVED channel after `re`/`thread` inheritance, BEFORE `ensureChannel` (grok: the
-inherited `--re` path skips the regex — that stays correct, the check moves).
-(v) **DM channel creation is ONE helper:** the channel row plus exactly 2
-`channel_members` rows in one txn (grok's invariant). `post {channel:"dm~x~y"}` on a
-nonexistent dm channel routes through the helper iff sender ∈ {x,y} and both ids exist as
-agents, else rejected; a non-party naming a nonexistent dm channel gets the SAME
-`not_found` as one naming an existing channel — channel existence is never an oracle.
+(iv) **`thread` is an anchor too (claude N1 — today `thread=<any id>` is never
+validated, and channel inheritance is `WHERE id=? OR thread=? ORDER BY created_at ASC`
+(bus.ts:537), which can resolve to a squatter row rather than the named message).**
+"Thread root" = the message whose `id` equals the `thread` value (claude m-e definition).
+Legacy free-form explicit thread strings (any id-shaped value that never named a real
+message) are rejected in server mode; local mode is unaffected, so golden is safe.
+In server mode look up `messages WHERE id=?` for the thread param. Missing and
+invisible are the same `not_found` with one detail string — do not copy the `re`
+detail (`error: re -> unknown message id …`); it names `re`. "Byte-identical to a
+missing `re`" means the same error code and the same missing-vs-hidden bytes, not
+that string. If that row's channel is dm-shaped, the post's resolved channel must
+EQUAL it, else `usage` (G7 "rejected"). That comparison is reached only after canSee
+passes, so a non-party never sees `usage`. When `channel` is omitted, inheritance is
+that id-row's `channel` column — not the `id OR thread` lookup. The inherited `--re`
+path still skips the channel regex (that stays correct). (iii), (ii), and the G2w-i
+membership check run on the resolved channel after that inheritance and BEFORE any
+channel write. They apply only when the channel row already exists. Running them
+against an empty `channel_members` rejects every first DM post — the helper has not
+written the rows yet. As one unbranched sequence, (iv) and (v) cannot both be
+implemented.
+(v) **DM channel creation is ONE helper, both modes** (local `comms.ts` against the
+server DB is the same file). `ensureChannel` is `INSERT OR IGNORE` and commits
+outside the message txn (bus.ts:387, then the insert txn at :570), so a local first
+post is the zero-member window G5 fail-closes. The helper is the other branch of
+(iv), not a check that runs after (i):
+- Canonicalize first (`lo`/`hi` by code unit; `lo==hi` rejected). A client-supplied
+  `~n` is ignored. `dm~hi~lo` is the same request as `dm~lo~hi` — do not create a
+  second channel, and do not return a different error for the non-canonical spelling.
+- Member-pair lookup (the G0 statement) for `{lo,hi}`. If a channel already exists
+  for that pair, post into the stored name. The requested name is not the key.
+  Name-keyed create (`channel row missing ⇒ insert that string`) splits the pair.
+- If no channel for the pair: create iff the final sender (after `as`, same word as
+  G2w-i — not the token principal) ∈ `{lo,hi}` AND both ids exist in `agents` AND
+  neither id is in `agent_retired`. Every other outcome is `not_found` with the same
+  detail as a non-party naming an existing dm channel. `usage` vs `not_found` on this
+  branch is an existence oracle; do not `usage`-reject a missing peer. "else rejected"
+  in the previous sentence is this `not_found`, not a second code.
+- One IMMEDIATE txn: channel row (`created_at = nowIso()`) + exactly 2
+  `channel_members` rows + the message insert. Never call `ensureChannel` on a
+  dm-shaped name. `~n` is allocated inside this txn only when the canonical name is
+  taken by a different pair; an explicit post naming a nonexistent `~n` is rejected
+  (claude m-e — either party minting a fresh duplicate + newest-created_at tie-break
+  would silently re-route `--dm` for both = split conversation). With `agent_retired`
+  blocking id reuse, the `~n` path is unreachable on server-mode DBs (it exists only
+  for legacy/local ones); say so in the runbook. Renaming BACK to a retired id (the
+  undo) is impossible by design — one-way door. On `UNIQUE` name collision: rollback, re-read the pair
+  lookup, post into the winner if the sender is a member, else `not_found` — not
+  `internal`.
+- Recipients ⊆ `{lo,hi}` (or ⊆ the existing member ids if the lookup hit). Wildcards
+  are `usage`, and that rejection rolls back the same txn so it does not leave a
+  channel row.
 
 **G3 — Authz matrix delta.** §5 "every token can read every message" is amended: public
 channels unchanged; dm-shaped channels filtered by canSee. Scope enum becomes FIVE names:
@@ -774,10 +879,18 @@ not a recipient rewrite. So the old id cannot be re-minted:
 CREATE TABLE IF NOT EXISTS agent_retired(
   id TEXT PRIMARY KEY, renamed_to TEXT NOT NULL, at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS agent_retired_new ON agent_retired(renamed_to, id);
--- inside the existing rename IMMEDIATE txn, after agents.id update:
-UPDATE agent_retired SET renamed_to = ? WHERE renamed_to = ?;  -- chain: alice→bob becomes alice→carol
-INSERT INTO agent_retired(id, renamed_to, at) VALUES(?, ?, ?); -- old, new, nowIso
--- token.create and rename (server): hit ⇒ identity_conflict
+-- inside the existing rename IMMEDIATE txn, after agents.id update.
+-- Binds are (new, old) then (old, new, nowIso). Swapping the UPDATE binds
+-- points the chain at the id being retired. Probe: alice→bob then bob→carol
+-- leaves both rows renamed_to=carol. A second INSERT of alice throws
+-- UNIQUE constraint failed: agent_retired.id — do not OR IGNORE that INSERT
+-- (it would retarget the tombstone and reopen mail inheritance).
+UPDATE agent_retired SET renamed_to = ? WHERE renamed_to = ?;  -- (new, old)
+INSERT INTO agent_retired(id, renamed_to, at) VALUES(?, ?, ?); -- (old, new, nowIso)
+-- EVERY path that inserts an agents row, both modes, BEFORE the write.
+-- token.create (local root included), rename's new id, AND joinAgent's local
+-- INSERT (bus.ts:461 — the bypass the role-grammar paragraph already names).
+-- "token.create and rename (server)" leaves that INSERT open. Hit ⇒ identity_conflict.
 SELECT 1 FROM agent_retired WHERE id = ?;
 ```
 Do not add an alias arm to delivery unless inbox continuity of id-addressed mail is
@@ -802,4 +915,8 @@ root>` by a non-party ⇒ `not_found`; cross-channel thread attach into a dm ⇒
 (claude N1); `thread=<nonexistent>` rejected in server mode; `thread=<own public root>`
 accepted**; post `@all` into
 dm rejected; SSE event filtered for non-party subscriber; `/raw` 404-equivalent; rename
-keeps conversation via member-pair; acl_generation refusal.
+keeps conversation via member-pair; acl_generation refusal; non-canonical dm name does
+not create a second channel; first post by a party creates via the helper with no
+pre-existing `channel_members` row; non-party first post is `not_found` and writes no
+channel row; group delete+recreate in the same second does not inherit (tombstone +1s
+is ISO-Z, not `datetime()`); local join of a retired id is `identity_conflict`.
