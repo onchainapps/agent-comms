@@ -48,7 +48,10 @@ export interface BusHandle {
  *  The `as never` casts only satisfy tsc's deferred conditional when M is
  *  generic (Bus<M> methods take Ctx<M>); the ctx reaching here is always the
  *  mode-correct one (serverCtx/localCtx constructors + ServerOnly param types). */
-export function wrapSession<M extends Mode>(bus: Bus<M>, ctx: Ctx<M>): Session {
+export function wrapSession<B extends { readonly mode: Mode }>(bus: B, ctx: B["mode"] extends "server" ? Ctx<"server"> : Ctx<"local">): Session {
+  return wrapSessionImpl(bus as unknown as Bus<Mode>, ctx as Ctx<Mode>);
+}
+function wrapSessionImpl<M extends Mode>(bus: Bus<M>, ctx: Ctx<M>): Session {
   const a = <T>(r: Res<T>) => Promise.resolve(r);
   const c = ctx as never;
   return {
@@ -109,6 +112,7 @@ export class LocalBus implements BusHandle {
  *  resolved via tokenVerify on EVERY request (finding: rename rewrites
  *  tokens.agent_id, so a cached principal would go stale). */
 export function serverHandle(core: Bus<"server">): BusHandle & { raw: Bus<"server"> } {
+  if (core.mode !== "server") throw new Error("serverHandle requires a server-mode core (mode discriminant, round-2 M1)");
   return {
     mode: "server" as const,
     raw: core,

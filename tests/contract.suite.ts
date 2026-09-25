@@ -81,8 +81,21 @@ export function contractSuite(name: string, make: Factory) {
         expect((await w.value.session.setStatus({ agent: "s2", id, state: "acked" })).error).toBeUndefined();
         // spoof: s3 passes agent:"s2" (a legit recipient) — server uses PRINCIPAL ⇒ forbidden
         expect((await x.value.session.setStatus({ agent: "s2", id, state: "done" })).error).toBe("forbidden");
-        // root (read:all) may
+        // root (holds agents:admin) may
         expect((await root.setStatus({ agent: "s3", id, state: "done" })).error).toBeUndefined();
+      });
+    });
+
+    test("status gate is agents:admin, NOT read:all (round-2 M2, RFC §5)", async () => {
+      await withBus(async (h, root) => {
+        const p = await root.post({ from: "root", to: "nobody-here", type: "ask", body: "b", channel: "st-gate" });
+        const id = (p as any).value.id;
+        // read:all alone (not sender, not recipient) ⇒ forbidden — visibility ≠ control
+        const viewer = (await seedAgent(h, root, "viewer", "v", ["read:all"])) as any;
+        expect((await viewer.value.session.setStatus({ agent: "viewer", id, state: "done" })).error).toBe("forbidden");
+        // agents:admin alone ⇒ may set any
+        const admin = (await seedAgent(h, root, "aadm", "a", ["agents:admin"])) as any;
+        expect((await admin.value.session.setStatus({ agent: "aadm", id, state: "done" })).error).toBeUndefined();
       });
     });
 
@@ -122,15 +135,25 @@ export function contractSuite(name: string, make: Factory) {
     test("token.create authz + subset rule + bootstrap guard ACTUALLY aborts (P8/P11)", async () => {
       await withBus(async (h, root) => {
         const plain = (await seedAgent(h, root, "pleb", "p")) as any;
-        expect((await plain.value.session.tokenCreate({ agent: "x1", scopes: [] })).error).toBe("unauthorized");
+        // M9 (round 2): valid credential lacking the scope ⇒ forbidden (-32002),
+        // never unauthorized (-32001 = bad/missing credential only).
+        expect((await plain.value.session.tokenCreate({ agent: "x1", scopes: [] })).error).toBe("forbidden");
         const scoped = await root.tokenCreate({ agent: "scoped", scopes: ["read:all"] });
         expect(scoped.error).toBeUndefined();
         const ss = h.session({ token: (scoped as any).value.token });
-        expect((await ss.tokenCreate({ agent: "x2", scopes: ["read:all"] })).error).toBe("unauthorized"); // lacks tokens:admin
+        expect((await ss.tokenCreate({ agent: "x2", scopes: ["read:all"] })).error).toBe("forbidden"); // lacks tokens:admin
+        // M8a: scope enum + no-comma validation
+        expect((await root.tokenCreate({ agent: "smug", scopes: ["read:all,agents:admin"] as any })).error).toBe("usage");
+        expect((await root.tokenCreate({ agent: "smug", scopes: ["bogus"] as any })).error).toBe("usage");
+        // M8b: tokens:admin is TRANSITIVELY ROOT — may mint scopes it lacks
+        const t = await root.tokenCreate({ agent: "tadm", scopes: ["tokens:admin"], force: true }); // force: bootstrap guard (root admin exists)
+        expect(t.error).toBeUndefined();
+        const adm = { value: { session: h.session({ token: (t as any).value.token }) } } as any;
+        expect((await adm.value.session.tokenCreate({ agent: "sub1", scopes: ["read:all"] })).error).toBeUndefined();
         // bootstrap guard: root minted admins above ⇒ second admin aborts w/o force
         expect((await root.tokenCreate({ agent: "don2", admin: true })).error).toBe("conflict");
         expect((await root.tokenCreate({ agent: "don2", admin: true, force: true })).error).toBeUndefined();
-        // human mint (root holds tokens:admin:human via ALL_SCOPES) defaults read:all
+        // human mint (root holds tokens:admin) defaults read:all
         const hum = await root.tokenCreate({ agent: "bakon", kind: "human" });
         expect(hum.error).toBeUndefined();
         const hv = h.session({ token: (hum as any).value.token });
@@ -224,6 +247,44 @@ export function contractSuite(name: string, make: Factory) {
         expect((await root.threadOf("missing-1")).error).toBe("not_found");
         // server mode: dangling re rejected (local leniency is a pinned divergence)
         expect((await root.post({ from: "root", to: "x", type: "reply", body: "b", re: "nope-9999" })).error).toBe("not_found");
+        // m3 (round 2): rejected dangling-re must leave NO orphan channel row
+        expect((await root.post({ from: "root", to: "x", type: "reply", body: "b", re: "nope-9999", channel: "orphan-chan" })).error).toBe("not_found");
+        expect(((await root.channels()) as any).value.map((c: any) => c.name)).not.toContain("orphan-chan");
+      });
+    });
+
+    test("history since-mode pages to hasMore=false ⇒ every row exactly once (round-2 M4)", async () => {
+      await withBus(async (h, root) => {
+        const ids: string[] = [];
+        for (let i = 0; i < 7; i++) ids.push(((await root.post({ from: "root", to: "z", type: "note", body: `pg${i}` })) as any).value.id);
+        let cursor = `${(h as any).raw.epoch()}.0`;
+        const seen: string[] = [];
+        for (let guard = 0; guard < 20; guard++) {
+          const page = (await root.history({ since: cursor, limit: 3 })) as any;
+          expect(page.error).toBeUndefined();
+          seen.push(...page.value.rows.map((r: any) => r.id));
+          cursor = page.cursor;
+          if (!page.value.hasMore) break;
+        }
+        expect(seen).toEqual(ids); // ordered, no gaps, no dupes — the N-a hole is gone
+      });
+    });
+
+    test("explicit since below gc_floor ⇒ resync on history AND waitStep (round-2 M3)", async () => {
+      await withBus(async (h, root) => {
+        const raw = (h as any).raw;
+        for (let i = 0; i < 6; i++) raw.testDb.run("INSERT INTO events(kind,at) VALUES('msg','2020-01-01T00:00:00Z')");
+        const g = raw.gc(); // real clock ⇒ 2020 events are past retention; floor advances
+        expect(g.floor).toBeGreaterThan(0);
+        const stale = `${raw.epoch()}.0`; // below floor
+        const h1 = await root.history({ since: stale });
+        expect(h1.error).toBe("resync");
+        expect((h1 as any).data.floor).toBe(g.floor);
+        const w1 = await root.waitStep({ since: stale });
+        expect(w1.error).toBe("resync");
+        expect((w1 as any).data.floor).toBe(g.floor);
+        // at-or-above floor: normal operation
+        expect((await root.history({ since: `${raw.epoch()}.${g.floor}` })).error).toBeUndefined();
       });
     });
 

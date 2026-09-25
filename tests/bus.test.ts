@@ -35,14 +35,14 @@ describe("N1: recipient split — recursive CTE == csv(), no aborts on legacy da
 
     const bus = loc(home);
     for (let i = 0; i < hostile.length; i++) {
-      const idx = (bus.db.query("SELECT target FROM message_recipients WHERE msg=? ORDER BY target").all(`m${i}`) as any[])
+      const idx = (bus.testDb.query("SELECT target FROM message_recipients WHERE msg=? ORDER BY target").all(`m${i}`) as any[])
         .map((r) => r.target);
       expect([...new Set(idx)]).toEqual([...new Set(csv(hostile[i]))].sort());
     }
     // trigger path parity for NEW inserts too
     const r = bus.post(localCtx("sys"), { from: "sys", to: 'we"ird, ok ,', type: "note", body: "x" });
     expect(r.error).toBeUndefined();
-    const idx = (bus.db.query("SELECT target FROM message_recipients WHERE msg=?").all((r as any).value.id) as any[])
+    const idx = (bus.testDb.query("SELECT target FROM message_recipients WHERE msg=?").all((r as any).value.id) as any[])
       .map((x) => x.target);
     expect([...new Set(idx)]).toEqual([...new Set(csv('we"ird, ok ,'))].sort());
     bus.close(); rmSync(home, { recursive: true, force: true });
@@ -53,7 +53,7 @@ describe("N1: recipient split — recursive CTE == csv(), no aborts on legacy da
     const bus = loc(home);
     const r = bus.post(localCtx("sys"), { from: "sys", to: ",", type: "note", body: "x" });
     expect((r as any).error).toBeUndefined();
-    const rows = bus.db.query("SELECT COUNT(*) c FROM message_recipients WHERE msg=?").get((r as any).value.id) as any;
+    const rows = bus.testDb.query("SELECT COUNT(*) c FROM message_recipients WHERE msg=?").get((r as any).value.id) as any;
     expect(rows.c).toBe(0);
     bus.close(); rmSync(home, { recursive: true, force: true });
   });
@@ -68,7 +68,7 @@ describe("fan-out events (§3′/§4)", () => {
     const mid = (p as any).value.id;
     bus.setStatus(localCtx("a1"), { agent: "a1", id: mid, state: "done" });
     bus.read(localCtx("a2"), { agent: "a2", id: mid });
-    const kinds = (bus.db.query("SELECT kind FROM events ORDER BY seq").all() as any[]).map((r) => r.kind);
+    const kinds = (bus.testDb.query("SELECT kind FROM events ORDER BY seq").all() as any[]).map((r) => r.kind);
     expect(kinds).toContain("msg");
     expect(kinds).toContain("status");
     expect(kinds).toContain("read");
@@ -80,11 +80,11 @@ describe("fan-out events (§3′/§4)", () => {
     const home = tmp();
     const bus = loc(home);
     bus.joinAgent(localCtx("a1"), { agent: "a1", role: "lab" });
-    const before = (bus.db.query("SELECT count(*) c FROM events WHERE kind='presence'").get() as any).c;
+    const before = (bus.testDb.query("SELECT count(*) c FROM events WHERE kind='presence'").get() as any).c;
     bus.touch("a1"); bus.touch("a1"); bus.touch("a1"); // same frozen clock ⇒ no events
-    expect((bus.db.query("SELECT count(*) c FROM events WHERE kind='presence'").get() as any).c).toBe(before);
+    expect((bus.testDb.query("SELECT count(*) c FROM events WHERE kind='presence'").get() as any).c).toBe(before);
     bus.joinAgent(localCtx("a1"), { agent: "a1", role: "lead" }); // role change ⇒ emits
-    expect((bus.db.query("SELECT count(*) c FROM events WHERE kind='presence'").get() as any).c).toBe(before + 1);
+    expect((bus.testDb.query("SELECT count(*) c FROM events WHERE kind='presence'").get() as any).c).toBe(before + 1);
     bus.close(); rmSync(home, { recursive: true, force: true });
   });
 
@@ -92,14 +92,14 @@ describe("fan-out events (§3′/§4)", () => {
     const home = tmp();
     const bus = loc(home);
     // agents INSERT without last_seen
-    expect(() => bus.db.run("INSERT INTO agents(id,role) VALUES('n1','r')")).not.toThrow();
+    expect(() => bus.testDb.run("INSERT INTO agents(id,role) VALUES('n1','r')")).not.toThrow();
     // messages INSERT without created_at
-    expect(() => bus.db.run("INSERT INTO messages(id,thread,sender,recipients,type,status,body,updated_at) VALUES('x1','x1','s','a','note','open','b','2026-01-01T00:00:00Z')")).not.toThrow();
+    expect(() => bus.testDb.run("INSERT INTO messages(id,thread,sender,recipients,type,status,body,updated_at) VALUES('x1','x1','s','a','note','open','b','2026-01-01T00:00:00Z')")).not.toThrow();
     // revoke then UN-revoke (revoked_at back to NULL)
     const t = bus.tokenCreate(localCtx("s"), { agent: "n1", scopes: ["read:all"] });
     expect(t.error).toBeUndefined();
     expect(bus.tokenRevoke(localCtx("s"), { id: (t as any).value.id }).error).toBeUndefined();
-    expect(() => bus.db.run("UPDATE tokens SET revoked_at=NULL WHERE id=?", [(t as any).value.id])).not.toThrow();
+    expect(() => bus.testDb.run("UPDATE tokens SET revoked_at=NULL WHERE id=?", [(t as any).value.id])).not.toThrow();
     // the un-revoked token verifies again
     expect(bus.tokenVerify((t as any).value.token).error).toBeUndefined();
     bus.close(); rmSync(home, { recursive: true, force: true });
@@ -125,14 +125,13 @@ describe("tokens (§4/§5)", () => {
     bus.close(); rmSync(home, { recursive: true, force: true });
   });
 
-  test("admin:true mints full NORMALIZED scope set incl tokens:admin:human; human defaults read:all", () => {
+  test("admin:true mints the full 4-name NORMALIZED scope set (§4/§5); human defaults read:all", () => {
     const home = tmp();
     const bus = loc(home); // bootstrap = local-mode opener (§5)
     const root = localCtx("root");
     const a = bus.tokenCreate(root, { agent: "don", admin: true, force: true });
     const v1 = bus.tokenVerify((a as any).value.token);
-    expect((v1 as any).value.scopes).toContain("tokens:admin");
-    expect((v1 as any).value.scopes).toContain("tokens:admin:human");
+    expect([...(v1 as any).value.scopes].sort()).toEqual(["agents:admin", "post:as", "read:all", "tokens:admin"]);
     const norm = (v1 as any).value.scopes.join(",");
     expect(norm).toBe([...(v1 as any).value.scopes].sort().join(",")); // normalized sorted CSV
     const h = bus.tokenCreate(root, { agent: "bakon", kind: "human" });
@@ -152,7 +151,7 @@ describe("tokens (§4/§5)", () => {
     expect(a2.error).toBe("conflict");
     const a3 = bus.tokenCreate(root, { agent: "don2", admin: true, force: true });
     expect(a3.error).toBeUndefined();
-    const c = (bus.db.query(
+    const c = (bus.testDb.query(
       "SELECT count(*) c FROM tokens WHERE revoked_at IS NULL AND instr(',' || scopes || ',', ',tokens:admin,') > 0",
     ).get() as any).c;
     expect(c).toBe(2);
@@ -163,8 +162,8 @@ describe("tokens (§4/§5)", () => {
     const home = tmp();
     const bus = srv(home);
     const ctx = serverCtx("pleb", []);
-    bus.db.run("INSERT INTO agents(id,role,last_seen) VALUES('pleb','p','2026-01-01T00:00:00Z')");
-    expect(bus.tokenCreate(ctx, { agent: "x", scopes: [] }).error).toBe("unauthorized");
+    bus.testDb.run("INSERT INTO agents(id,role,last_seen) VALUES('pleb','p','2026-01-01T00:00:00Z')");
+    expect(bus.tokenCreate(ctx, { agent: "x", scopes: [] }).error).toBe("forbidden"); // M9: valid cred lacking scope ⇒ -32002
     bus.close(); rmSync(home, { recursive: true, force: true });
   });
 });
@@ -224,8 +223,8 @@ describe("cursors (§6)", () => {
     const bus = srv(home);
     // 10 old events (at=2025) via direct inserts
     for (let i = 0; i < 10; i++)
-      bus.db.run("INSERT INTO events(kind,at) VALUES('msg','2025-01-01T00:00:00Z')");
-    const minSeq = (bus.db.query("SELECT min(seq) m FROM events").get() as any).m;
+      bus.testDb.run("INSERT INTO events(kind,at) VALUES('msg','2025-01-01T00:00:00Z')");
+    const minSeq = (bus.testDb.query("SELECT min(seq) m FROM events").get() as any).m;
     bus.cursorSet("a", "cli", bus.epoch(), minSeq + 3); // cursor inside the hole
     const g = bus.gc(); // frozen clock 2026 ⇒ all 2025 events are past retention
     expect(g.events).toBeGreaterThanOrEqual(9);
@@ -242,7 +241,7 @@ describe("history handoff (§6 nit + finding 8)", () => {
     const home = tmp();
     const bus = srv(home);
     const ctx = serverCtx("don", ["read:all"]);
-    bus.db.run("INSERT INTO agents(id,role,last_seen) VALUES('don','d','2026-01-01T00:00:00Z')");
+    bus.testDb.run("INSERT INTO agents(id,role,last_seen) VALUES('don','d','2026-01-01T00:00:00Z')");
     const h0 = bus.history(ctx, {});
     for (let i = 0; i < 5; i++) bus.post(ctx, { from: "don", to: "other", type: "note", body: `m${i}` });
     const page = bus.history(ctx, { limit: 2 }) as any;
@@ -269,7 +268,7 @@ describe("local-mode quirks pinned (finding 14 / §10)", () => {
     const home = tmp();
     const bus = loc(home);
     expect(bus.post(localCtx("late"), { from: "late", to: "x", type: "bogus", body: "b" }).error).toBe("usage");
-    expect((bus.db.query("SELECT count(*) c FROM agents WHERE id='late'").get() as any).c).toBe(1);
+    expect((bus.testDb.query("SELECT count(*) c FROM agents WHERE id='late'").get() as any).c).toBe(1);
     bus.close(); rmSync(home, { recursive: true, force: true });
   });
   test("dangling --re inserts silently in LOCAL mode (legacy leniency)", () => {
@@ -287,9 +286,9 @@ describe("local-mode quirks pinned (finding 14 / §10)", () => {
     bus.post(localCtx("a1"), { from: "a1", to: "a2", type: "ask", body: "hi" });
     const v = bus.inbox(localCtx("a2"), { agent: "a2" }) as any;
     expect(v.value.rows.length).toBe(1);
-    expect((bus.db.query("SELECT count(*) c FROM reads WHERE agent='a2'").get() as any).c).toBe(0);
+    expect((bus.testDb.query("SELECT count(*) c FROM reads WHERE agent='a2'").get() as any).c).toBe(0);
     bus.inbox(localCtx("a2"), { agent: "a2", mark: true });
-    expect((bus.db.query("SELECT count(*) c FROM reads WHERE agent='a2'").get() as any).c).toBe(1);
+    expect((bus.testDb.query("SELECT count(*) c FROM reads WHERE agent='a2'").get() as any).c).toBe(1);
     bus.close(); rmSync(home, { recursive: true, force: true });
   });
 });
@@ -311,23 +310,26 @@ describe("rename (§4 transactional)", () => {
   test("rewrites reads/tokens/cursors/idempotency/events in one txn; history keeps old sender", () => {
     const home = tmp();
     const bus = srv(home);
-    bus.db.run("INSERT INTO agents(id,role,last_seen) VALUES('old','lab','2026-01-01T00:00:00Z')");
+    bus.testDb.run("INSERT INTO agents(id,role,last_seen) VALUES('old','lab','2026-01-01T00:00:00Z')");
     const ctx = serverCtx("old", ["post:as", "read:all", "tokens:admin", "agents:admin"]);
     const p = bus.post(ctx, { from: "old", to: "other", type: "note", body: "b" });
     const mid = (p as any).value.id;
-    bus.db.run("INSERT INTO reads(agent,msg,read_at) VALUES('old',?,'now')", [mid]);
+    bus.testDb.run("INSERT INTO reads(agent,msg,read_at) VALUES('old',?,'now')", [mid]);
     bus.tokenCreate(serverCtx("old", ["tokens:admin", "read:all"]), { agent: "old", scopes: ["read:all"] });
     bus.cursorSet("old", "cli", bus.epoch(), 5);
     const r = bus.rename(ctx, { agent: "old", to: "new" });
     expect(r.error).toBeUndefined();
-    expect((bus.db.query("SELECT count(*) c FROM agents WHERE id='new'").get() as any).c).toBe(1);
-    expect((bus.db.query("SELECT count(*) c FROM reads WHERE agent='new'").get() as any).c).toBe(1);
-    expect((bus.db.query("SELECT count(*) c FROM tokens WHERE agent_id='new'").get() as any).c).toBe(1);
-    expect((bus.db.query("SELECT count(*) c FROM cursors WHERE agent_id='new'").get() as any).c).toBe(1);
-    expect((bus.db.query("SELECT count(*) c FROM idempotency WHERE agent_id='new'").get() as any).c).toBe(0);
-    expect((bus.db.query("SELECT sender FROM messages WHERE id=?").get(mid) as any).sender).toBe("old");
-    const kinds = (bus.db.query("SELECT kind FROM events").all() as any[]).map((x) => x.kind);
+    expect((bus.testDb.query("SELECT count(*) c FROM agents WHERE id='new'").get() as any).c).toBe(1);
+    expect((bus.testDb.query("SELECT count(*) c FROM reads WHERE agent='new'").get() as any).c).toBe(1);
+    expect((bus.testDb.query("SELECT count(*) c FROM tokens WHERE agent_id='new'").get() as any).c).toBe(1);
+    expect((bus.testDb.query("SELECT count(*) c FROM cursors WHERE agent_id='new'").get() as any).c).toBe(1);
+    expect((bus.testDb.query("SELECT count(*) c FROM idempotency WHERE agent_id='new'").get() as any).c).toBe(0);
+    expect((bus.testDb.query("SELECT sender FROM messages WHERE id=?").get(mid) as any).sender).toBe("old");
+    const kinds = (bus.testDb.query("SELECT kind FROM events").all() as any[]).map((x) => x.kind);
     expect(kinds).toContain("rename");
+    // M7 (round 2): events are point-in-time audit — the OLD id survives in
+    // prior events (the rename event itself carries the new id via agents_au).
+    expect((bus.testDb.query("SELECT count(*) c FROM events WHERE agent_id='old'").get() as any).c).toBeGreaterThan(0);
     bus.close(); rmSync(home, { recursive: true, force: true });
   });
 
@@ -335,12 +337,77 @@ describe("rename (§4 transactional)", () => {
     const home = tmp();
     const files = new Map<string, string>();
     const bus = openBus({ home, mode: "local", seams: testSeams({ files }) });
-    bus.db.run("INSERT INTO agents(id,role,last_seen) VALUES('ra','lab','2026-01-01T00:00:00Z')");
-    bus.db.run("INSERT INTO agents(id,role,last_seen) VALUES('rb','lab','2026-01-01T00:00:00Z')"); // target exists ⇒ conflict
+    bus.testDb.run("INSERT INTO agents(id,role,last_seen) VALUES('ra','lab','2026-01-01T00:00:00Z')");
+    bus.testDb.run("INSERT INTO agents(id,role,last_seen) VALUES('rb','lab','2026-01-01T00:00:00Z')"); // target exists ⇒ conflict
     const r = bus.rename(localCtx("ra"), { agent: "ra", to: "rb" });
     expect(r.error).toBe("identity_conflict");
     expect([...files.keys()].filter((k) => k.includes("announce")).length).toBe(0); // mirror untouched
     bus.close(); rmSync(home, { recursive: true, force: true });
+  });
+});
+
+describe("round-3 pins (m2 quirk, M5 forced collision, M6 trigger upgrade)", () => {
+  test("m2: local inbox/read touch-before-validate registers unvalidated ids (legacy parity)", () => {
+    const home = tmp();
+    const bus = loc(home);
+    // legacy de4ed3b quirk: inbox --for "BAD ID" succeeds AND writes the row
+    expect(bus.inbox(localCtx("BAD ID"), { agent: "BAD ID" }).error).toBeUndefined();
+    const ids = (bus.testDb.query("SELECT id FROM agents").all() as any[]).map((r) => r.id);
+    expect(ids).toContain("BAD ID");
+    bus.close(); rmSync(home, { recursive: true, force: true });
+  });
+
+  test("M5: forced PK collision ⇒ derived thread follows the NEW id; explicit thread survives", () => {
+    const home = tmp();
+    const bus = openBus({ home, mode: "local", seams: testSeams({ seed: 7 }) });
+    const ctx = localCtx("sys");
+    const first = bus.post(ctx, { from: "sys", to: "x", type: "note", body: "one" });
+    const firstId = (first as any).value.id;
+    // force a collision: seed resets per-bus, so a fresh bus mints the same id
+    bus.close();
+    const bus2 = openBus({ home, mode: "local", seams: testSeams({ seed: 7 }) });
+    const second = bus2.post(ctx, { from: "sys", to: "x", type: "note", body: "two" });
+    expect(second.error).toBeUndefined();
+    const v = (second as any).value;
+    expect(v.id).not.toBe(firstId); // retried to a fresh id
+    expect(v.thread).toBe(v.id); // M5: derived thread = NEW id, never the victim's
+    expect((bus2.testDb.query("SELECT thread FROM messages WHERE id=?").get(v.id) as any).thread).toBe(v.id);
+    // explicit thread is never retargeted by the retry
+    const pinned = bus2.post(ctx, { from: "sys", to: "x", type: "note", body: "three", thread: "manual-thread" });
+    expect((pinned as any).value.thread).toBe("manual-thread");
+    bus2.close(); rmSync(home, { recursive: true, force: true });
+  });
+
+  test("M6: reopening a DB with old-generation triggers upgrades them + rebuilds recipients", () => {
+    const home = tmp();
+    const bus = loc(home);
+    // simulate the old generation: replace msg_ai with the pre-WSET version
+    // (space-trim only, no coalesce) and drop the version marker
+    bus.testDb.exec(`DROP TRIGGER msg_ai;
+      CREATE TRIGGER msg_ai AFTER INSERT ON messages BEGIN
+        INSERT INTO events(kind,msg_id,agent_id,at) VALUES('msg',NEW.id,NEW.sender,NEW.created_at);
+        INSERT OR IGNORE INTO message_recipients(msg,target)
+        WITH RECURSIVE s(rest,tok) AS (
+          SELECT coalesce(NEW.recipients,'') || ',', NULL
+          UNION ALL
+          SELECT substr(rest, instr(rest,',')+1), trim(substr(rest,1,instr(rest,',')-1)) FROM s WHERE rest <> '')
+        SELECT NEW.id, tok FROM s WHERE tok IS NOT NULL AND tok <> '';
+      END;`);
+    bus.testDb.exec("DELETE FROM meta WHERE key='schema_version'");
+    // a row written by the OLD trigger: tab-padded recipient indexed WITH the tab
+    bus.testDb.run("INSERT INTO messages(id,thread,sender,recipients,type,status,body,created_at,channel) VALUES('m-old','m-old','sys','a,\tb','note','open','b','2026-01-01T00:00:00Z','general')");
+    bus.testDb.run("INSERT INTO message_recipients(msg,target) VALUES('m-old','\\tb')");
+    bus.close();
+    // reopen with current code ⇒ version bump drops+recreates triggers, rebuilds index
+    const bus2 = loc(home);
+    const sql = (bus2.testDb.query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='msg_ai'").get() as any).sql;
+    expect(sql).toContain("char(9)"); // WSET present ⇒ new generation
+    expect(sql).toContain("coalesce");
+    const targets = (bus2.testDb.query("SELECT target FROM message_recipients WHERE msg='m-old' ORDER BY target").all() as any[]).map((r) => r.target);
+    expect(targets).toEqual(["a", "b"]); // rebuilt via WSET trim: "\tb" → "b" — matches csv() parity
+    // NULL last_seen insert must no longer abort (coalesce live):
+    bus2.testDb.run("INSERT INTO agents(id,role,joined_at,last_seen) VALUES('nulld','r','2026-01-01T00:00:00Z',NULL)");
+    bus2.close(); rmSync(home, { recursive: true, force: true });
   });
 });
 

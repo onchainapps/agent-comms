@@ -22,14 +22,20 @@ import { defaultSeams, type Seams } from "./seams.ts";
 // ---------- public types ----------
 
 export type Mode = "local" | "server";
-export type Scope =
-  | "read:all" | "post:as" | "tokens:admin" | "agents:admin"
-  | "tokens:admin:human" | "presence:all" | "backup" | "restore"
-  | `channel:${string}`;
-export const ALL_SCOPES: readonly Scope[] = [
-  "read:all", "post:as", "tokens:admin", "agents:admin",
-  "tokens:admin:human", "presence:all", "backup", "restore",
-];
+// §4/§5: exactly the four-name scope enum. Any other token (presence:all,
+// tokens:admin:human, backup, restore, channel:*) is NOT a scope in the accepted
+// RFC and was removed in the round-3 audit (M8c) — presence/token admin/backup
+// are governed by tokens:admin + agents:admin + the restore runbook, not scopes.
+export type Scope = "read:all" | "post:as" | "tokens:admin" | "agents:admin";
+export const ALL_SCOPES: readonly Scope[] = ["read:all", "post:as", "tokens:admin", "agents:admin"];
+const SCOPE_SET: ReadonlySet<string> = new Set(ALL_SCOPES);
+/** §4 normalizer contract: writers must never store unnormalized input. A scope
+ *  is one enum name — never empty, never comma-bearing (which would smuggle a
+ *  second name through normalizeScopes and verify as a scope the minter never
+ *  named). Rejects `read:all,agents:admin` and `bogus` alike (M8a). */
+export function validScope(s: string): s is Scope {
+  return SCOPE_SET.has(s);
+}
 
 export type PrincipalBase = { agentId: string; kind: "agent" | "human"; scopes: Scope[] };
 export type LocalPrincipal = PrincipalBase & { localRoot?: true };
@@ -149,9 +155,13 @@ type Core = ReturnType<typeof openBusCore>;
  *  through them would widen the ctx to the union and let localRoot slip back
  *  in (probe-verified with tsc). */
 export type Bus<M extends Mode = Mode> = M extends "server" ? Omit<Core,
-  "joinAgent" | "post" | "inbox" | "read" | "threadOf" | "receipts" | "setStatus" | "channels" | "rename" | "history" | "waitStep" | "tokenCreate" | "tokenList" | "tokenRevoke"
-> & ServerOnly : Core;
+  "joinAgent" | "post" | "inbox" | "read" | "threadOf" | "receipts" | "setStatus" | "channels" | "rename" | "history" | "waitStep" | "tokenCreate" | "tokenList" | "tokenRevoke" | "mode"
+> & ServerOnly : Omit<Core, "mode"> & { readonly mode: "local" };
 interface ServerOnly {
+  // discriminant so Bus<"local"> is NOT structurally assignable to Bus<"server">
+  // (H2/H3, round-2 M1): without it, core methods taking Ctx<M> are a supertype
+  // and nothing else distinguishes the modes at the handle seam.
+  readonly mode: "server";
   // property (arrow) syntax, NOT method syntax: strictFunctionTypes is only
   // contravariant for properties — method params are bivariant and would let
   // a Ctx<"local"> slip back in (probe-verified).
@@ -258,6 +268,27 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
 
   // triggers (§4). Timestamps coalesced (finding 6): a NULL created_at/last_seen/
   // revoked_at from a manual or stale writer must not abort the write.
+  // M6 (round 2): triggers are VERSIONED. CREATE TRIGGER IF NOT EXISTS would
+  // silently keep old-generation triggers forever on existing DBs (the live
+  // review bus hit exactly this). On SCHEMA_VERSION bump: DROP + recreate all
+  // triggers inside BEGIN IMMEDIATE, and rebuild message_recipients (rows the
+  // old trigger wrote had wrong trim semantics).
+  const SCHEMA_VERSION = 2;
+  const storedVersion = Number((d.query("SELECT value FROM meta WHERE key='schema_version'").get() as any)?.value ?? 0);
+  const hadTriggers = (d.query("SELECT count(*) c FROM sqlite_master WHERE type='trigger'").get() as any).c > 0;
+  if (storedVersion !== SCHEMA_VERSION && hadTriggers) {
+    d.exec("BEGIN IMMEDIATE");
+    try {
+      for (const trg of ["msg_ai", "msg_au", "reads_ai", "agents_ai", "agents_au", "tokens_ai", "tokens_au"])
+        d.exec(`DROP TRIGGER IF EXISTS ${trg}`);
+      d.exec("DELETE FROM message_recipients"); // rebuilt below by the backfill split
+      d.exec("DELETE FROM meta WHERE key='backfill_recipients'");
+      d.run("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", [String(SCHEMA_VERSION)]);
+      d.exec("COMMIT");
+    } catch (e) { d.exec("ROLLBACK"); throw e; }
+  } else if (storedVersion !== SCHEMA_VERSION) {
+    d.run("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", [String(SCHEMA_VERSION)]);
+  }
   const NOW_SQL = `strftime('%Y-%m-%dT%H:%M:%SZ','now')`;
   d.exec(`
     CREATE TRIGGER IF NOT EXISTS msg_ai AFTER INSERT ON messages BEGIN
@@ -290,8 +321,9 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       INSERT INTO events(kind,agent_id,at) VALUES('token',NEW.agent_id,coalesce(NEW.created_at,${NOW_SQL}));
     END;
     CREATE TRIGGER IF NOT EXISTS tokens_au AFTER UPDATE OF revoked_at ON tokens
-    WHEN NEW.revoked_at IS NOT NULL BEGIN
-      INSERT INTO events(kind,agent_id,at) VALUES('token',NEW.agent_id,NEW.revoked_at);
+    WHEN OLD.revoked_at IS NOT NEW.revoked_at BEGIN
+      -- emits on revoke AND un-revoke (audit trail is complete either way)
+      INSERT INTO events(kind,agent_id,at) VALUES('token',NEW.agent_id,coalesce(NEW.revoked_at,${NOW_SQL}));
     END;
   `);
 
@@ -494,13 +526,21 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
         channel = par?.channel ?? null;
       }
     }
+    // m3 (round 2): server rejects dangling --re BEFORE ensureChannel, so a
+    // rejected post leaves no orphan channel row (X3/N-h).
+    if (p.re && mode === "server") {
+      const reRow = d.query("SELECT id FROM messages WHERE id=?").get(p.re);
+      if (!reRow) return { error: "not_found", detail: `error: re -> unknown message id '${p.re}'` };
+    }
     channel = channel || "general";
     ensureChannel(channel, p.from);
 
     const sender = rootCtx ? (p.as ?? p.from) : (p.as || ctx.principal.agentId); // §5: sender = as-target
     const asAudit = p.as ? ctx.principal.agentId : null;                        // N4: meta.as = principal
     const mid = newId(sender.split("-")[0]);
-    const thread = p.thread || mid;
+    // M5 (round 2): thread is DERIVED from the final id — recomputed on every
+    // collision retry; an explicit p.thread always wins and never retargets.
+    let thread = p.thread || mid;
     let fname = `msg-${stamp()}-${sender}-${p.type}-${mid.split("-").pop()}.md`;
     const m: MsgRow = {
       id: mid, thread, re: p.re ?? null, sender, recipients: p.to,
@@ -509,11 +549,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       meta: asAudit ? JSON.stringify({ as: asAudit }) : null,
     };
     // QUIRK (legacy §10): a dangling --re inserts silently in local mode;
-    // server mode rejects it (contract-pinned divergence for M2).
-    if (p.re && mode === "server") {
-      const reRow = d.query("SELECT id FROM messages WHERE id=?").get(p.re);
-      if (!reRow) return { error: "not_found", detail: `error: re -> unknown message id '${p.re}'` };
-    }
+    // server mode rejects it ABOVE (m3) before any channel row is written.
 
     // insert-first (§9): DB txn commits (message + idempotency + PK-collision
     // retry), THEN mirror write outside the txn.
@@ -530,11 +566,13 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
                asAudit ? JSON.stringify({ as: asAudit }) : null],
             );
             m.id = id;
+            m.thread = thread;
             break;
           } catch (e: any) {
             if (!String(e?.message ?? e).includes("UNIQUE") || ++tries >= 8) throw e;
             id = newId(sender.split("-")[0]);
             fname = `msg-${stamp()}-${sender}-${p.type}-${id.split("-").pop()}.md`; // finding 13: fname follows id
+            if (!p.thread) thread = id; // M5 (round 2): derived thread follows the new id
           }
         }
         if (idem) {
@@ -547,7 +585,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       const msg = String(e?.message ?? e);
       if (msg.includes("UNIQUE") && idem) return { error: "conflict", detail: "idempotency key race (single-writer rule; retry)" };
       if (msg.includes("SQLITE_BUSY") || msg.includes("database is locked")) return { error: "contention", detail: "busy after retries" };
-      throw e;
+      return { error: "internal", detail: `post: ${msg}` }; // m6 (round 2): never raw-throw over Res
     }
 
     const content = renderMd(m);
@@ -622,10 +660,13 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const r = d.query("SELECT * FROM messages WHERE id=?").get(p.id) as MsgRow | null;
     if (!r) return { error: "not_found", detail: `no such message: ${p.id}` };
     if (!rootCtx) {
+      // §5: sender OR resolved intended recipient may ack/done/status;
+      // agents:admin may set ANY. read:all is visibility (history/stream/peek),
+      // NOT confidentiality — it must not gate status (round-2 M2).
       const maySet = agent === r.sender
         || recipientsMatch(r.recipients, agent, roleOf(agent))
-        || hasScope(ctx, "read:all");
-      if (!maySet) return { error: "forbidden", detail: "status: not sender, not recipient (needs read:all)" };
+        || hasScope(ctx, "agents:admin");
+      if (!maySet) return { error: "forbidden", detail: "status: not sender, not recipient (needs agents:admin)" };
     }
     d.run("UPDATE messages SET status=?, updated_at=? WHERE id=?", [p.state, nowIso(), p.id]);
     return { value: { id: p.id, status: p.state } };
@@ -680,12 +721,14 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
         d.run("UPDATE tokens SET agent_id=? WHERE agent_id=?", [p.to, p.agent]);
         d.run("UPDATE cursors SET agent_id=? WHERE agent_id=?", [p.to, p.agent]);
         d.run("UPDATE idempotency SET agent_id=? WHERE agent_id=?", [p.to, p.agent]);
-        d.run("UPDATE events SET agent_id=? WHERE agent_id=?", [p.to, p.agent]);
+        // M7 (round 2): events are point-in-time audit history (§4) — the OLD
+        // id is NOT rewritten; the agents_au rename event links old→new.
         d.exec("COMMIT");
       } catch (e) { d.exec("ROLLBACK"); throw e; }
     } catch (e: any) {
-      if (String(e?.message ?? e).includes("SQLITE_BUSY")) return { error: "contention", detail: "busy" };
-      throw e;
+      const msg = String(e?.message ?? e);
+      if (msg.includes("SQLITE_BUSY")) return { error: "contention", detail: "busy" };
+      return { error: "internal", detail: `rename: ${msg}` }; // m6 (round 2): never raw-throw over Res
     }
     seams.mirror(join(MSG_DIR, "general"), fname, renderMd(m));
     return { value: { announced: m } };
@@ -698,24 +741,24 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     if (!ID_RE.test(p.agent)) return { error: "usage", detail: `invalid agent id: ${p.agent}` };
     const kind = p.kind ?? "agent";
     const rootCtx = isRootCtx(ctx);
-    // finding 2 (B2): authz — server callers need tokens:admin (humans: the
-    // separate scope); local root is the bootstrap path.
-    if (!rootCtx) {
-      if (!ctx.principal.scopes.includes("tokens:admin"))
-        return { error: "unauthorized", detail: "token.create requires tokens:admin" };
-      if (kind === "human" && !ctx.principal.scopes.includes("tokens:admin:human"))
-        return { error: "unauthorized", detail: "minting human tokens requires tokens:admin:human" };
-    }
+    // §5: token.create requires tokens:admin (local root is the bootstrap path).
+    // M9 (round 2): a VALID credential lacking the scope is forbidden (-32002),
+    // never unauthorized (-32001 = bad/missing credential only).
+    if (!rootCtx && !ctx.principal.scopes.includes("tokens:admin"))
+      return { error: "forbidden", detail: "token.create requires tokens:admin" };
+    // §4 normalizer contract (M8a): every minted scope must be one enum name —
+    // no commas, no unknown names. Otherwise normalizeScopes would store a
+    // smuggled second name that later verifies as a real scope.
+    if (p.scopes) for (const s of p.scopes)
+      if (!validScope(s)) return { error: "usage", detail: `invalid scope: ${JSON.stringify(s)} (must be one of ${ALL_SCOPES.join("|")}, no commas)` };
     let scopes: Scope[];
     if (p.admin) scopes = [...ALL_SCOPES];
     else if (p.scopes) scopes = p.scopes;
     else scopes = kind === "human" ? ["read:all"] : [];
-    if (!rootCtx && p.scopes) {
-      // subset rule: cannot mint scopes you don't hold (channel:* is transitive)
-      for (const s of scopes)
-        if (!ctx.principal.scopes.includes(s) && !(s.startsWith("channel:") && ctx.principal.scopes.includes("channel:*" as Scope)))
-          return { error: "unauthorized", detail: `cannot mint scope '${s}' you do not hold` };
-    }
+    // §5: tokens:admin is TRANSITIVELY ROOT — it may mint any subset, including
+    // scopes it does not itself hold (the round-2 M8b "must hold" rule was a
+    // contradiction of §5 and is removed). Minting tokens:admin itself is still
+    // gated by the bootstrap guard below.
     const norm = normalizeScopes(scopes);
     const bytes = seams.rng(32);
     const token = "ac_" + b64url(bytes);
@@ -757,21 +800,22 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     if (digest.length !== row.key_hash.length || !timingSafeEqual(digest, Buffer.from(row.key_hash)))
       return { error: "unauthorized", detail: "bad token" };
     const kind = ((d.query("SELECT kind FROM agents WHERE id=?").get(row.agent_id) as any)?.kind ?? "agent") as "agent" | "human";
-    return { value: { agentId: row.agent_id, scopes: normalizeScopes(csv(row.scopes)).split(",") as Scope[], kind, tokenId: row.id } }; // finding 20: tokenId
+    return { value: { agentId: row.agent_id, scopes: normalizeScopes(csv(row.scopes)).split(",").filter(validScope) as Scope[], kind, tokenId: row.id } }; // finding 20: tokenId; legacy 8-name rows: unknown tokens are inert (M8)
   }
 
   function tokenList(ctx: Ctx<M>): Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; created_at: string; last_used: string; revoked_at: string | null }[] }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (!isRootCtx(ctx) && !ctx.principal.scopes.includes("tokens:admin"))
-      return { error: "unauthorized", detail: "token.list requires tokens:admin" };
-    const rows = d.query("SELECT * FROM tokens ORDER BY id").all() as any[];
-    return { value: { tokens: rows.map((r) => ({ id: r.id, agentId: r.agent_id, kind: r.kind, prefix: r.prefix, scopes: normalizeScopes(csv(r.scopes)).split(",") as Scope[], created_at: r.created_at, last_used: r.last_used, revoked_at: r.revoked_at })) } };
+      return { error: "forbidden", detail: "token.list requires tokens:admin" }; // M9
+    // m1 (round 2): kind lives on agents, not tokens — JOIN for it.
+    const rows = d.query("SELECT t.*, a.kind AS agent_kind FROM tokens t LEFT JOIN agents a ON a.id=t.agent_id ORDER BY t.id").all() as any[];
+    return { value: { tokens: rows.map((r) => ({ id: r.id, agentId: r.agent_id, kind: r.agent_kind ?? "agent", prefix: r.prefix, scopes: normalizeScopes(csv(r.scopes)).split(",").filter(validScope) as Scope[], created_at: r.created_at, last_used: r.last_used, revoked_at: r.revoked_at })) } };
   }
 
   function tokenRevoke(ctx: Ctx<M>, p: { id: number }): Res<{ revoked: boolean }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (!isRootCtx(ctx) && !ctx.principal.scopes.includes("tokens:admin"))
-      return { error: "unauthorized", detail: "token.revoke requires tokens:admin" };
+      return { error: "forbidden", detail: "token.revoke requires tokens:admin" }; // M9
     const r = d.run("UPDATE tokens SET revoked_at=? WHERE id=? AND revoked_at IS NULL", [nowIso(), p.id]);
     if (r.changes === 0) return { error: "not_found", detail: `no active token ${p.id}` };
     return { value: { revoked: true } };
@@ -816,6 +860,20 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
 
   // ---------- streaming/history (§6) ----------
 
+  /** M3 (round 2): ONE cursor parser for every since-bearing entry point
+   *  (history, waitStep, cursorSet). Format → usage; foreign epoch → resync;
+   *  seq below gc_floor → resync with data.floor — a stale Last-Event-ID or
+   *  explicit since can NEVER silently skip past deleted events (§9/N3). */
+  function parseCursor(since: string): Res<{ ep: string; seq: number }> {
+    const m = /^([0-9a-f]{8,64})\.(\d+)$/.exec(since);
+    if (!m) return { error: "usage", detail: "cursor must be <epoch>.<seq>" };
+    const e = epoch();
+    if (m[1] !== e) return { error: "resync", detail: "epoch mismatch", data: { resync: true, epoch: e } };
+    const seq = Number(m[2]);
+    if (seq < gcFloor()) return { error: "resync", detail: "cursor below retention floor", data: { resync: true, epoch: e, floor: gcFloor() } };
+    return { value: { ep: e, seq } };
+  }
+
   function history(ctx: Ctx<M>, p: { channel?: string | null; limit?: number; since?: string }): Res<{ rows: MsgRow[]; hasMore: boolean; cursor: { epoch: string; seq: number } }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (!isRootCtx(ctx) && !ctx.principal.scopes.includes("read:all"))
@@ -823,20 +881,24 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const limit = Math.min(Math.max(p.limit ?? 200, 1), 1000);
     let seqFrom = 0;
     if (p.since) {
-      const m = /^([0-9a-f]{8,64})\.(\d+)$/.exec(p.since);
-      if (!m) return { error: "usage", detail: "since must be <epoch>.<seq>" };
-      if (m[1] !== epoch()) return { error: "resync", detail: "epoch mismatch", data: { resync: true, epoch: epoch() } };
-      seqFrom = Number(m[2]);
+      const c = parseCursor(p.since);
+      if (c.error) return c;
+      seqFrom = c.value.seq;
     }
-    // finding 8: NEWEST page + cursor of last DELIVERED event + has_more — no hole.
+    // M4 (round 2): TWO modes. WITH since the client is catching up ⇒ OLDEST
+    // unseen first (ASC), cursor = last delivered, hasMore = more after it —
+    // paging to hasMore=false delivers every row exactly once, no hole.
+    // WITHOUT since ⇒ newest-page snapshot (finding 8), cursor = newest.
+    const ascending = !!p.since;
     d.exec("BEGIN");
     try {
+      const dir = ascending ? "ASC" : "DESC";
       const evs = (p.channel
-        ? d.query(`SELECT e.seq,e.msg_id FROM events e JOIN messages m ON m.id=e.msg_id WHERE e.kind='msg' AND e.seq>? AND m.channel=? ORDER BY e.seq DESC LIMIT ?`)
-        : d.query(`SELECT seq,msg_id FROM events WHERE kind='msg' AND seq>? ORDER BY seq DESC LIMIT ?`)) as any;
+        ? d.query(`SELECT e.seq,e.msg_id FROM events e JOIN messages m ON m.id=e.msg_id WHERE e.kind='msg' AND e.seq>? AND m.channel=? ORDER BY e.seq ${dir} LIMIT ?`)
+        : d.query(`SELECT seq,msg_id FROM events WHERE kind='msg' AND seq>? ORDER BY seq ${dir} LIMIT ?`)) as any;
       const got = (p.channel ? evs.all(seqFrom, p.channel, limit + 1) : evs.all(seqFrom, limit + 1)) as { seq: number; msg_id: string }[];
       const hasMore = got.length > limit;
-      const page = got.slice(0, limit).reverse();
+      const page = ascending ? got.slice(0, limit) : got.slice(0, limit).reverse();
       const rows = page.map((e) => d.query("SELECT * FROM messages WHERE id=?").get(e.msg_id) as MsgRow).filter(Boolean);
       const lastSeq = page.length ? page[page.length - 1].seq : seqFrom;
       d.exec("COMMIT");
@@ -855,10 +917,9 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const consumer = p.consumer ?? "default";
     let ep = epoch(); let seq: number;
     if (p.since) {
-      const m = /^([0-9a-f]{8,64})\.(\d+)$/.exec(p.since);
-      if (!m) return { error: "usage", detail: "since must be <epoch>.<seq>" };
-      if (m[1] !== ep) return { error: "resync", detail: "since epoch mismatch", data: { resync: true, epoch: ep } };
-      seq = Number(m[2]);
+      const c = parseCursor(p.since); // M3: epoch AND gc_floor checked
+      if (c.error) return c;
+      ep = c.value.ep; seq = c.value.seq;
     } else {
       const c = cursorGet(ctx.principal.agentId, consumer);
       ep = c.epoch; seq = c.seq;
@@ -926,7 +987,9 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   function close() { d.close(); }
 
   return {
-    db: d, home, mode, seams, DB_PATH, MSG_DIR, nowIso, stamp, newId,
+    // m5 (round 2): db is demoted to an explicit test accessor — production
+    // shells/adapters must never reach for it (M2 RpcBus has no DB at all).
+    testDb: d, home, mode, seams, DB_PATH, MSG_DIR, nowIso, stamp, newId,
     joinAgent, listAgents, post, inbox, read, threadOf, receipts, setStatus, channels, rename,
     tokenCreate, tokenVerify, tokenList, tokenRevoke, tokenTouch,
     cursorGet, cursorSet, history, waitStep, tailEvents, epoch, gcFloor, rotateEpoch, gc, preflight,

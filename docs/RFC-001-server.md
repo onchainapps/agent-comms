@@ -413,10 +413,10 @@ rebaseline quirk through M1 (goldens hold); cursor-backed watch lands in M3.
   history same-txn cursor + msg_id dedupe (§6), login CSRF + media-type parse (§8),
   identity-flag naming (§3), inbox.wait consumer/reads semantics (§6), per-request identity
   from token row (§5), tokens_ai (§4), prose aligned to UPDATE OF status (§3).
-- **D** — M1 implementation deltas (sanctioned, @6e1f7e6): identifier rejection via
-  `ID_RE`/`CH_RE` fails closed with `usage` (exit 2) *before* any path join or DB write
-  (legacy silently accepted `../` and produced orphan mirrors — golden pins the accepted
-  set byte-identical); `rename` is transactional across reads/tokens/cursors/idempotency
+- **D** — M1 implementation deltas (sanctioned, @6e1f7e6 + round-3): identifier rejection
+  via `ID_RE` fails closed with `usage` (exit 2) *before* any path join or DB write **on the
+  write paths** (post/join/rename/token.create); local `inbox`/`read` keep the legacy
+  touch-before-validate quirk on unvalidated ids (pinned by test, byte-parity with de4ed3b); `rename` is transactional across reads/tokens/cursors/idempotency
   with mirror files rewritten after commit (rollback leaves no orphan mirrors; history
   keeps old sender rows by design); local-root principals are unnameable on
   `Bus<"server">` at type level (concrete `LocalCtx`/`ServerCtx` — tsc alias-variance
@@ -424,3 +424,16 @@ rebaseline quirk through M1 (goldens hold); cursor-backed watch lands in M3.
   local-opener-only (§5) — server-mode `tokenCreate` always traverses scope +
   duplicate-admin guard; legacy quirks pinned by contract tests: touch-before-validate
   on post/status, inbox does not mark reads, dangling `--re` lenient in local mode only.
+- **E** — M1 round-3 deltas (sanctioned, post-rereview): triggers are versioned via
+  `meta.schema_version` — on bump, all triggers DROP+CREATE inside one IMMEDIATE txn and
+  `message_recipients` is rebuilt via the canonical SPLIT_SQL (old-generation rows had
+  space-only trim); scope enum is exactly the 4 names (§4/§5) and mint validates each name
+  (no commas, no unknowns — smuggled names verify inert on legacy rows); `tokens:admin` is
+  transitive-root for minting (§5, supersedes the round-2 "must hold" rule); scope failures
+  are `forbidden` (-32002), `unauthorized` reserved for credential failure (§6); status
+  "any" gate is `agents:admin`, not `read:all` (§5); `events.agent_id` is NOT rewritten by
+  rename (§4, audit); history `since`-mode pages ASC oldest-first with no-hole cursor,
+  snapshot mode keeps newest-page; ALL since-bearing entry points share one cursor parser
+  that resyncs on epoch mismatch AND gc-floor breach (§9); collision retry retargets the
+  DERIVED thread to the new id; dangling-re rejection precedes ensureChannel (no orphan
+  rows); `db` demoted to `testDb`; post/rename return `internal` instead of raw-throwing.

@@ -1,8 +1,11 @@
 /**
  * Golden harness (RFC-001 §10-M1, finding 4 rebuild):
  *  - runs under `bun test` (golden.test.ts imports this)
- *  - FROZEN seams via COMMS_TEST_SEAMS (clock/rng/pid) → ids & timestamps are
- *    deterministic, so masks shrink to just the tmp path
+ *  - FROZEN seams via COMMS_TEST_SEAMS (clock/pid; rng stays REAL across CLI
+ *    processes to avoid seeded id collisions) → ids/timestamps are still
+ *    volatile because the de4ed3b BASELINE runs on wall-clock time, so masks
+ *    (<ID>/<TS>/seen/last/pid/tmp + sorted ●/○ runs) remain necessary — the
+ *    seams make the NEW impl deterministic; parity is against the old one.
  *  - mirror snapshots keyed SORTED (readdir order is filesystem-hash order —
  *    the old harness was flaky because of this, not behavior)
  *  - runs the script TWICE: on an empty home AND on a LEGACY fixture DB
