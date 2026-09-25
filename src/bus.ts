@@ -1126,6 +1126,11 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     // dm channel routes through the pair-keyed creation path (client ~n is
     // stripped there — the pair, not the name, is the key).
     if (channel !== null && DM_SHAPED_RE.test(channel) && dmMembersResolved === null) {
+      // M2-residual: detail is the CANONICAL pair name of the request (sorted,
+      // ~n stripped) on EVERY branch — raw echo on hit vs canonical on miss is
+      // a pair-existence oracle for reversed / suffixed names.
+      const rq = DM_RE.exec(channel);
+      if (rq) requestedChannel = dmChannelName(rq[1], rq[2]);
       if (d.query("SELECT 1 FROM channels WHERE name=?").get(channel)) {
         dmMembersResolved = dmMembers(channel);
       } else {
@@ -1198,6 +1203,11 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
           const win = dmChannelForPair(dmPending.lo, dmPending.hi);
           if (win) channel = win;
           else {
+            // M3-residual: re-run the pure gate INSIDE the txn — a rename that
+            // committed between the pre-check and BEGIN must not let us mint a
+            // dm with a now-retired member (m-c parity).
+            const g2 = dmGate(dmPending.lo, dmPending.hi, sender, dmRules);
+            if (g2) { d.exec("ROLLBACK"); return g2; }
             try { channel = dmCreateInTxn(dmPending.lo, dmPending.hi, sender); }
             catch (e: any) {
               if (!String(e?.message ?? e).includes("UNIQUE")) throw e;
@@ -1530,6 +1540,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const prefix = token.slice(3, 15);
     const row = d.query("SELECT * FROM tokens WHERE prefix=? AND revoked_at IS NULL").get(prefix) as any;
     if (!row) return { error: "unauthorized", detail: "unknown or revoked token" };
+    // B1-legacy (claude r2): a token minted for a touch()-resurrected retired id
+    // under b922c1f is still live — the one-way door fails CLOSED at verify.
+    if (d.query("SELECT 1 FROM agent_retired WHERE id=?").get(row.agent_id))
+      return { error: "unauthorized", detail: "unknown or revoked token" };
     const digest = createHmac("sha256", Buffer.from(row.salt)).update(token).digest();
     if (digest.length !== row.key_hash.length || !timingSafeEqual(digest, Buffer.from(row.key_hash)))
       return { error: "unauthorized", detail: "bad token" };
@@ -1761,7 +1775,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     });
   }
 
-  function preflight(): { badIds: string[]; badChannels: string[]; zeroMemberDms: string[]; roleCollisions: string[]; phantomMembers: string[] } {
+  function preflight(): { badIds: string[]; badChannels: string[]; zeroMemberDms: string[]; roleCollisions: string[]; phantomMembers: string[]; resurrectedIds: string[] } {
     const badIds = (d.query("SELECT DISTINCT id FROM agents").all() as any[])
       .map((r) => r.id).filter((id: string) => id && !ID_RE.test(id));
     // G1: preflight uses the SAME widened write-gate helper as post() — else
@@ -1778,11 +1792,14 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const roleCollisions = (d.query("SELECT id, role FROM agents WHERE role IS NOT NULL").all() as any[])
       .filter((r) => d.query("SELECT 1 FROM agents WHERE id=? AND id!=?").get(r.role, r.id) || d.query("SELECT 1 FROM agent_retired WHERE id=?").get(r.role))
       .map((r) => `${r.id}!role=${r.role}`);
-    return { badIds, badChannels: [...new Set(badChannels)], zeroMemberDms, roleCollisions, phantomMembers };
+    return { badIds, badChannels: [...new Set(badChannels)], zeroMemberDms, roleCollisions, phantomMembers: phantomMembersNow(),
+      // B1-legacy: agents rows resurrected by the b922c1f touch() bug (repair surface).
+      resurrectedIds: (d.query("SELECT a.id FROM agents a JOIN agent_retired r ON r.id = a.id").all() as any[]).map((r) => r.id) };
   }
   // n1 (claude nit): channel_members rows pointing at non-agents (decision A
   // allows a local DM to a not-yet-minted id) — listed so hosts can repair.
-  const phantomMembers = (d.query("SELECT DISTINCT agent_id FROM channel_members").all() as any[])
+  // Computed PER CALL (a handle-open snapshot goes stale — same latch class as M4).
+  const phantomMembersNow = () => (d.query("SELECT DISTINCT agent_id FROM channel_members").all() as any[])
     .map((r) => r.agent_id)
     .filter((id: string) => !d.query("SELECT 1 FROM agents WHERE id=?").get(id));
 

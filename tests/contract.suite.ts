@@ -544,6 +544,15 @@ export function contractSuite(name: string, make: Factory) {
         // as a distinct string — detail equals "no such channel: <requested>".
         expect((r1 as any).detail).toBe(`no such channel: dm~o-alice~o-bob2`);
         expect((r2 as any).detail).toBe(`no such channel: dm~o-alice~o-zzz`);
+        // M2-residual: reversed order and ~n suffix — existing pair and
+        // never-existing pair must produce the SAME (canonical) detail shape.
+        const d = async (ch: string) => ((await mal.post({ from: "o-mal", to: "o-alice", type: "note", body: "x", channel: ch })) as any).detail;
+        expect(await d("dm~o-bob2~o-alice")).toBe("no such channel: dm~o-alice~o-bob2");
+        expect(await d("dm~o-zzz~o-alice")).toBe("no such channel: dm~o-alice~o-zzz");
+        expect(await d("dm~o-alice~o-bob2~7")).toBe("no such channel: dm~o-alice~o-bob2");
+        expect(await d("dm~o-alice~o-zzz~7")).toBe("no such channel: dm~o-alice~o-zzz");
+        // literal STORED name: canonicalized too (no raw echo of a real label)
+        expect(await d("dm~o-alice~o-bob")).toBe("no such channel: dm~o-alice~o-bob");
       });
     });
 

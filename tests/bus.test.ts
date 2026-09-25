@@ -572,6 +572,16 @@ describe("M1.5 F/G — local direction + mechanics (unit)", () => {
     bus.close(); rmSync(home, { recursive: true, force: true });
   });
 
+  test("n1: preflight.phantomMembers is live per call (not a handle-open snapshot)", () => {
+    const home = tmp();
+    const bus = loc(home);
+    expect(bus.preflight().phantomMembers).toEqual([]);
+    // decision A: local DM to a not-yet-minted id writes a phantom member row
+    bus.post(localCtx("pm-alice"), { from: "pm-alice", to: "pm-ghost", type: "note", body: "x", dm: "pm-ghost" });
+    expect(bus.preflight().phantomMembers).toEqual(["pm-ghost"]);
+    bus.close(); rmSync(home, { recursive: true, force: true });
+  });
+
   test("dm name canonicalization: code-unit sort, ~n stripped via pair lookup, both orders one channel", () => {
     const home = tmp();
     const bus = loc(home);
@@ -623,6 +633,13 @@ describe("M1.5 F/G — local direction + mechanics (unit)", () => {
     // identity_conflict, not internal UNIQUE failure.
     bus.testDb.run("INSERT OR IGNORE INTO agents(id,role,caps,pid,joined_at,last_seen,meta) VALUES('ar-a','ar-a','',0,?,?,'{}')", [bus.nowIso(), bus.nowIso()]);
     expect(bus.rename(r, { agent: "ar-a", to: "ar-d" }).error).toBe("identity_conflict");
+    expect(bus.preflight().resurrectedIds).toEqual(["ar-a"]);
+    // B1-legacy: a token that points at a retired id (minted under b922c1f
+    // before the fix) is refused at VERIFY — fail closed.
+    const tk = bus.tokenCreate(r, { agent: "ar-leg", scopes: [] } as any) as any;
+    expect(bus.tokenVerify(tk.value.token).error).toBeUndefined();
+    bus.testDb.run("INSERT INTO agent_retired(id,renamed_to,at) VALUES('ar-leg','ar-c',?)", [bus.nowIso()]);
+    expect(bus.tokenVerify(tk.value.token).error).toBe("unauthorized");
     bus.close(); rmSync(home, { recursive: true, force: true });
   });
 
