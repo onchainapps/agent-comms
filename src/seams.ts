@@ -15,6 +15,9 @@ export interface Seams {
   pid(): number;
   /** Human/git mirror sink. Writes content under dir, returns the display path. */
   mirror(dir: string, fname: string, content: string): string;
+  /** Hit-only notices (e.g. legacy role grammar in local mode — §5 golden-safe
+   *  warnings). Default: stderr. Tests may capture or silence. */
+  warn?(msg: string): void;
 }
 
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -24,6 +27,7 @@ export const defaultSeams: Seams = {
   now: () => new Date(),
   rng: (n) => crypto.getRandomValues(new Uint8Array(n)),
   pid: () => process.pid,
+  warn: (m) => { console.error(m); },
   mirror: (dir, fname, content) => {
     mkdirSync(dir, { recursive: true });
     const path = join(dir, fname);

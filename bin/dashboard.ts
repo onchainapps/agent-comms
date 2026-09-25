@@ -26,9 +26,20 @@ const HOME = process.env.COMMS_HOME ?? findRoot(dirname(fileURLToPath(import.met
 const DB_PATH = join(HOME, ".comms", "comms.db");
 const argPort = process.argv.includes("--port") ? process.argv[process.argv.indexOf("--port") + 1] : undefined;
 const PORT = Number(argPort ?? process.env.PORT ?? 8787);
+// N4 (claude F/G review): Bun.serve without hostname binds the v6 wildcard
+// (`*:port` — ss-verified), re-serving every message body to the LAN from an
+// unauthenticated direct-DB process. Default to loopback; --host opts out.
+const argHost = process.argv.includes("--host") ? process.argv[process.argv.indexOf("--host") + 1] : undefined;
+const HOST = argHost ?? "127.0.0.1";
+// G5: this is a pre-G binary (direct DB, unauthenticated). When the DB holds any
+// dm-shaped channel, dm rows are STRIPPED unless --omniview — "local = host user
+// is root of trust" does not extend to LAN visitors of a DB re-publisher.
+const OMNIVIEW = process.argv.includes("--omniview");
 
 const db = new Database(DB_PATH, { readonly: true });
 db.exec("PRAGMA busy_timeout = 3000");
+const dmStrip = !OMNIVIEW && !!db.query("SELECT 1 FROM channels WHERE name GLOB 'dm~*' LIMIT 1").get();
+if (dmStrip) console.error("dashboard: dm-shaped channels present — dm rows hidden (direct-DB pre-G binary); pass --omniview to show, or use the M4 web UI");
 
 function state() {
   const agents = db.query("SELECT id, role, caps, last_seen, joined_at FROM agents WHERE id IS NOT NULL ORDER BY last_seen DESC").all();
@@ -37,7 +48,14 @@ function state() {
   ).all();
   const reads = db.query("SELECT agent, msg, read_at FROM reads").all();
   const channels = db.query("SELECT channel name, COUNT(*) n FROM messages GROUP BY channel ORDER BY n DESC").all();
-  return { now: new Date().toISOString(), agents, messages, reads, channels };
+  // F: receipts call site must resolve group: targets — same incarnation guard
+  // as the core (grp -> {created_at, members}).
+  const groups = db.query("SELECT name, created_at FROM groups").all();
+  const gm = db.query("SELECT grp, agent_id FROM group_members").all();
+  const gmap: Record<string, { at: string; members: string[] }> = {};
+  for (const g of groups as any[]) gmap[g.name] = { at: g.created_at, members: [] };
+  for (const r of gm as any[]) gmap[r.grp]?.members.push(r.agent_id);
+  return { now: new Date().toISOString(), agents, messages: dmStrip ? (messages as any[]).filter((m) => !String(m.channel).startsWith("dm~")) : messages, reads, channels, groups: gmap };
 }
 
 const HTML = /* html */ `<!doctype html>
@@ -164,9 +182,19 @@ function renderAgents(agents){
   el("acount").textContent=agents.filter(a=>(Date.now()-Date.parse(a.last_seen))<=9e5).length;
 }
 // per-message read receipts: intended readers (addressed, minus sender) vs who's read
-function receiptsOf(m,agents,reads,messages){
-  const toks=(m.recipients||"").split(",").map(s=>s.trim());
-  const intended=agents.filter(a=>a.id!==m.sender&&(toks.includes("@all")||toks.includes(a.id)||toks.includes(a.role))).map(a=>a.id);
+// F: group: targets resolve through state.groups with the incarnation guard.
+function receiptsOf(m,agents,reads,messages,groups){
+  const toks=(m.recipients||"").split(",").map(s=>s.trim()).filter(Boolean);
+  const gmap=groups||{};
+  const intended=agents.filter(a=>{
+    if(a.id===m.sender)return false;
+    for(const t of toks){
+      if(t==="@all"||t===a.id||t===a.role)return true;
+      const g=gmap[t.startsWith("group:")?t.slice(6):""];
+      if(g&&m.created_at>=g.at&&g.members.includes(a.id))return true;
+    }
+    return false;
+  }).map(a=>a.id);
   const rmap=new Map(reads.filter(r=>r.msg===m.id).map(r=>[r.agent,r.read_at]));
   messages.forEach(x=>{if(x.re===m.id&&!rmap.has(x.sender))rmap.set(x.sender,null);}); // inferred via reply
   return intended.map(id=>({id,read:rmap.has(id),at:rmap.get(id)}));
@@ -180,7 +208,7 @@ function renderChannels(channels){
   ).join("");
 }
 function renderFeed(s){
-  const messages=s.messages||[], agents=s.agents||[], reads=s.reads||[];
+  const messages=s.messages||[], agents=s.agents||[], reads=s.reads||[], groups=s.groups||{};
   el("mcount").textContent=messages.length;
   let msgs=messages;
   if(filterChannel) msgs=msgs.filter(m=>(m.channel||"general")===filterChannel);
@@ -191,7 +219,7 @@ function renderFeed(s){
     const tcol=color(m.type,"--"); const scol=color(m.status,"--s-");
     const fresh=!seen.has(m.id)&&!first; if(!seen.has(m.id))seen.add(m.id);
     const opened=openIds.has(m.id);
-    const rc=receiptsOf(m,agents,reads,messages); const nread=rc.filter(r=>r.read).length;
+    const rc=receiptsOf(m,agents,reads,messages,groups); const nread=rc.filter(r=>r.read).length;
     const receiptsHtml=rc.length?
       '<div class="receipts"><span class="lbl">receipts</span>'+
       rc.map(r=>'<span class="rcpt '+(r.read?'read':'unread')+'" title="'+(r.read?(r.at?'read '+rel(r.at):'seen (replied)'):'unread')+'">'+
@@ -275,6 +303,7 @@ connect();
 </body></html>`;
 
 Bun.serve({
+  hostname: HOST, // N4: loopback default — direct-DB dashboard must not re-serve the LAN
   port: PORT,
   idleTimeout: 0,
   fetch(req) {

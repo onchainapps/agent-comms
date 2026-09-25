@@ -77,7 +77,9 @@ function cmdJoin(a: Args) {
   if (!a.agent || !a.role) { console.error("error: join requires --agent and --role"); process.exit(2); }
   const fp = a.fingerprint ?? process.env.COMMS_FINGERPRINT ?? null;
   const v = unwrap(bus.joinAgent(localCtx(a.agent), { agent: a.agent, role: a.role, caps: a.caps, fingerprint: fp }));
-  console.log(`joined: ${a.agent} (role=${a.role}, caps=${a.caps || "-"}, ${fp ? `fp=${String(fp).slice(0, 8)}…` : "fp=UNSET — identity unprotected, set COMMS_FINGERPRINT"})`);
+  // F CLI: join --group <name> = create-if-missing + join self.
+  if (a.group) unwrap(bus.groupJoin(localCtx(a.agent), { name: a.group, agent: a.agent }));
+  console.log(`joined: ${a.agent} (role=${a.role}, caps=${a.caps || "-"}${a.group ? `, group=${a.group}` : ""}, ${fp ? `fp=${String(fp).slice(0, 8)}…` : "fp=UNSET — identity unprotected, set COMMS_FINGERPRINT"})`);
   printWho(true);
   console.log(`\n${v.unresolved} unresolved message(s) in flight. Run: bun comms.ts inbox --for ${a.agent} --open`);
 }
@@ -90,6 +92,62 @@ function cmdPost(a: Args) {
     thread: a.thread, re: a.re, tags: a.tags, channel: a.channel,
   }));
   console.log(`posted ${v.id}  [#${v.channel}]  thread=${v.thread}  -> ${a.to}  (${basename(v.file)})`);
+}
+
+// M1.5 G1: dm sugar — channel + recipients resolve via the member PAIR.
+function cmdDm(a: Args) {
+  if (!a.sender || !a.to) { console.error("error: dm requires --from and --to"); process.exit(2); }
+  const body = readBody(a.body);
+  const v = unwrap(bus.post(localCtx(a.sender), {
+    from: a.sender, to: a.to, type: a.type ?? "note", subject: a.subject, body, dm: a.to,
+  }));
+  console.log(`dm ${v.id}  [#${v.channel}]  thread=${v.thread}  -> ${a.to}  (${basename(v.file)})`);
+}
+
+// M1.5 F: group verbs (self-organizing; delete needs agents:admin — local root is).
+function cmdGroup(a: Args) {
+  const sub = a._pos?.[0];
+  const name = a.group ?? a._pos?.[1];
+  const who = a.agent ?? "";
+  const ctx = localCtx(who);
+  switch (sub) {
+    case "create": {
+      const v = unwrap(bus.groupCreate(ctx, { name, agent: a.agent }));
+      console.log(v.created ? `group created: ${v.name}` : `group already exists: ${v.name}`);
+      return;
+    }
+    case "join": {
+      const v = unwrap(bus.groupJoin(ctx, { name, agent: a.agent }));
+      console.log(`joined ${v.name} (${v.members.length} member(s): ${v.members.join(", ")})`);
+      return;
+    }
+    case "leave": {
+      const v = unwrap(bus.groupLeave(ctx, { name, agent: a.agent }));
+      console.log(v.left ? `left ${v.name}` : `was not a member of ${v.name}`);
+      return;
+    }
+    case "list": {
+      const v = unwrap(bus.groupList(ctx));
+      if (!v.groups.length) { console.log("(no groups)"); return; }
+      for (const g of v.groups)
+        console.log(`  ${g.mine ? "*" : " "} ${String(g.name).padEnd(24)} ${String(g.members).padStart(3)} member(s)  by=${g.created_by} since=${g.created_at}`);
+      return;
+    }
+    case "show": {
+      const v = unwrap(bus.groupShow(ctx, { name }));
+      console.log(`group ${v.name} (by ${v.created_by}, since ${v.created_at}):`);
+      for (const m of v.members) console.log(`  ${m}`);
+      return;
+    }
+    case "delete": {
+      const v = unwrap(bus.groupDelete(ctx, { name }));
+      console.log(`deleted group ${v.name} (undelivered backlog drops from members' inboxes — mailing-list semantics)`);
+      return;
+    }
+    default:
+      console.error("usage: group create|join|leave|list|show|delete [name] [--agent who] [--group name]");
+      process.exit(2);
+  }
 }
 
 function cmdInbox(a: Args) {
@@ -145,6 +203,8 @@ function cmdRename(a: Args) {
 
 async function cmdWatch(a: Args) {
   const role = bus.roleOf(a.agent);
+  // F: membership resolves at TAIL time — reload the incarnation Map every tick.
+  let mem = bus.membershipsOf(a.agent);
   const ivSec = a.interval ?? 3;
   const capSec = a.timeout ?? 28800;
   const seen = new Set(bus.allMessageIds()); // core accessor — no SQL in the shell (finding 9)
@@ -155,6 +215,7 @@ async function cmdWatch(a: Args) {
   const started = Date.now();
   while (!stop) {
     bus.touch(a.agent);
+    mem = bus.membershipsOf(a.agent);
     let hitForMe = false;
     for (const r of bus.allMessages()) {
       if (seen.has(r.id)) continue;
@@ -162,7 +223,7 @@ async function cmdWatch(a: Args) {
       if (r.sender === a.agent) continue;
       if (a.channel && r.channel !== a.channel) continue;
       // --all surfaces every message in scope (a whole channel); default = only addressed to me
-      if (a.all || bus.recipientsMatch(r.recipients, a.agent, role)) { console.log(`NEW ${fmtRow(r)}`); hitForMe = true; }
+      if (a.all || bus.recipientsMatch(r.recipients, a.agent, role, mem, r.created_at)) { console.log(`NEW ${fmtRow(r)}`); hitForMe = true; }
     }
     if (a.once) break;
     if (hitForMe && a["exit-on-new"]) { console.log("watch: message for me; exiting"); break; }
@@ -175,10 +236,10 @@ async function cmdWatch(a: Args) {
 type Args = Record<string, any>;
 function parse(argv: string[]): Args {
   const [cmd, ...rest] = argv;
-  const a: Args = { cmd };
+  const a: Args = { cmd, _pos: [] as string[] };
   for (let i = 0; i < rest.length; i++) {
     const t = rest[i];
-    if (!t.startsWith("--")) continue;
+    if (!t.startsWith("--")) { a._pos.push(t); continue; }
     const key = t.slice(2) === "for" ? "agent" : t.slice(2) === "from" ? "sender" : t.slice(2);
     const next = rest[i + 1];
     if (next === undefined || next.startsWith("--")) { a[key] = true; }
@@ -190,7 +251,8 @@ function parse(argv: string[]): Args {
 }
 
 const HELP = `comms — join-able serverless agent comms (bun:sqlite)
-commands: join | rename | who | post | inbox | read | thread | receipts | channels | ack | done | status | watch
+commands: join | rename | who | post | dm | inbox | read | thread | receipts | channels | group | ack | done | status | watch
+group: group create|join|leave|list|show|delete <name> [--agent who] · post --to group:<name>
 run 'bun comms.ts <cmd> --help-ish' — see header of this file for full usage.`;
 
 async function main() {
@@ -200,6 +262,8 @@ async function main() {
     case "rename": return cmdRename(a);
     case "who": return printWho(!a.all);
     case "post": return cmdPost(a);
+    case "dm": return cmdDm(a);
+    case "group": return cmdGroup(a);
     case "inbox": return cmdInbox(a);
     case "read": return cmdRead(a);
     case "thread": return cmdThread(a);

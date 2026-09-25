@@ -125,18 +125,18 @@ describe("tokens (§4/§5)", () => {
     bus.close(); rmSync(home, { recursive: true, force: true });
   });
 
-  test("admin:true mints the full 4-name NORMALIZED scope set (§4/§5); human defaults read:all", () => {
+  test("admin:true mints the full 5-name NORMALIZED scope set (§4/§5, App G ruling c); human defaults read:all,read:dm", () => {
     const home = tmp();
     const bus = loc(home); // bootstrap = local-mode opener (§5)
     const root = localCtx("root");
     const a = bus.tokenCreate(root, { agent: "don", admin: true, force: true });
     const v1 = bus.tokenVerify((a as any).value.token);
-    expect([...(v1 as any).value.scopes].sort()).toEqual(["agents:admin", "post:as", "read:all", "tokens:admin"]);
+    expect([...(v1 as any).value.scopes].sort()).toEqual(["agents:admin", "post:as", "read:all", "read:dm", "tokens:admin"]);
     const norm = (v1 as any).value.scopes.join(",");
     expect(norm).toBe([...(v1 as any).value.scopes].sort().join(",")); // normalized sorted CSV
     const h = bus.tokenCreate(root, { agent: "bakon", kind: "human" });
     const v2 = bus.tokenVerify((h as any).value.token);
-    expect((v2 as any).value.scopes).toEqual(["read:all"]);
+    expect((v2 as any).value.scopes).toEqual(["read:all", "read:dm"]); // G3: both read scopes
     expect((v2 as any).value.kind).toBe("human");
     bus.close(); rmSync(home, { recursive: true, force: true });
   });
@@ -545,5 +545,128 @@ describe("mapping tables (§7)", () => {
     expect(EXIT_CODES.usage).toBe(2);
     expect(EXIT_CODES.identity_conflict).toBe(3);
     expect(EXIT_CODES.forbidden).toBe(3);
+  });
+});
+
+describe("M1.5 F/G — local direction + mechanics (unit)", () => {
+  test("local non-party sees DM rows (see-all quirk pin) and dm channels list", () => {
+    const home = tmp();
+    const bus = loc(home);
+    const a = localCtx("q-alice"), b = localCtx("q-bob"), m = localCtx("q-mallory");
+    const p = bus.post(a, { from: "q-alice", to: "q-bob", type: "note", body: "s", dm: "q-bob" });
+    expect((p as any).value.channel).toBe("dm~q-alice~q-bob");
+    // Local see-all quirk = VISIBILITY (canSee), not delivery: inbox arms stay
+    // recipient-literal for everyone; a local non-party can still READ the row
+    // (host filesystem = root of trust).
+    const rd = bus.read(m, { agent: "q-mallory", id: (p as any).value.id });
+    expect((rd as any).error).toBeUndefined();
+    const inb = bus.inbox(m, { agent: "q-mallory" });
+    expect((inb as any).value.rows.map((r: any) => r.id)).not.toContain((p as any).value.id); // delivery unchanged
+    const inbB = bus.inbox(b, { agent: "q-bob" });
+    expect((inbB as any).value.rows.map((r: any) => r.id)).toContain((p as any).value.id); // recipient arm
+    const ch = bus.channels(m);
+    expect((ch as any).value.map((x: any) => x.name)).toContain("dm~q-alice~q-bob");
+    // exactly-2-member invariant written in the creation txn (G5 zero-member window closed)
+    const cm = (bus.testDb.query("SELECT count(*) c FROM channel_members WHERE channel='dm~q-alice~q-bob'").get() as any).c;
+    expect(cm).toBe(2);
+    bus.close(); rmSync(home, { recursive: true, force: true });
+  });
+
+  test("dm name canonicalization: code-unit sort, ~n stripped via pair lookup, both orders one channel", () => {
+    const home = tmp();
+    const bus = loc(home);
+    const a = localCtx("c-alice"), b = localCtx("c-bob");
+    const p1 = bus.post(a, { from: "c-alice", to: "c-bob", type: "note", body: "1", dm: "c-bob" });
+    const p2 = bus.post(b, { from: "c-bob", to: "c-alice", type: "note", body: "2", dm: "c-alice" });
+    expect((p1 as any).value.channel).toBe("dm~c-alice~c-bob");
+    expect((p2 as any).value.channel).toBe((p1 as any).value.channel);
+    // client ~n stripped: pair-keyed lookup posts into the existing channel
+    const p3 = bus.post(a, { from: "c-alice", to: "x", type: "note", body: "3", channel: "dm~c-bob~c-alice~7" });
+    expect((p3 as any).value.channel).toBe((p1 as any).value.channel);
+    bus.close(); rmSync(home, { recursive: true, force: true });
+  });
+
+  test("group tombstone: same-second delete+create ⇒ contention (never a future stamp) [frozen clock]", () => {
+    const home = tmp();
+    const bus = loc(home);
+    const r = localCtx("t-root");
+    expect(bus.groupCreate(r, { name: "tx" }).error).toBeUndefined();
+    expect(bus.groupDelete(r, { name: "tx" }).error).toBeUndefined();
+    // frozen seam clock ⇒ now <= deleted_at ⇒ contention (grok m-a ruling)
+    const again = bus.groupCreate(r, { name: "tx" });
+    expect(again.error).toBe("contention");
+    // tombstone is a PK upsert, never a sibling
+    const n = (bus.testDb.query("SELECT count(*) c FROM group_tombstones WHERE name='tx'").get() as any).c;
+    expect(n).toBe(1);
+    bus.close(); rmSync(home, { recursive: true, force: true });
+  });
+
+  test("agent_retired chains (alice→bob then bob→carol ⇒ both renamed_to=carol); retired ids hard-reject mint + role", () => {
+    const home = tmp();
+    const bus = loc(home);
+    const r = localCtx("x-root");
+    bus.joinAgent(r, { agent: "ar-a", role: "a" });
+    bus.joinAgent(r, { agent: "ar-b", role: "b" });
+    expect(bus.rename(r, { agent: "ar-a", to: "ar-b2" }).error).toBeUndefined();
+    expect(bus.rename(r, { agent: "ar-b", to: "ar-c" }).error).toBeUndefined();
+    const rows = bus.testDb.query("SELECT id, renamed_to FROM agent_retired ORDER BY id").all() as any[];
+    expect(rows.map((x) => `${x.id}>${x.renamed_to}`).sort()).toEqual(["ar-a>ar-b2", "ar-b>ar-c"]);
+    // one-way door: re-mint retired id (local join INSERT path, m-b)
+    expect(bus.joinAgent(r, { agent: "ar-a", role: "z" }).error).toBe("identity_conflict");
+    // role == retired id rejected in local mode too (grok: never weakened)
+    bus.joinAgent(r, { agent: "ar-mal", role: "ar-a" });
+    expect((bus.joinAgent(r, { agent: "ar-mal", role: "ar-a" }) as any).error).toBe("identity_conflict");
+    // rename BACK to a retired id refused
+    expect(bus.rename(r, { agent: "ar-b2", to: "ar-a" }).error).toBe("identity_conflict");
+    bus.close(); rmSync(home, { recursive: true, force: true });
+  });
+
+  test("rename cascades group_members + channel_members with leftover delete (n9)", () => {
+    const home = tmp();
+    const bus = loc(home);
+    const r = localCtx("n-root");
+    bus.joinAgent(r, { agent: "n-a", role: "a" });
+    bus.joinAgent(r, { agent: "n-b", role: "b" });
+    bus.groupJoin(r, { name: "ng", agent: "n-a" });
+    bus.groupJoin(r, { name: "ng", agent: "n-b" });
+    // n9 leftover: a membership row already exists under the FUTURE name (the
+    // alias-era pre-rename join shape). rename rejects existing AGENT ids, so
+    // this row references a not-yet-minted id.
+    bus.testDb.run("INSERT OR IGNORE INTO group_members(grp,agent_id,joined_at) VALUES('ng','n-a2',?)", [bus.nowIso()]);
+    expect(bus.rename(r, { agent: "n-a", to: "n-a2" }).error).toBeUndefined();
+    const members = (bus.testDb.query("SELECT agent_id FROM group_members WHERE grp='ng' ORDER BY agent_id").all() as any[]).map((x) => x.agent_id);
+    expect(members).toEqual(["n-a2", "n-b"]); // no leftover n-a, no PK crash
+    bus.close(); rmSync(home, { recursive: true, force: true });
+  });
+
+  test("acl_generation: server openBus refuses a higher generation; local proceeds (G5)", () => {
+    const home = tmp();
+    const bus = loc(home);
+    bus.testDb.run("INSERT OR REPLACE INTO meta(key,value) VALUES('acl_generation','99')");
+    bus.close();
+    expect(() => openBus({ home, mode: "server", seams: testSeams({}) })).toThrow(/acl_generation/);
+    expect(() => openBus({ home, mode: "local", seams: testSeams({}) })).not.toThrow(); // host is root
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  test("group caps: 64 memberships per agent enforced (join)", () => {
+    const home = tmp();
+    const bus = loc(home);
+    const r = localCtx("cap-root");
+    bus.joinAgent(r, { agent: "cap-a", role: "a" });
+    for (let i = 0; i < 64; i++) expect(bus.groupJoin(r, { name: `cg-${i}`, agent: "cap-a" }).error).toBeUndefined();
+    expect(bus.groupJoin(r, { name: "cg-64", agent: "cap-a" }).error).toBe("usage");
+    bus.close(); rmSync(home, { recursive: true, force: true });
+  });
+
+  test("recipientsMatch group arm: incarnation guard + no membership ⇒ no match; @all never implies group", () => {
+    const { recipientsMatch } = require("../src/bus.ts");
+    const mem = new Map<string, string>([["g1", "2026-06-01T00:00:00Z"]]);
+    expect(recipientsMatch("group:g1", "x", null, mem, "2026-06-02T00:00:00Z")).toBe(true);
+    expect(recipientsMatch("group:g1", "x", null, mem, "2026-05-31T23:59:59Z")).toBe(false); // old incarnation
+    expect(recipientsMatch("group:g1", "x", null, new Map(), "2026-06-02T00:00:00Z")).toBe(false); // not a member
+    expect(recipientsMatch("@all", "x", null, new Map(), "2026-06-02T00:00:00Z")).toBe(true); // @all arm
+    expect(recipientsMatch("group:g1", "x", "g1", mem, "2026-06-01T00:00:00Z")).toBe(true); // bare-role arm can't hit group: tokens
+    expect(recipientsMatch("group:g1", "x", null)).toBe(false); // no memberships ⇒ inert (legacy call shape)
   });
 });

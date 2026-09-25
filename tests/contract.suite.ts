@@ -351,6 +351,293 @@ export function contractSuite(name: string, make: Factory) {
       });
     });
 
+    // ================= M1.5 G7 — DM matrix (server direction) =================
+
+    const dmPair = async (h: BusHandle, root: Session) => {
+      const a = (await seedAgent(h, root, "dm-alice", "da")) as any;
+      const b = (await seedAgent(h, root, "dm-bob", "db")) as any;
+      return { alice: a.value.session as Session, bob: b.value.session as Session };
+    };
+
+    test("G7 canonicalization: alice↔bob same channel; code-unit order; self-DM rejected; ~ collision impossible", async () => {
+      await withBus(async (h, root) => {
+        const { alice, bob } = await dmPair(h, root);
+        const p1 = await alice.post({ from: "dm-alice", to: "dm-bob", type: "note", body: "a2b", dm: "dm-bob" });
+        const p2 = await bob.post({ from: "dm-bob", to: "dm-alice", type: "note", body: "b2a", dm: "dm-alice" });
+        expect(p1.error).toBeUndefined();
+        expect((p2 as any).value.channel).toBe((p1 as any).value.channel); // pair-keyed, both directions
+        expect((p1 as any).value.channel).toBe("dm~dm-alice~dm-bob"); // code-unit: '-'(45) < 'b'… 'dm-alice' < 'dm-bob'
+        // non-canonical explicit spelling resolves to the SAME channel, no split
+        const p3 = await alice.post({ from: "dm-alice", to: "dm-bob", type: "note", body: "expl", channel: "dm~dm-bob~dm-alice" });
+        expect((p3 as any).value.channel).toBe((p1 as any).value.channel);
+        // self-DM rejected
+        expect((await alice.post({ from: "dm-alice", to: "dm-alice", type: "note", body: "s", dm: "dm-alice" })).error).toBe("usage");
+        expect((await alice.post({ from: "dm-alice", to: "x", type: "note", body: "s", channel: "dm~zed~zed" })).error).toBe("usage");
+        // ~ collision: recipient index stores bare ids (no ~ in ids)
+        const rec = (await root.receipts((p1 as any).value.id)) as any;
+        expect(rec.value.recipients).toBe("dm-bob"); // sugar: recipients = peer only
+      });
+    });
+
+    test("G7 non-party invisibility: read/inbox/threadOf/receipts/waitStep/setStatus ⇒ byte-identical not_found; no reads row", async () => {
+      await withBus(async (h, root) => {
+        const { alice, bob } = await dmPair(h, root);
+        const mallory = ((await seedAgent(h, root, "dm-mallory", "dm-role")) as any).value.session as Session;
+        const p = await alice.post({ from: "dm-alice", to: "dm-bob", type: "note", body: "secret", dm: "dm-bob" });
+        const id = (p as any).value.id;
+        // read: same error + same detail SHAPE as a missing id; NO reads row.
+        // (detail embeds the requested id — hidden and missing produce the same
+        // bytes for the same id; no separate hidden-vs-missing string.)
+        const rd = await mallory.read({ agent: "dm-mallory", id });
+        const miss = await mallory.read({ agent: "dm-mallory", id: "zzz-not-a-real-msg-id-zzz" });
+        expect(rd.error).toBe("not_found"); expect(miss.error).toBe("not_found");
+        expect((rd as any).detail).toBe(`no such message: ${id}`);
+        const raw = (h as any).raw;
+        expect((raw.testDb.query("SELECT count(*) c FROM reads WHERE agent='dm-mallory' AND msg=?").get(id) as any).c).toBe(0);
+        // inbox: absent
+        const inb = await mallory.inbox({ agent: "dm-mallory" });
+        expect((inb as any).value.rows.map((r: any) => r.id)).not.toContain(id);
+        // party inbox: present
+        const bin = await bob.inbox({ agent: "dm-bob" });
+        expect((bin as any).value.rows.map((r: any) => r.id)).toContain(id);
+        // threadOf: not_found (all rows filtered)
+        const th = await mallory.threadOf(id);
+        expect(th.error).toBe("not_found");
+        // receipts: not_found BEFORE receiptsForMsg
+        const rc = await mallory.receipts(id);
+        expect(rc.error).toBe("not_found");
+        // waitStep (stream scope=mine predicate): not delivered
+        const ws = await mallory.waitStep({ consumer: "t" });
+        expect((ws as any).value.messages.map((m: any) => m.id)).not.toContain(id);
+        const wsB = await bob.waitStep({ consumer: "t" });
+        expect((wsB as any).value.messages.map((m: any) => m.id)).toContain(id);
+        // setStatus: not_found, NOT forbidden (no existence oracle)
+        const st = await mallory.setStatus({ agent: "dm-mallory", id, state: "done" });
+        expect(st.error).toBe("not_found");
+      });
+    });
+
+    test("G7 role spoof closed: mallory joins with role=<an agent id> ⇒ identity_conflict (canSee is member-based)", async () => {
+      await withBus(async (h, root) => {
+        const { alice } = await dmPair(h, root);
+        // server join is UPDATE-only; spoofy exists via token.create, then takes role=dm-alice
+        const tc = (await root.tokenCreate({ agent: "spoofy", scopes: [] })) as any;
+        const sp = h.session({ token: tc.value.token });
+        const j = await sp.joinAgent({ agent: "spoofy", role: "dm-alice" });
+        expect(j.error).toBe("identity_conflict");
+      });
+    });
+
+    test("G7 R1 closed: role == retired id rejected after rename (pre-rename mail cannot be inherited by a role squatter)", async () => {
+      await withBus(async (h, root) => {
+        const bob = ((await seedAgent(h, root, "r1-bob", "b")) as any).value.session as Session;
+        await root.post({ from: "root", to: "r1-bob", type: "note", body: "pre-rename mail" });
+        expect((await root.rename({ agent: "r1-bob", to: "r1-carol" })).error).toBeUndefined();
+        const mal = ((await seedAgent(h, root, "r1-mal", "m")) as any).value.session as Session;
+        const j = await mal.joinAgent({ agent: "r1-mal", role: "r1-bob" }); // retired id as role
+        expect(j.error).toBe("identity_conflict");
+        // and the retired id cannot be re-minted as an id (one-way door)
+        expect((await root.tokenCreate({ agent: "r1-bob", scopes: [] })).error).toBe("identity_conflict");
+      });
+    });
+
+    test("G7 scope matrix: read:all-only sees channels but NOT DMs (history BOTH modes); read:dm sees all", async () => {
+      await withBus(async (h, root) => {
+        const { alice, bob } = await dmPair(h, root);
+        const pub = await root.post({ from: "root", to: "x1", type: "note", body: "public", channel: "g7-pub" });
+        const dm = await alice.post({ from: "dm-alice", to: "dm-bob", type: "note", body: "private", dm: "dm-bob" });
+        const dmId = (dm as any).value.id;
+        const allOnly = ((await seedAgent(h, root, "g7-allonly", "v", ["read:all"])) as any).value.session as Session;
+        const dmAll = ((await seedAgent(h, root, "g7-dmall", "v", ["read:all", "read:dm"])) as any).value.session as Session;
+        // snapshot mode
+        const s1 = (await allOnly.history({ limit: 100 })) as any;
+        expect(s1.value.rows.map((r: any) => r.id)).toContain((pub as any).value.id);
+        expect(s1.value.rows.map((r: any) => r.id)).not.toContain(dmId);
+        const s2 = (await dmAll.history({ limit: 100 })) as any;
+        expect(s2.value.rows.map((r: any) => r.id)).toContain(dmId);
+        // since mode (row predicate BEFORE LIMIT — m-d). Real epoch cursor:
+        const raw = (h as any).raw;
+        const cur0 = `${raw.epoch()}.0`;
+        const f1 = (await allOnly.history({ since: cur0, limit: 100 })) as any;
+        expect(f1.value.rows.map((r: any) => r.id)).not.toContain(dmId);
+        const f2 = (await dmAll.history({ since: cur0, limit: 100 })) as any;
+        expect(f2.value.rows.map((r: any) => r.id)).toContain(dmId);
+        // channels(): dm-shaped hidden for read:all-only, listed for read:dm
+        const ch1 = ((await allOnly.channels()) as any).value.map((x: any) => x.name);
+        expect(ch1).toContain("g7-pub");
+        expect(ch1.some((n: string) => n.startsWith("dm~"))).toBe(false);
+        const ch2 = ((await dmAll.channels()) as any).value.map((x: any) => x.name);
+        expect(ch2.some((n: string) => n.startsWith("dm~"))).toBe(true);
+      });
+    });
+
+    test("G7 write side: @all into dm rejected; non-party --re/thread into dm ⇒ not_found; cross-channel dm thread attach rejected", async () => {
+      await withBus(async (h, root) => {
+        const { alice, bob } = await dmPair(h, root);
+        const mal = ((await seedAgent(h, root, "g7w-mal", "w")) as any).value.session as Session;
+        const dm = await alice.post({ from: "dm-alice", to: "dm-bob", type: "note", body: "s", dm: "dm-bob" });
+        const dmId = (dm as any).value.id;
+        // party posting @all into dm ⇒ usage (subset-of-members predicate)
+        expect((await alice.post({ from: "dm-alice", to: "@all", type: "note", body: "x", channel: (dm as any).value.channel })).error).toBe("usage");
+        // party posting to a non-member id ⇒ usage
+        expect((await alice.post({ from: "dm-alice", to: "g7w-mal", type: "note", body: "x", channel: (dm as any).value.channel })).error).toBe("usage");
+        // non-party --re into dm ⇒ not_found, same detail SHAPE as a missing
+        // re (the id is embedded; hidden vs missing is one code, one shape).
+        const r1 = await mal.post({ from: "g7w-mal", to: "x", type: "reply", body: "x", re: dmId });
+        expect(r1.error).toBe("not_found");
+        expect((r1 as any).detail).toBe(`error: re -> unknown message id '${dmId}'`);
+        // non-party thread=<dm root> ⇒ not_found
+        expect((await mal.post({ from: "g7w-mal", to: "x", type: "note", body: "x", thread: dmId })).error).toBe("not_found");
+        // thread=<nonexistent> rejected in server mode
+        expect((await mal.post({ from: "g7w-mal", to: "x", type: "note", body: "x", thread: "zzz-nonexistent-thread" })).error).toBe("not_found");
+        // thread=<own public root> accepted
+        const pub = await mal.post({ from: "g7w-mal", to: "x", type: "note", body: "p" });
+        const ok = await mal.post({ from: "g7w-mal", to: "x", type: "note", body: "t", thread: (pub as any).value.id });
+        expect(ok.error).toBeUndefined();
+        // PARTY cross-channel attach into dm thread ⇒ usage (equality rule)
+        expect((await alice.post({ from: "dm-alice", to: "x", type: "note", body: "x", thread: dmId, channel: "g7-pub" })).error).toBe("usage");
+        // bob replies inside the dm thread — fine
+        expect((await bob.post({ from: "dm-bob", to: "dm-alice", type: "reply", body: "r", re: dmId })).error).toBeUndefined();
+      });
+    });
+
+    test("G7 rename keeps conversation via member pair (frozen name, moved ACL)", async () => {
+      await withBus(async (h, root) => {
+        const aliceS = (await seedAgent(h, root, "dm-alice", "da")) as any;
+        const bobS = (await seedAgent(h, root, "dm-bob", "db")) as any;
+        const alice = aliceS.value.session as Session;
+        const p = await alice.post({ from: "dm-alice", to: "dm-bob", type: "note", body: "s", dm: "dm-bob" });
+        const chan = (p as any).value.channel;
+        expect((await root.rename({ agent: "dm-bob", to: "g7-bobby" })).error).toBeUndefined();
+        // --dm <new peer> resolves the SAME stored channel (pair lookup, not name re-derive)
+        const p2 = await alice.post({ from: "dm-alice", to: "g7-bobby", type: "note", body: "again", dm: "g7-bobby" });
+        expect((p2 as any).value.channel).toBe(chan);
+        // bob's ORIGINAL token now authenticates g7-bobby (tokens.agent_id
+        // rewritten). Visibility follows the MOVED ACL (canSee); old mail does
+        // NOT reappear in the new id's INBOX — no alias arm (G6 ruling: delivery
+        // is recipient-literal; continuity runs through the channel, not arms).
+        const bobby = h.session({ token: bobS.value.token });
+        const rd = await bobby.read({ agent: "g7-bobby", id: (p as any).value.id });
+        expect(rd.error).toBeUndefined(); // member via moved channel_members
+        expect((await bobby.inbox({ agent: "g7-bobby" }) as any).value.rows.map((r: any) => r.id))
+          .not.toContain((p as any).value.id); // no alias arm — pinned
+        expect((await bobby.threadOf((p as any).value.id) as any).value.rows.length).toBeGreaterThan(0);
+      });
+    });
+
+    // ================= M1.5 F — work-groups matrix (server direction) =================
+
+    test("F late joiner sees earlier group traffic; leave stops delivery (delivery-time resolution)", async () => {
+      await withBus(async (h, root) => {
+        const a = ((await seedAgent(h, root, "f-a", "ra")) as any).value.session as Session;
+        const b = ((await seedAgent(h, root, "f-b", "rb")) as any).value.session as Session;
+        expect((await a.groupCreate({ name: "swap-migration" })).error).toBeUndefined();
+        const p = await a.post({ from: "f-a", to: "group:swap-migration", type: "note", body: "early" });
+        expect(p.error).toBeUndefined();
+        // late joiner
+        expect((await b.groupJoin({ name: "swap-migration" })).error).toBeUndefined();
+        const inb = await b.inbox({ agent: "f-b" });
+        expect((inb as any).value.rows.map((r: any) => r.id)).toContain((p as any).value.id);
+        // group receipts: intended = members excl sender
+        const rec = (await b.receipts((p as any).value.id)) as any;
+        expect(rec.value.receipts.intended).toEqual(["f-b"]);
+        // leave ⇒ delivery stops (and old rows drop out of inbox — mailing-list semantics)
+        expect((await b.groupLeave({ name: "swap-migration" })).error).toBeUndefined();
+        const inb2 = await b.inbox({ agent: "f-b" });
+        expect((inb2 as any).value.rows.map((r: any) => r.id)).not.toContain((p as any).value.id);
+      });
+    });
+
+    test("F @all never matches a group target — both halves; group:<nonexistent> post rejected usage", async () => {
+      await withBus(async (h, root) => {
+        const a = ((await seedAgent(h, root, "f2-a", "ra")) as any).value.session as Session;
+        const b = ((await seedAgent(h, root, "f2-b", "rb")) as any).value.session as Session;
+        await a.groupCreate({ name: "g2x" });
+        await a.groupJoin({ name: "g2x" }); // a is member
+        // half 1: an @all message is not a group delivery — b (NON-member) still gets @all via the @all arm
+        const pAll = await a.post({ from: "f2-a", to: "@all", type: "announce", body: "broadcast" });
+        expect(((await b.inbox({ agent: "f2-b" })) as any).value.rows.map((r: any) => r.id)).toContain((pAll as any).value.id);
+        // half 2: group:x does not reach non-members
+        const pGrp = await a.post({ from: "f2-a", to: "group:g2x", type: "note", body: "members only" });
+        expect(((await b.inbox({ agent: "f2-b" })) as any).value.rows.map((r: any) => r.id)).not.toContain((pGrp as any).value.id);
+        // recipient index stores the LITERAL group:x
+        const raw = (h as any).raw;
+        expect((raw.testDb.query("SELECT count(*) c FROM message_recipients WHERE msg=? AND target='group:g2x'").get((pGrp as any).value.id) as any).c).toBe(1);
+        // n3: nonexistent group
+        expect((await a.post({ from: "f2-a", to: "group:nope-squat", type: "note", body: "x" })).error).toBe("usage");
+      });
+    });
+
+    test("F group ops authz: join agent assertion (self only), delete needs agents:admin, member rename cascades", async () => {
+      await withBus(async (h, root) => {
+        const a = ((await seedAgent(h, root, "f3-a", "ra")) as any).value.session as Session;
+        const b = ((await seedAgent(h, root, "f3-b", "rb")) as any).value.session as Session;
+        await a.groupCreate({ name: "g3x" });
+        // assertion: b cannot subscribe a to a group
+        expect((await b.groupJoin({ name: "g3x", agent: "f3-a" })).error).toBe("forbidden");
+        // self-join needs NO scope (self-organizing)
+        expect((await b.groupJoin({ name: "g3x" })).error).toBeUndefined();
+        // delete without agents:admin ⇒ forbidden; with root (admin) ⇒ ok
+        expect((await b.groupDelete({ name: "g3x" })).error).toBe("forbidden");
+        expect((await root.groupDelete({ name: "g3x" })).error).toBeUndefined();
+        // rename cascade: membership follows the id
+        await root.groupCreate({ name: "g3y" });
+        expect((await a.groupJoin({ name: "g3y" })).error).toBeUndefined();
+        expect((await root.rename({ agent: "f3-a", to: "f3-a2" })).error).toBeUndefined();
+        const p = await b.post({ from: "f3-b", to: "group:g3y", type: "note", body: "cascade" });
+        // the renamed id's session: f3-a2's token was minted by seedAgent below;
+        // membership followed via the rename txn (UPDATE cascade).
+        const a2 = ((await seedAgent(h, root, "f3-a2", "ra")) as any).value.session as Session;
+        expect(((await a2.inbox({ agent: "f3-a2" })) as any).value.rows.map((r: any) => r.id)).toContain((p as any).value.id);
+      });
+    });
+
+    test("F JS ≡ SQL parity: deliveredMsgIds equals recipientsMatch(Map) row sets, incl. old-incarnation exclusion (claude fuzz)", async () => {
+      await withBus(async (h, root) => {
+        const raw = (h as any).raw;
+        const a = ((await seedAgent(h, root, "f4-a", "ra")) as any).value.session as Session;
+        const b = ((await seedAgent(h, root, "f4-b", "rb")) as any).value.session as Session;
+        await a.groupCreate({ name: "g4x" });
+        await a.groupJoin({ name: "g4x" });
+        const p1 = await a.post({ from: "f4-a", to: "group:g4x", type: "note", body: "in-incarnation" });
+        // delete + recreate (tombstone boundary crossed); the OLD-incarnation
+        // message is marked older than the new groups.created_at (rewinding the
+        // MESSAGE, never future-stamping the group — m-a rule). The re-create is
+        // direct SQL: same-second groupEnsure would return contention (m-a).
+        await root.groupDelete({ name: "g4x" });
+        raw.testDb.run("INSERT INTO groups(name,created_by,created_at) VALUES('g4x','f4-a',?)", [raw.nowIso()]);
+        raw.testDb.run("UPDATE messages SET created_at = datetime('now','-1 day') WHERE id=?", [(p1 as any).value.id]);
+        raw.testDb.run("INSERT OR IGNORE INTO group_members(grp,agent_id,joined_at) VALUES('g4x','f4-a',datetime('now'))");
+        const p2 = await a.post({ from: "f4-a", to: "group:g4x", type: "note", body: "new-incarnation" });
+        const sqlSet = raw.deliveredMsgIds("f4-a", "ra");
+        const mem = raw.membershipsOf("f4-a");
+        // delivery set (SQL arms == JS recipientsMatch predicate; the sender
+        // exclusion is a separate inbox predicate, not a delivery arm).
+        const jsSet = new Set(
+          (raw.allMessages() as any[])
+            .filter((m) => raw.recipientsMatch(m.recipients, "f4-a", "ra", mem, m.created_at))
+            .map((m) => m.id),
+        );
+        // both directions equal
+        expect([...sqlSet].sort()).toEqual([...jsSet].sort());
+        // old-incarnation row excluded from BOTH sets
+        expect(sqlSet.has((p1 as any).value.id)).toBe(false);
+        expect(jsSet.has((p1 as any).value.id)).toBe(false);
+        expect(sqlSet.has((p2 as any).value.id)).toBe(true);
+      });
+    });
+
+    test("F group fan-out triggers fire (events kind='group') + group name traversal rejected", async () => {
+      await withBus(async (h, root) => {
+        const a = ((await seedAgent(h, root, "f5-a", "ra")) as any).value.session as Session;
+        expect((await a.groupJoin({ name: "g5x" })).error).toBeUndefined();
+        const raw = (h as any).raw;
+        expect((raw.testDb.query("SELECT count(*) c FROM events WHERE kind='group' AND agent_id='f5-a'").get() as any).c).toBeGreaterThan(0);
+        expect((await a.groupCreate({ name: "../evil" })).error).toBe("usage");
+        expect((await a.groupCreate({ name: "a:b" })).error).toBe("usage");
+      });
+    });
+
     test("local-root principal in server handle ⇒ internal (finding B1 runtime backstop)", async () => {
       await withBus(async (h) => {
         // simulate a transport that forgot to strip a forged localRoot flag

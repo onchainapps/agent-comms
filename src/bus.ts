@@ -26,8 +26,11 @@ export type Mode = "local" | "server";
 // tokens:admin:human, backup, restore, channel:*) is NOT a scope in the accepted
 // RFC and was removed in the round-3 audit (M8c) — presence/token admin/backup
 // are governed by tokens:admin + agents:admin + the restore runbook, not scopes.
-export type Scope = "read:all" | "post:as" | "tokens:admin" | "agents:admin";
-export const ALL_SCOPES: readonly Scope[] = ["read:all", "post:as", "tokens:admin", "agents:admin"];
+// M1.5 (App G ruling c): FIFTH name read:dm — split so an existing read:all
+// credential (minted under "cost/UX control, not confidentiality") is never
+// retroactively widened into a DM-omniview credential.
+export type Scope = "read:all" | "read:dm" | "post:as" | "tokens:admin" | "agents:admin";
+export const ALL_SCOPES: readonly Scope[] = ["read:all", "read:dm", "post:as", "tokens:admin", "agents:admin"];
 const SCOPE_SET: ReadonlySet<string> = new Set(ALL_SCOPES);
 /** §4 normalizer contract: writers must never store unnormalized input. A scope
  *  is one enum name — never empty, never comma-bearing (which would smuggle a
@@ -91,6 +94,23 @@ export const STATES = ["acked", "blocked", "done", "in_progress", "open"] as con
 export const ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 export const TYPE_RE = /^[a-z0-9._-]{1,32}$/;
 export const PRESENCE_TTL_MS = 15 * 60 * 1000;
+// M1.5 App G1: dm-shaped channel. ~ is NOT in ID_RE ⇒ the split is unambiguous.
+// The ~n suffix exists only for legacy/local DBs (agent_retired blocks id reuse
+// on server DBs, so the collision path is unreachable there).
+export const DM_RE = new RegExp(`^dm~(${ID_RE.source.slice(1, -1)})~(${ID_RE.source.slice(1, -1)})(~[1-9][0-9]{0,3})?$`);
+/** G2: name SHAPE is the authority for canSee — a cheap shape test mirroring
+ *  SQL GLOB 'dm~*'. (DM_RE additionally validates the id halves; the shape test
+ *  alone is what routes a channel through the ACL.) */
+export const DM_SHAPED_RE = /^dm~/;
+/** App G1: ONE helper for the write gate (post/preflight). Read filters do NOT
+ *  widen (§9: regexes gate writes only). Name SHAPE is the authority for canSee. */
+export const validChannelName = (n: string) => ID_RE.test(n) || DM_RE.test(n);
+/** App G1: canonical dm channel name — code-unit sort (NOT localeCompare:
+ *  locales order -/_ differently), lo==hi rejected by the caller. */
+export function dmChannelName(a: string, b: string, suffix?: string): string {
+  const [lo, hi] = a < b ? [a, b] : [b, a];
+  return `dm~${lo}~${hi}${suffix ? `~${suffix}` : ""}`;
+}
 
 // ---------- helpers (quirk-exact from bin/comms.ts) ----------
 
@@ -131,10 +151,28 @@ const SPLIT_SQL = `WITH RECURSIVE s(rest,tok) AS (
     SELECT substr(rest, instr(rest,',')+1), ${jtrim("substr(rest,1,instr(rest,',')-1)")} FROM s WHERE rest <> '')
   SELECT tok FROM s WHERE tok IS NOT NULL AND tok <> ''`;
 
-export function recipientsMatch(recips: string, agent: string, role?: string | null): boolean {
+/** M1.5 F: memberships is Map<grp, groups.created_at> — the INCARNATION time,
+ *  never joined_at, never a name set (a name set cannot express the per-message
+ *  comparison, so the JS≡SQL fixture could not pass against it). Explicit param
+ *  so no call site can forget the group arm. Group arm: token is group:x AND
+ *  memberships.has(x) AND msgCreatedAt >= memberships.get(x). */
+export function recipientsMatch(
+  recips: string, agent: string, role?: string | null,
+  memberships?: Map<string, string>, msgCreatedAt?: string,
+): boolean {
   const toks = new Set(csv(recips));
   if (toks.has("@all") || toks.has(agent)) return true;
-  return !!role && toks.has(role);
+  if (role && toks.has(role)) return true;
+  if (memberships?.size)
+    for (const t of toks)
+      if (t.startsWith("group:")) {
+        const grp = t.slice(6);
+        const since = memberships.get(grp);
+        // F n3: group:<nonexistent> never lands here via delivery (post rejects
+        // it up front); a stale incarnation still resolves via the created_at guard.
+        if (since !== undefined && msgCreatedAt !== undefined && msgCreatedAt >= since) return true;
+      }
+  return false;
 }
 
 export type BusOpts = {
@@ -155,7 +193,8 @@ type Core = ReturnType<typeof openBusCore>;
  *  through them would widen the ctx to the union and let localRoot slip back
  *  in (probe-verified with tsc). */
 export type Bus<M extends Mode = Mode> = M extends "server" ? Omit<Core,
-  "joinAgent" | "post" | "inbox" | "read" | "threadOf" | "receipts" | "setStatus" | "channels" | "rename" | "history" | "waitStep" | "tokenCreate" | "tokenList" | "tokenRevoke" | "mode"
+  "joinAgent" | "post" | "inbox" | "read" | "threadOf" | "receipts" | "setStatus" | "channels" | "rename" | "history" | "waitStep" | "tokenCreate" | "tokenList" | "tokenRevoke" | "mode" |
+  "groupCreate" | "groupJoin" | "groupLeave" | "groupDelete" | "groupList" | "groupShow"
 > & ServerOnly : Omit<Core, "mode"> & { readonly mode: "local" };
 interface ServerOnly {
   // discriminant so Bus<"local"> is NOT structurally assignable to Bus<"server">
@@ -166,7 +205,7 @@ interface ServerOnly {
   // contravariant for properties — method params are bivariant and would let
   // a Ctx<"local"> slip back in (probe-verified).
   joinAgent: (ctx: Ctx<"server">, p: { agent: string; role: string; caps?: string; fingerprint?: string | null }) => Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number }>;
-  post: (ctx: Ctx<"server">, p: { from: string; to: string; type: string; subject?: string; body: string; thread?: string | null; re?: string | null; tags?: string; channel?: string | null; as?: string | null; idempotencyKey?: string | null }) => Res<{ id: string; channel: string; thread: string; file: string }>;
+  post: (ctx: Ctx<"server">, p: { from: string; to: string; type: string; subject?: string; body: string; thread?: string | null; re?: string | null; tags?: string; channel?: string | null; as?: string | null; idempotencyKey?: string | null; dm?: string | null }) => Res<{ id: string; channel: string; thread: string; file: string }>;
   inbox: (ctx: Ctx<"server">, p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean }) => Res<{ rows: MsgRow[]; unreadIds: Set<string> }>;
   read: (ctx: Ctx<"server">, p: { agent: string; id: string }) => Res<MsgRow & { receipts: Receipts }>;
   threadOf: (ctx: Ctx<"server">, id: string) => Res<{ rows: MsgRow[]; receipts: Receipts[] }>;
@@ -179,6 +218,12 @@ interface ServerOnly {
   tokenCreate: (ctx: Ctx<"server">, p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean }) => Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string }>;
   tokenList: (ctx: Ctx<"server">) => Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; created_at: string; last_used: string; revoked_at: string | null }[] }>;
   tokenRevoke: (ctx: Ctx<"server">, p: { id: number }) => Res<{ revoked: boolean }>;
+  groupCreate: (ctx: Ctx<"server">, p: { name: string; agent?: string }) => Res<{ name: string; created: boolean }>;
+  groupJoin: (ctx: Ctx<"server">, p: { name: string; agent?: string }) => Res<{ name: string; members: string[] }>;
+  groupLeave: (ctx: Ctx<"server">, p: { name: string; agent?: string }) => Res<{ name: string; left: boolean }>;
+  groupDelete: (ctx: Ctx<"server">, p: { name: string }) => Res<{ name: string; deleted: boolean }>;
+  groupList: (ctx: Ctx<"server">) => Res<{ groups: { name: string; created_by: string; created_at: string; members: number; mine: boolean }[] }>;
+  groupShow: (ctx: Ctx<"server">, p: { name: string }) => Res<{ name: string; created_by: string; created_at: string; members: string[] }>;
 }
 
 // ---------- open / schema ----------
@@ -258,6 +303,28 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       epoch TEXT NOT NULL, last_seq INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY(agent_id, consumer)
     );
+    -- M1.5 App F: work-groups. PK answers "who is in group X"; gm_agent answers
+    -- the HOT path "which groups is agent Y in" (PK alone would SCAN).
+    CREATE TABLE IF NOT EXISTS groups(
+      name TEXT PRIMARY KEY, created_by TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS group_members(
+      grp TEXT NOT NULL, agent_id TEXT NOT NULL, joined_at TEXT NOT NULL,
+      created_by TEXT,
+      PRIMARY KEY(grp, agent_id));
+    CREATE INDEX IF NOT EXISTS gm_agent ON group_members(agent_id, grp);
+    -- F n5: delete+recreate backlog guard (upserted PK, never siblings).
+    CREATE TABLE IF NOT EXISTS group_tombstones(
+      name TEXT PRIMARY KEY, deleted_at TEXT NOT NULL);
+    -- M1.5 App G: the ONE confidentiality boundary. Literal member ids only —
+    -- role/group/@all are NEVER consulted for access.
+    CREATE TABLE IF NOT EXISTS channel_members(
+      channel TEXT NOT NULL, agent_id TEXT NOT NULL,
+      PRIMARY KEY(channel, agent_id));
+    CREATE INDEX IF NOT EXISTS cm_agent ON channel_members(agent_id, channel);
+    -- G6: retired-id tombstone (mail inheritance + id-reuse door closed).
+    CREATE TABLE IF NOT EXISTS agent_retired(
+      id TEXT PRIMARY KEY, renamed_to TEXT NOT NULL, at TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS agent_retired_new ON agent_retired(renamed_to, id);
   `);
   // dedupe key for the recipient index; legacy DBs may hold duplicates from the
   // racing-backfill bug — clean them first so the unique index can exist.
@@ -273,7 +340,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   // review bus hit exactly this). On SCHEMA_VERSION bump: DROP + recreate all
   // triggers inside BEGIN IMMEDIATE, and rebuild message_recipients (rows the
   // old trigger wrote had wrong trim semantics).
-  const SCHEMA_VERSION = 2;
+  // v3 (M1.5 F): group_members triggers added — E2: these names must appear in
+  // BOTH TRIGGER_DDL and the hardcoded DROP array (IF NOT EXISTS never upgrades
+  // a stale generation).
+  const SCHEMA_VERSION = 3;
   const readVersion = () => Number((d.query("SELECT value FROM meta WHERE key='schema_version'").get() as any)?.value ?? 0);
   const NOW_SQL = `strftime('%Y-%m-%dT%H:%M:%SZ','now')`;
   const TRIGGER_DDL = (`
@@ -311,6 +381,15 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       -- emits on revoke AND un-revoke (audit trail is complete either way)
       INSERT INTO events(kind,agent_id,at) VALUES('token',NEW.agent_id,coalesce(NEW.revoked_at,${NOW_SQL}));
     END;
+    -- v3 (M1.5 F): membership changes fan out via TRIGGERS, not core inserts —
+    -- "no writer can bypass fan-out" (§3). Rename is an UPDATE: these do NOT
+    -- fire there; membership cache misses must load from the DB (never empty).
+    CREATE TRIGGER IF NOT EXISTS group_members_ai AFTER INSERT ON group_members BEGIN
+      INSERT INTO events(kind,agent_id,at) VALUES('group',NEW.agent_id,${NOW_SQL});
+    END;
+    CREATE TRIGGER IF NOT EXISTS group_members_ad AFTER DELETE ON group_members BEGIN
+      INSERT INTO events(kind,agent_id,at) VALUES('group',OLD.agent_id,${NOW_SQL});
+    END;
   `);
   // round-3 fix (don-claude): DROP + CREATE + recipient rebuild + version write
   // are ONE IMMEDIATE txn, version re-checked inside it, forward-only. No
@@ -322,7 +401,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       const v = readVersion();
       if (v > SCHEMA_VERSION) { /* newer binary already upgraded: leave its triggers */ }
       else if (v < SCHEMA_VERSION) {
-        for (const trg of ["msg_ai", "msg_au", "reads_ai", "agents_ai", "agents_au", "tokens_ai", "tokens_au"])
+        for (const trg of ["msg_ai", "msg_au", "reads_ai", "agents_ai", "agents_au", "tokens_ai", "tokens_au", "group_members_ai", "group_members_ad"])
           d.exec(`DROP TRIGGER IF EXISTS ${trg}`);
         d.exec(TRIGGER_DDL);
         d.exec("DELETE FROM message_recipients");
@@ -339,6 +418,30 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   // N2 (round 3): no events seed — history snapshot pages over MESSAGES (§6),
   // so pre-events legacy rows and gc'd-event rows stay visible without
   // fabricating seqs.
+
+  // M1.5 G5 — acl_generation (DB-wide counter, SEPARATE from schema_version).
+  // Compiled generation is 1 (this binary understands channel_members).
+  const ACL_GENERATION = 1;
+  {
+    const cur = (d.query("SELECT value FROM meta WHERE key='acl_generation'").get() as any)?.value;
+    if (cur === undefined) {
+      const nakedDm = d.query("SELECT 1 FROM channels WHERE name GLOB 'dm~*' LIMIT 1").get();
+      if (!nakedDm) {
+        // marker re-read INSIDE the txn (backfill precedent)
+        d.exec("BEGIN IMMEDIATE");
+        try {
+          if (!d.query("SELECT value FROM meta WHERE key='acl_generation'").get())
+            d.run("INSERT INTO meta(key,value) VALUES('acl_generation','1')");
+          d.exec("COMMIT");
+        } catch (e) { d.exec("ROLLBACK"); throw e; }
+      }
+      // else: pre-existing dm channel without the key (crash window) — canSee
+      // fails closed PER CHANNEL; do not refuse open (false-refuses nothing here).
+    } else if (Number(cur) > ACL_GENERATION && mode === "server") {
+      d.close();
+      throw new Error(`openBus: DB acl_generation ${cur} exceeds compiled ${ACL_GENERATION} — replace the binary before serving this DB (G5)`);
+    }
+  }
 
   d.run(
     "INSERT OR IGNORE INTO channels(name,purpose,created_at,created_by) VALUES('general','tooling / meta / cross-project chatter','',?)",
@@ -391,11 +494,245 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   const roleOf = (agent: string): string | null =>
     (d.query("SELECT role FROM agents WHERE id=?").get(agent) as any)?.role ?? null;
 
-  function receiptsForMsg(msg: MsgRow): Receipts {
+  // ---------- M1.5 F/G: memberships + canSee ----------
+
+  /** F JS-parity Map: grp -> groups.created_at (incarnation time). THIS is the
+   *  JOIN's membership read — a cache filled on an earlier tick is not the Map;
+   *  a miss loads from the DB, never empty (rename UPDATE fires no trigger). */
+  function membershipsOf(agent: string): Map<string, string> {
+    const m = new Map<string, string>();
+    for (const r of d.query(
+      "SELECT gm.grp, g.created_at FROM group_members gm JOIN groups g ON g.name = gm.grp WHERE gm.agent_id = ?",
+    ).all(agent) as any[]) m.set(r.grp, r.created_at);
+    return m;
+  }
+
+  /** The probe-verified delivery statement (F): one UNION ALL, every arm an
+   *  index SEARCH, positional binds (house style — bun:sqlite does NOT bind
+   *  named params from {agent}). Role NULL ⇒ arm returns 0 rows (skip). */
+  function deliveredMsgIds(agent: string, role: string | null): Set<string> {
+    const rows = d.query(`
+      SELECT msg FROM message_recipients WHERE target = ?
+      UNION ALL SELECT msg FROM message_recipients WHERE target = ? AND ? IS NOT NULL
+      UNION ALL SELECT msg FROM message_recipients WHERE target = '@all'
+      UNION ALL SELECT r.msg FROM group_members gm
+        JOIN groups g ON g.name = gm.grp
+        JOIN message_recipients r ON r.target = ('group:' || gm.grp)
+        JOIN messages m ON m.id = r.msg AND m.created_at >= g.created_at
+        WHERE gm.agent_id = ?
+    `).all(agent, role, role, agent) as any[];
+    return new Set(rows.map((r) => r.msg));
+  }
+
+  const dmMembers = (channel: string): string[] =>
+    (d.query("SELECT agent_id FROM channel_members WHERE channel=? ORDER BY agent_id").all(channel) as any[]).map((r) => r.agent_id);
+
+  /** G2 — the ONE visibility predicate. Name SHAPE is the authority (GLOB);
+   *  channels.kind is at most a CHECK-enforced copy. Role/group/@all NEVER
+   *  consulted. Local mode = host is root of trust ⇒ see-all (pinned quirk). */
+  function canSeeChannel(ctx: AnyCtx, channel: string): boolean {
+    if (mode === "local") return true; // quirk pin: local sees all (G5/G7)
+    if (!DM_SHAPED_RE.test(channel)) return true;
+    if (hasScope(ctx, "read:dm")) return true;
+    return d.query("SELECT 1 FROM channel_members WHERE channel=? AND agent_id=?").get(channel, ctx.principal.agentId) !== null;
+  }
+
+  /** G0 pair lookup — GLOB + cardinality, deterministic tie-break newest
+   *  channels.created_at then rowid (nowIso is one-second resolution). */
+  function dmChannelForPair(lo: string, hi: string): string | null {
+    const row = d.query(`
+      SELECT c.name FROM channel_members cm INDEXED BY cm_agent
+      JOIN channels c ON c.name = cm.channel
+      WHERE cm.agent_id IN (?, ?) AND cm.channel GLOB 'dm~*'
+      GROUP BY c.name
+      HAVING count(*) = 2
+         AND (SELECT count(*) FROM channel_members x WHERE x.channel = c.name) = 2
+      ORDER BY c.created_at DESC, c.rowid DESC
+      LIMIT 1
+    `).get(lo, hi) as any;
+    return row?.name ?? null;
+  }
+
+  /** G2w-v — the ONE dm creation helper, BOTH modes. Canonicalize first (client
+   *  ~n is STRIPPED, not a distinct reject — the PAIR is the key). One IMMEDIATE
+   *  txn: channel row + exactly 2 member rows. Returns the stored name. */
+  function dmEnsure(lo: string, hi: string, by: string): Res<{ channel: string }> {
+    const existing = dmChannelForPair(lo, hi);
+    if (existing) return { value: { channel: existing } };
+    const t = nowIso();
+    let chan = dmChannelName(lo, hi);
+    try {
+      d.exec("BEGIN IMMEDIATE");
+      try {
+        const hit = dmChannelForPair(lo, hi); // re-check inside txn
+        if (hit) { d.exec("COMMIT"); return { value: { channel: hit } }; }
+        if (d.query("SELECT 1 FROM channels WHERE name=?").get(chan)) {
+          // canonical name held by a DIFFERENT pair (legacy id-reuse path only —
+          // agent_retired blocks id reuse on server DBs): allocate ~n inside txn.
+          let n = 1;
+          while (d.query("SELECT 1 FROM channels WHERE name=?").get(`dm~${lo}~${hi}~${n}`)) n++;
+          chan = `dm~${lo}~${hi}~${n}`;
+        }
+        d.run("INSERT INTO channels(name,purpose,created_at,created_by) VALUES(?,?,?,?)", [chan, "", t, by]);
+        d.run("INSERT INTO channel_members(channel,agent_id) VALUES(?,?)", [chan, lo]);
+        d.run("INSERT INTO channel_members(channel,agent_id) VALUES(?,?)", [chan, hi]);
+        d.exec("COMMIT");
+      } catch (e) { d.exec("ROLLBACK"); throw e; }
+      return { value: { channel: chan } };
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      if (msg.includes("SQLITE_BUSY")) return { error: "contention", detail: "busy" };
+      return { error: "internal", detail: `dmEnsure: ${msg}` };
+    }
+  }
+
+  /** G2w-v branch of (iv): pair lookup first; missing ⇒ create iff the FINAL
+   *  sender ∈ {lo,hi} AND both ids exist as agents AND neither is retired.
+   *  Every other outcome is the SAME not_found as a non-party naming an
+   *  existing dm channel — channel existence is never an oracle. UNIQUE name
+   *  collision ⇒ rollback, re-read the pair, post into the winner if member. */
+  function dmResolvePair(lo: string, hi: string, sender: string, requireAgents = true): Res<{ channel: string; members: string[] }> {
+    const hit = dmChannelForPair(lo, hi);
+    if (hit) return { value: { channel: hit, members: dmMembers(hit) } };
+    const agentExists = (id: string) => d.query("SELECT 1 FROM agents WHERE id=?").get(id) !== null;
+    // requireAgents = the server-mode oracle closure (G2w-v). Local mode is the
+    // bypass (host = root; ids mint implicitly everywhere), so only the retired
+    // check applies there.
+    if (!sender || sender !== lo && sender !== hi || (requireAgents && (!agentExists(lo) || !agentExists(hi))) ||
+        d.query("SELECT 1 FROM agent_retired WHERE id IN (?,?)").get(lo, hi))
+      return { error: "not_found", detail: `no such channel: ${dmChannelName(lo, hi)}` };
+    const en = dmEnsure(lo, hi, sender);
+    if (en.error) return en;
+    return { value: { channel: en.value.channel, members: dmMembers(en.value.channel) } };
+  }
+
+  // ---------- F: group operations (self-organizing — NO scope to create/join/leave) ----------
+
+  /** create-if-missing core. Tombstone rule (m-a/grok): if now <= deleted_at the
+   *  create REJECTS with contention (retry <=1s) — never stamp ahead of clock. */
+  function groupEnsure(name: string, by: string): Res<{ name: string; created: boolean }> {
+    const ex = d.query("SELECT name FROM groups WHERE name=?").get(name);
+    if (ex) return { value: { name, created: false } };
+    const t = nowIso();
+    try {
+      d.exec("BEGIN IMMEDIATE");
+      try {
+        if (d.query("SELECT name FROM groups WHERE name=?").get(name)) { d.exec("COMMIT"); return { value: { name, created: false } }; }
+        const tomb = (d.query("SELECT deleted_at FROM group_tombstones WHERE name=?").get(name) as any)?.deleted_at as string | undefined;
+        if (tomb !== undefined && t <= tomb) { d.exec("ROLLBACK"); return { error: "contention", detail: `group '${name}' deleted <1s ago; retry after the second boundary` }; }
+        const created = (d.query("SELECT count(*) c FROM groups WHERE created_by=?").get(by) as any).c;
+        if (created >= 64) { d.exec("ROLLBACK"); return { error: "usage", detail: "group squatting cap: 64 groups created per agent" }; }
+        d.run("INSERT INTO groups(name,created_by,created_at) VALUES(?,?,?)", [name, by, t]);
+        d.exec("COMMIT");
+      } catch (e) { d.exec("ROLLBACK"); throw e; }
+      return { value: { name, created: true } };
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      if (msg.includes("SQLITE_BUSY")) return { error: "contention", detail: "busy" };
+      return { error: "internal", detail: `groupEnsure: ${msg}` };
+    }
+  }
+
+  function groupCreate(ctx: Ctx<M>, p: { name: string; agent?: string }): Res<{ name: string; created: boolean }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    if (!ID_RE.test(p.name)) return { error: "usage", detail: `invalid group name: ${p.name} (ID_RE, ':' and '~' excluded)` };
+    const self = p.agent ?? ctx.principal.agentId;
+    if (self !== ctx.principal.agentId && !isRootCtx(ctx))
+      return { error: "forbidden", detail: "group agent is an assertion — self only" };
+    return groupEnsure(p.name, self);
+  }
+
+  /** join = create-if-missing + add self. Caps: <=64 groups/agent, <=512 members/group. */
+  function groupJoin(ctx: Ctx<M>, p: { name: string; agent?: string }): Res<{ name: string; members: string[] }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    if (!ID_RE.test(p.name)) return { error: "usage", detail: `invalid group name: ${p.name}` };
+    const self = p.agent ?? ctx.principal.agentId;
+    if (self !== ctx.principal.agentId && !isRootCtx(ctx))
+      return { error: "forbidden", detail: "group agent is an assertion — self only (else anyone subscribes others to 500 groups)" };
+    const en = groupEnsure(p.name, self);
+    if (en.error) return en;
+    const nGroups = (d.query("SELECT count(*) c FROM group_members WHERE agent_id=?").get(self) as any).c;
+    if (nGroups >= 64) return { error: "usage", detail: "cap: 64 groups per agent (bounds the delivery arm's seeks)" };
+    const t = nowIso();
+    d.run("INSERT OR IGNORE INTO group_members(grp,agent_id,joined_at,created_by) VALUES(?,?,?,?)", [p.name, self, t, self]);
+    return { value: { name: p.name, members: dmMembersLike(p.name) } };
+  }
+
+  const dmMembersLike = (grp: string) =>
+    (d.query("SELECT agent_id FROM group_members WHERE grp=? ORDER BY agent_id").all(grp) as any[]).map((r) => r.agent_id);
+
+  function groupLeave(ctx: Ctx<M>, p: { name: string; agent?: string }): Res<{ name: string; left: boolean }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    if (!ID_RE.test(p.name)) return { error: "usage", detail: `invalid group name: ${p.name}` };
+    const self = p.agent ?? ctx.principal.agentId;
+    if (self !== ctx.principal.agentId && !isRootCtx(ctx))
+      return { error: "forbidden", detail: "group agent is an assertion — self only" };
+    const r = d.run("DELETE FROM group_members WHERE grp=? AND agent_id=?", [p.name, self]);
+    return { value: { name: p.name, left: r.changes > 0 } };
+  }
+
+  /** delete requires agents:admin; DELETEs members in the SAME txn (delivery
+   *  reads members, not groups — orphans must not still receive); upserts the
+   *  tombstone PK (never a sibling row). */
+  function groupDelete(ctx: Ctx<M>, p: { name: string }): Res<{ name: string; deleted: boolean }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    if (!ID_RE.test(p.name)) return { error: "usage", detail: `invalid group name: ${p.name}` };
+    if (!isRootCtx(ctx) && !hasScope(ctx, "agents:admin"))
+      return { error: "forbidden", detail: "group.delete requires agents:admin" };
+    const t = nowIso();
+    try {
+      d.exec("BEGIN IMMEDIATE");
+      try {
+        const g = d.query("SELECT name FROM groups WHERE name=?").get(p.name);
+        if (!g) { d.exec("ROLLBACK"); return { error: "not_found", detail: `no such group: ${p.name}` }; }
+        d.run("DELETE FROM group_members WHERE grp=?", [p.name]);
+        d.run("DELETE FROM groups WHERE name=?", [p.name]);
+        d.run(`INSERT INTO group_tombstones(name,deleted_at) VALUES(?,?)
+               ON CONFLICT(name) DO UPDATE SET deleted_at = excluded.deleted_at
+               WHERE excluded.deleted_at > group_tombstones.deleted_at`, [p.name, t]);
+        d.exec("COMMIT");
+      } catch (e) { d.exec("ROLLBACK"); throw e; }
+      return { value: { name: p.name, deleted: true } };
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      if (msg.includes("SQLITE_BUSY")) return { error: "contention", detail: "busy" };
+      return { error: "internal", detail: `groupDelete: ${msg}` };
+    }
+  }
+
+  function groupList(ctx: Ctx<M>): Res<{ groups: { name: string; created_by: string; created_at: string; members: number; mine: boolean }[] }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    const mine = new Set((d.query("SELECT grp FROM group_members WHERE agent_id=?").all(ctx.principal.agentId) as any[]).map((r) => r.grp));
+    const rows = (d.query("SELECT name, created_by, created_at FROM groups ORDER BY name").all() as any[])
+      .map((g) => ({ name: g.name, created_by: g.created_by, created_at: g.created_at, members: dmMembersLike(g.name).length, mine: mine.has(g.name) }));
+    return { value: { groups: rows } };
+  }
+
+  function groupShow(ctx: Ctx<M>, p: { name: string }): Res<{ name: string; created_by: string; created_at: string; members: string[] }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    const g = d.query("SELECT name, created_by, created_at FROM groups WHERE name=?").get(p.name) as any;
+    if (!g) return { error: "not_found", detail: `no such group: ${p.name}` };
+    return { value: { name: g.name, created_by: g.created_by, created_at: g.created_at, members: dmMembersLike(g.name) } };
+  }
+
+  /** F receipts honesty: the intended set is current members of the
+   *  incarnation that existed when the message was posted, excluding sender —
+   *  NOT a membership snapshot (no history table; a recreated group
+   *  contributes nobody). G2: receipts never build for a hidden dm row — the
+   *  intended set is filtered by canSee per reader (server mode). */
+  function receiptsForMsg(msg: MsgRow, ctx?: AnyCtx): Receipts {
     const agents = d.query("SELECT id, role FROM agents WHERE id IS NOT NULL").all() as any[];
-    const intended = agents
-      .filter((a) => a.id !== msg.sender && recipientsMatch(msg.recipients, a.id, a.role))
+    const memCache = new Map<string, Map<string, string>>();
+    const memFor = (id: string) => {
+      let m = memCache.get(id);
+      if (!m) { m = membershipsOf(id); memCache.set(id, m); }
+      return m;
+    };
+    let intended = agents
+      .filter((a) => a.id !== msg.sender && recipientsMatch(msg.recipients, a.id, a.role, memFor(a.id), msg.created_at))
       .map((a) => a.id);
+    // G2: never build receipts for a hidden row's readers.
+    if (ctx && mode === "server") intended = intended.filter((id) => canSeeReader(msg.channel, id, ctx));
     const readMap = new Map<string, string | null>();
     for (const r of d.query("SELECT agent, read_at FROM reads WHERE msg=?").all(msg.id) as any[])
       readMap.set(r.agent, r.read_at);
@@ -406,6 +743,16 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       readers: intended.filter((id) => readMap.has(id)).map((id) => ({ id, at: readMap.get(id) ?? null })),
       unread: intended.filter((id) => !readMap.has(id)),
     };
+  }
+
+  /** canSee from the READER's side for receipts: a dm row is visible to its
+   *  literal members; the omniview overlay (read:dm) belongs to whoever asks,
+   *  so per-reader filtering here is membership-only (the caller's scope was
+   *  already checked at the path gate). */
+  function canSeeReader(channel: string, readerId: string, _ctx: AnyCtx): boolean {
+    if (mode === "local") return true;
+    if (!DM_SHAPED_RE.test(channel)) return true;
+    return d.query("SELECT 1 FROM channel_members WHERE channel=? AND agent_id=?").get(channel, readerId) !== null;
   }
 
   function renderMd(m: MsgRow): string {
@@ -433,6 +780,44 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
 
   // ---------- commands ----------
 
+  /** §5 role grammar (F/G close the P2/R1 class) — checks on a role WRITE:
+   *  (1) ID_RE grammar — server rejects, local warns (hit-only, golden-safe);
+   *  (2) role == ANOTHER AGENT'S ID (T2 direction) — server identity_conflict,
+   *      local warns; (3) role == any agent_retired.id (R1) — identity_conflict
+   *      in BOTH modes (grok binding: never weakened into the warning).
+   *  Returns { error } to reject, { warnings } hit-only notices, or null. */
+  function roleWriteChecks(role: string, selfId: string): { error?: BusError; warnings?: string[] } | null {
+    const warnings: string[] = [];
+    if (!ID_RE.test(role)) {
+      if (mode === "server") return { error: { error: "usage", detail: `invalid role: ${role} (must match ID_RE — no ':' '~' '@': a role of 'group:secret' must not impersonate a structured target)` } };
+      warnings.push(`warning: legacy role '${role}' fails ID_RE grammar (local mode = root; will be rejected in server mode)`);
+    }
+    const clash = (d.query("SELECT id FROM agents WHERE id=? AND id!=?").get(role, selfId) as any)?.id;
+    if (clash) {
+      if (mode === "server") return { error: { error: "identity_conflict", detail: `role '${role}' equals agent id '${clash}' — would inherit that agent's bare-token mail (N3/T2)` } };
+      warnings.push(`warning: role '${role}' equals existing agent id — server mode rejects this (N3)`);
+    }
+    if (d.query("SELECT 1 FROM agent_retired WHERE id=?").get(role))
+      return { error: { error: "identity_conflict", detail: `role '${role}' equals a retired agent id — would inherit pre-rename mail through the bare-token arm (R1)` } };
+    return warnings.length ? { warnings } : null;
+  }
+
+  /** §5 N3 symmetric + G6 checks on a NEW agent id (token.create INSERT, rename
+   *  target, local joinAgent mint): the id must not be retired (HARD both modes —
+   *  a re-minted id would collide agent_retired PK AND inherit old mail); no
+   *  OTHER agent may hold role == newId (server hard; local warn). Runs INSIDE
+   *  the caller's IMMEDIATE txn (m-c). */
+  function idMintChecks(newId: string): { error?: BusError; warnings?: string[] } | null {
+    if (d.query("SELECT 1 FROM agent_retired WHERE id=?").get(newId))
+      return { error: { error: "identity_conflict", detail: `id '${newId}' was retired by a rename — ids are not reused (one-way door, G6)` } };
+    const holder = (d.query("SELECT id FROM agents WHERE role=? AND id!=?").get(newId, newId) as any)?.id;
+    if (holder) {
+      if (mode === "server") return { error: { error: "identity_conflict", detail: `id '${newId}' is held as ROLE by '${holder}' — minting it would inherit that agent's bare-token mail (N3/T2)` } };
+      return { warnings: [`warning: id '${newId}' is held as role by '${holder}' — server mode rejects this mint (N3)`] };
+    }
+    return null;
+  }
+
   function joinAgent(ctx: Ctx<M>, p: { agent: string; role: string; caps?: string; fingerprint?: string | null }): Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (!p.agent || !p.role) return { error: "usage", detail: "error: join requires --agent and --role" };
@@ -442,9 +827,19 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       // finding 12: assertion id, UPDATE-only (no auto-register), fingerprint IGNORED.
       if (p.agent !== ctx.principal.agentId)
         return { error: "forbidden", detail: `agent assertion '${p.agent}' != principal '${ctx.principal.agentId}'` };
-      const r = d.run("UPDATE agents SET role=?, caps=?, last_seen=? WHERE id=?", [p.role, p.caps ?? "", t, p.agent]);
-      if (r.changes === 0)
-        return { error: "not_found", detail: `unknown agent '${p.agent}' — rows are minted by token.create on the server` };
+      // m-c: identity checks INSIDE the write's IMMEDIATE txn.
+      try { d.exec("BEGIN IMMEDIATE"); } catch (e: any) {
+        if (String(e?.message ?? e).includes("SQLITE_BUSY")) return { error: "contention", detail: "busy" };
+        return { error: "internal", detail: `join: ${String(e?.message ?? e)}` };
+      }
+      try {
+        const rc = roleWriteChecks(p.role, p.agent);
+        if (rc?.error) { d.exec("ROLLBACK"); return rc.error; }
+        for (const w of rc?.warnings ?? []) seams.warn?.(w);
+        const r = d.run("UPDATE agents SET role=?, caps=?, last_seen=? WHERE id=?", [p.role, p.caps ?? "", t, p.agent]);
+        if (r.changes === 0) { d.exec("ROLLBACK"); return { error: "not_found", detail: `unknown agent '${p.agent}' — rows are minted by token.create on the server` }; }
+        d.exec("COMMIT");
+      } catch (e: any) { d.exec("ROLLBACK"); return { error: "internal", detail: `join: ${String(e?.message ?? e)}` }; }
     } else {
       const fp = p.fingerprint ?? null;
       if (fp) {
@@ -458,6 +853,14 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
         if (byId && byId.fingerprint && byId.fingerprint !== fp)
           return { error: "identity_conflict", detail: `error: id '${p.agent}' is already claimed by another runtime. Pick a different id, or coordinate a rename.` };
       }
+      const isNew = !d.query("SELECT id FROM agents WHERE id=?").get(p.agent);
+      // §5 role grammar applies to EVERY join (both modes); mint checks only on
+      // the INSERT branch (m-b).
+      const rc = roleWriteChecks(p.role, p.agent);
+      if (rc?.error) return rc.error;
+      const mc = isNew ? idMintChecks(p.agent) : null;
+      if (mc?.error) return mc.error;
+      for (const w of [...(mc?.warnings ?? []), ...(rc?.warnings ?? [])]) seams.warn?.(w);
       d.run(
         `INSERT INTO agents(id,role,caps,pid,joined_at,last_seen,meta,fingerprint,kind) VALUES(?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET role=excluded.role, caps=excluded.caps, pid=excluded.pid, last_seen=excluded.last_seen,
@@ -467,9 +870,22 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       );
     }
     const row = d.query("SELECT * FROM agents WHERE id=?").get(p.agent) as AgentRow;
-    const unresolved = (d.query(
-      "SELECT COUNT(*) c FROM messages WHERE status IN ('open','acked','in_progress') AND sender!=?",
-    ).get(p.agent) as any).c;
+    // n6 (claude): unresolved count under canSee — a non-party's DM traffic must
+    // not leak existence/volume through join output. Local mode: legacy formula
+    // verbatim (golden parity).
+    let unresolved: number;
+    if (mode === "server") {
+      unresolved = (d.query(
+        "SELECT COUNT(*) c FROM messages WHERE status IN ('open','acked','in_progress') AND sender!=?",
+      ).get(p.agent) as any).c
+        - (d.query(
+          "SELECT COUNT(*) c FROM messages WHERE status IN ('open','acked','in_progress') AND sender!=? AND channel GLOB 'dm~*' AND NOT EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel=messages.channel AND cm.agent_id=?) AND ? != 1",
+        ).get(p.agent, p.agent, hasScope(ctx, "read:dm") ? 1 : 0) as any).c;
+    } else {
+      unresolved = (d.query(
+        "SELECT COUNT(*) c FROM messages WHERE status IN ('open','acked','in_progress') AND sender!=?",
+      ).get(p.agent) as any).c;
+    }
     return { value: { agent: row, active: listAgents(true), unresolved } };
   }
 
@@ -482,11 +898,13 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   function post(ctx: Ctx<M>, p: {
     from: string; to: string; type: string; subject?: string; body: string;
     thread?: string | null; re?: string | null; tags?: string; channel?: string | null;
-    as?: string | null; idempotencyKey?: string | null;
+    as?: string | null; idempotencyKey?: string | null; dm?: string | null;
   }): Res<{ id: string; channel: string; thread: string; file: string }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     const rootCtx = isRootCtx(ctx);
     if (!p.from || !p.to) return { error: "usage", detail: "error: post requires --from and --to" };
+    if (p.dm !== undefined && p.dm !== null && !ID_RE.test(p.dm))
+      return { error: "usage", detail: `invalid dm peer: ${p.dm}` };
 
     // QUIRK restored (finding 14): legacy touched the sender BEFORE validating
     // type/channel/etc, so a rejected post still registered the agent. Server
@@ -498,8 +916,18 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     if (!ID_RE.test(p.from)) return { error: "usage", detail: `invalid from id: ${p.from}` };
     if (!MSG_TYPES.includes(p.type as any)) return { error: "usage", detail: `error: --type must be one of ${[...MSG_TYPES].sort()}` };
     if (!TYPE_RE.test(p.type)) return { error: "usage", detail: `invalid type: ${p.type}` };
-    if (p.channel !== undefined && p.channel !== null && !ID_RE.test(p.channel))
+    if (p.channel !== undefined && p.channel !== null && !validChannelName(p.channel))
       return { error: "usage", detail: `invalid channel: ${p.channel}` };
+
+    // F n3: post addressed to group:<nonexistent> is rejected up front — nobody
+    // pre-addresses a name and squats traffic by creating the group later.
+    for (const t0 of csv(p.to))
+      if (t0.startsWith("group:") && !d.query("SELECT 1 FROM groups WHERE name=?").get(t0.slice(6)))
+        return { error: "usage", detail: `post to ${t0}: no such group (create it first — pre-addressing would squat traffic)` };
+
+    // G2w-i/ii: dm write-side rules (server-enforced; local root bypasses —
+    // host is root of trust). (iii) parent lookup applies canSee (below).
+    const dmRules = mode === "server" || !rootCtx;
 
     if (mode === "server" || !rootCtx) {
       // finding 2 (B2): `from` is ALWAYS an assertion — even with post:as.
@@ -530,26 +958,104 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       }
     }
 
+    // §5: sender = as-target; N4: meta.as = principal. Computed BEFORE channel
+    // resolution — G2w rules speak of the FINAL sender (after `as`).
+    const sender = rootCtx ? (p.as ?? p.from) : (p.as || ctx.principal.agentId);
+    const asAudit = p.as ? ctx.principal.agentId : null;
+
+    // ---------- M1.5 G2w: anchors + dm channel resolution ----------
+
+    // (iv) thread anchor: server mode requires it to reference an EXISTING,
+    // canSee-visible message (kills injection + future-id squat + legacy
+    // free-form thread strings). Local keeps legacy leniency (golden parity).
+    let threadRoot: MsgRow | null = null;
+    if (p.thread) {
+      threadRoot = d.query("SELECT * FROM messages WHERE id=?").get(p.thread) as MsgRow | null;
+      if (mode === "server" && (!threadRoot || !canSeeChannel(ctx, threadRoot.channel)))
+        return { error: "not_found", detail: `no such message: ${p.thread}` };
+    }
+
+    // (iii) re anchor: existence (m3) AND canSee — invisible == missing, same
+    // detail string (B2 oracle closed). Local dangling --re stays a silent
+    // insert (legacy quirk, pinned).
+    let reRow: MsgRow | null = null;
+    if (p.re) {
+      reRow = d.query("SELECT * FROM messages WHERE id=?").get(p.re) as MsgRow | null;
+      if (mode === "server" && (!reRow || !canSeeChannel(ctx, reRow.channel)))
+        return { error: "not_found", detail: `error: re -> unknown message id '${p.re}'` };
+    }
+
     let channel: string | null = p.channel ?? null;
+    // Channel inheritance: server = the ANCHOR ROW's channel column (never the
+    // legacy id-OR-thread lookup, which can resolve to a squatter row); local =
+    // legacy lookup verbatim (golden quirk pin).
     if (!channel) {
-      const parentId = p.thread || p.re;
-      if (parentId) {
-        const par = d.query("SELECT channel FROM messages WHERE id=? OR thread=? ORDER BY created_at ASC LIMIT 1")
-          .get(parentId, parentId) as any;
-        channel = par?.channel ?? null;
+      if (mode === "server") channel = threadRoot?.channel ?? reRow?.channel ?? null;
+      else {
+        const parentId = p.thread || p.re;
+        if (parentId) {
+          const par = d.query("SELECT channel FROM messages WHERE id=? OR thread=? ORDER BY created_at ASC LIMIT 1")
+            .get(parentId, parentId) as any;
+          channel = par?.channel ?? null;
+        }
       }
     }
-    // m3 (round 2): server rejects dangling --re BEFORE ensureChannel, so a
-    // rejected post leaves no orphan channel row (X3/N-h).
-    if (p.re && mode === "server") {
-      const reRow = d.query("SELECT id FROM messages WHERE id=?").get(p.re);
-      if (!reRow) return { error: "not_found", detail: `error: re -> unknown message id '${p.re}'` };
-    }
-    channel = channel || "general";
-    ensureChannel(channel, p.from);
 
-    const sender = rootCtx ? (p.as ?? p.from) : (p.as || ctx.principal.agentId); // §5: sender = as-target
-    const asAudit = p.as ? ctx.principal.agentId : null;                        // N4: meta.as = principal
+    // G1 dm sugar: channel + recipients = the peer (pair-keyed, like everything dm).
+    let dmMembersResolved: string[] | null = null;
+    if (p.dm !== undefined && p.dm !== null) {
+      const me = sender, peer = p.dm;
+      if (me === peer) return { error: "usage", detail: "self-DM rejected (lo == hi)" };
+      const [lo, hi] = me < peer ? [me, peer] : [peer, me];
+      const en = dmResolvePair(lo, hi, sender, dmRules);
+      if (en.error) return en;
+      channel = en.value.channel;
+      dmMembersResolved = en.value.members;
+      p = { ...p, to: peer };
+    }
+
+    // dm-shaped channel: an EXISTING channel row is used under its stored name
+    // as-is — the name is a frozen label and channel_members is the authority
+    // (G0: never re-sort current ids into a name after rename). Only a MISSING
+    // dm channel routes through the pair-keyed creation helper (client ~n is
+    // stripped there — the pair, not the name, is the key).
+    if (channel !== null && DM_SHAPED_RE.test(channel) && dmMembersResolved === null) {
+      if (d.query("SELECT 1 FROM channels WHERE name=?").get(channel)) {
+        dmMembersResolved = dmMembers(channel);
+      } else {
+        const dm = DM_RE.exec(channel);
+        if (!dm) return { error: "usage", detail: `invalid dm channel name: ${channel}` };
+        const [lo, hi] = dm[1] < dm[2] ? [dm[1], dm[2]] : [dm[2], dm[1]];
+        if (lo === hi) return { error: "usage", detail: "self-DM channel rejected (lo == hi)" };
+        const en = dmResolvePair(lo, hi, sender, dmRules);
+        if (en.error) return en;
+        channel = en.value.channel;
+        dmMembersResolved = en.value.members;
+      }
+    }
+
+    // (iv) dm thread-root equality — reached only after canSee passed above,
+    // so a non-party never sees `usage` here.
+    if (dmRules && threadRoot && DM_SHAPED_RE.test(threadRoot.channel) && channel !== threadRoot.channel)
+      return { error: "usage", detail: "cross-channel attach into a dm thread is rejected" };
+
+    // (i)+(ii) dm write rules on the RESOLVED channel, BEFORE any channel
+    // write: invisible == missing (not_found, no oracle); wildcard/out-of-pair
+    // recipients from a PARTY are usage.
+    if (channel !== null && DM_SHAPED_RE.test(channel)) {
+      const members = dmMembersResolved ?? dmMembers(channel);
+      if (dmRules) {
+        if (!members.includes(sender))
+          return { error: "not_found", detail: `no such channel: ${channel}` }; // == missing
+        for (const t0 of csv(p.to)) {
+          if (t0 === "@all" || t0.startsWith("group:") || !members.includes(t0))
+            return { error: "usage", detail: `dm recipients must be literal member ids (subset of members; no @all/group/wildcards): ${t0}` };
+        }
+      }
+    } else {
+      channel = channel || "general";
+      ensureChannel(channel, sender); // policy-free for public channels (G1)
+    }
     const mid = newId(sender.split("-")[0]);
     // M5 (round 2): thread is DERIVED from the final id — recomputed on every
     // collision retry; an explicit p.thread always wins and never retargets.
@@ -620,12 +1126,20 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const mark = p.mark === true && !peek;
     if (mode === "local") touch(p.agent);
     const role = roleOf(p.agent);
+    const mem = membershipsOf(p.agent);
+    // G2: confidentiality subject is the CALLER. A for≠self peek (read:all)
+    // sees the other's DM rows only with read:dm too; a self inbox sees own DMs
+    // as member. Local mode: see-all quirk (canSeeChannel returns true).
+    const callerSeesDm = (ch: string) =>
+      canSeeChannel(ctx, ch) &&
+      (p.agent === ctx.principal.agentId || isRootCtx(ctx) || !DM_SHAPED_RE.test(ch) || hasScope(ctx, "read:dm"));
     const rows = d.query("SELECT * FROM messages ORDER BY created_at ASC, rowid ASC").all() as MsgRow[];
     const readIds = new Set((d.query("SELECT msg FROM reads WHERE agent=?").all(p.agent) as any[]).map((x) => x.msg));
     const out = rows.filter((r) => {
       if (r.sender === p.agent) return false;
       if (p.channel && r.channel !== p.channel) return false;
-      if (!recipientsMatch(r.recipients, p.agent, role)) return false;
+      if (!callerSeesDm(r.channel)) return false;
+      if (!recipientsMatch(r.recipients, p.agent, role, mem, r.created_at)) return false;
       if (p.open && !["open", "acked", "in_progress"].includes(r.status)) return false;
       if (p.unread && readIds.has(r.id)) return false;
       return true;
@@ -641,25 +1155,34 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       return { error: "forbidden", detail: "read for another agent requires read:all" }; // finding 2 (B2)
     const r = d.query("SELECT * FROM messages WHERE id=?").get(p.id) as MsgRow | null;
     if (!r) return { error: "not_found", detail: `no such message: ${p.id}` };
+    // G2: canSee BEFORE the reads INSERT — a non-party probe must not write a
+    // reads row nor emit a kind=read event leaking the id. Invisible == missing.
+    if (!canSeeChannel(ctx, r.channel)) return { error: "not_found", detail: `no such message: ${p.id}` };
     if (mode === "local") touch(p.agent);
     const peek = !rootCtx && p.agent !== ctx.principal.agentId; // with read:all: NON-marking peek
+    if (peek && DM_SHAPED_RE.test(r.channel) && !hasScope(ctx, "read:dm") && !dmMembers(r.channel).includes(p.agent))
+      return { error: "not_found", detail: `no such message: ${p.id}` }; // peek needs read:dm for DMs
     if (!peek) d.run("INSERT OR REPLACE INTO reads(agent,msg,read_at) VALUES(?,?,?)", [p.agent, p.id, nowIso()]);
-    return { value: { ...r, receipts: receiptsForMsg(r) } };
+    return { value: { ...r, receipts: receiptsForMsg(r, ctx) } };
   }
 
   function threadOf(ctx: Ctx<M>, id: string): Res<{ rows: MsgRow[]; receipts: Receipts[] }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     // QUIRK (legacy): thread = explicit thread OR own id (de4ed3b semantics).
     const rows = d.query("SELECT * FROM messages WHERE thread=? OR id=? ORDER BY created_at ASC, rowid ASC").all(id, id) as MsgRow[];
-    if (!rows.length) return { error: "not_found", detail: `no thread: ${id}` };
-    return { value: { rows, receipts: rows.map(receiptsForMsg) } };
+    // G2: threads span channels ⇒ per-row canSee filter; not_found only if ALL
+    // rows filtered; never build receipts for a hidden row.
+    const vis = rows.filter((r) => canSeeChannel(ctx, r.channel));
+    if (!vis.length) return { error: "not_found", detail: `no thread: ${id}` };
+    return { value: { rows: vis, receipts: vis.map((r) => receiptsForMsg(r, ctx)) } };
   }
 
   function receipts(ctx: Ctx<M>, id: string): Res<MsgRow & { receipts: Receipts }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     const r = d.query("SELECT * FROM messages WHERE id=?").get(id) as MsgRow | null;
     if (!r) return { error: "not_found", detail: `no such message: ${id}` };
-    return { value: { ...r, receipts: receiptsForMsg(r) } };
+    if (!canSeeChannel(ctx, r.channel)) return { error: "not_found", detail: `no such message: ${id}` }; // not_found BEFORE receiptsForMsg
+    return { value: { ...r, receipts: receiptsForMsg(r, ctx) } };
   }
 
   function setStatus(ctx: Ctx<M>, p: { agent: string; id: string; state: string }): Res<{ id: string; status: string }> {
@@ -672,12 +1195,16 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     if (!STATES.includes(p.state as any)) return { error: "usage", detail: `error: state must be one of ${[...STATES].sort()}` };
     const r = d.query("SELECT * FROM messages WHERE id=?").get(p.id) as MsgRow | null;
     if (!r) return { error: "not_found", detail: `no such message: ${p.id}` };
+    // G2: non-party on a dm row ⇒ not_found, NOT forbidden (no existence oracle).
+    if (!canSeeChannel(ctx, r.channel)) return { error: "not_found", detail: `no such message: ${p.id}` };
     if (!rootCtx) {
       // §5: sender OR resolved intended recipient may ack/done/status;
       // agents:admin may set ANY. read:all is visibility (history/stream/peek),
       // NOT confidentiality — it must not gate status (round-2 M2).
+      // F honesty: group membership DOES grant ack on group-addressed mail
+      // (delivery-time resolved, includes earlier ones).
       const maySet = agent === r.sender
-        || recipientsMatch(r.recipients, agent, roleOf(agent))
+        || recipientsMatch(r.recipients, agent, roleOf(agent), membershipsOf(agent), r.created_at)
         || hasScope(ctx, "agents:admin");
       if (!maySet) return { error: "forbidden", detail: "status: not sender, not recipient (needs agents:admin)" };
     }
@@ -692,7 +1219,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     for (const c of d.query("SELECT name, purpose FROM channels").all() as any[])
       if (!cmap.has(c.name)) cmap.set(c.name, { name: c.name, n: 0, last: null, purpose: c.purpose });
     for (const c of counts) c.purpose = (d.query("SELECT purpose FROM channels WHERE name=?").get(c.name) as any)?.purpose ?? "";
-    return { value: [...cmap.values()].sort((a, b) => String(b.last ?? "").localeCompare(String(a.last ?? ""))) };
+    // G2: dm-shaped rows hidden unless member or read:dm (local mode lists all).
+    return { value: [...cmap.values()]
+      .filter((c) => canSeeChannel(ctx, c.name))
+      .sort((a, b) => String(b.last ?? "").localeCompare(String(a.last ?? ""))) };
   }
 
   function rename(ctx: Ctx<M>, p: { agent: string; to: string; fingerprint?: string | null }): Res<{ announced: MsgRow }> {
@@ -709,6 +1239,12 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     }
     if (d.query("SELECT id FROM agents WHERE id=?").get(p.to))
       return { error: "identity_conflict", detail: `error: id '${p.to}' already exists — pick a free name.` };
+    // G6: renaming TO a retired id is a one-way door; N3 symmetric: no other
+    // agent may hold role == the new id.
+    if (d.query("SELECT 1 FROM agent_retired WHERE id=?").get(p.to))
+      return { error: "identity_conflict", detail: `error: id '${p.to}' was retired by an earlier rename — one-way door (G6).` };
+    if ((d.query("SELECT id FROM agents WHERE role=? AND id!=?").get(p.to, p.agent) as any)?.id)
+      return { error: "identity_conflict", detail: `error: '${p.to}' is held as a role by another agent (N3) — pick a free name.` };
     const t = nowIso();
     ensureChannel("general", p.to);
     const mid = newId(String(p.to).split("-")[0]);
@@ -734,6 +1270,21 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
         d.run("UPDATE tokens SET agent_id=? WHERE agent_id=?", [p.to, p.agent]);
         d.run("UPDATE cursors SET agent_id=? WHERE agent_id=?", [p.to, p.agent]);
         d.run("UPDATE idempotency SET agent_id=? WHERE agent_id=?", [p.to, p.agent]);
+        // G6 (ruling a): membership cascades. OR IGNORE + leftover delete keeps
+        // the PK safe; the leftover delete is REQUIRED (under the alias
+        // alternative `new` may already be a member — claude n9).
+        d.run("UPDATE OR IGNORE group_members SET agent_id=? WHERE agent_id=?", [p.to, p.agent]);
+        d.run("DELETE FROM group_members WHERE agent_id=?", [p.agent]);
+        d.run("UPDATE OR IGNORE channel_members SET agent_id=? WHERE agent_id=?", [p.to, p.agent]);
+        d.run("DELETE FROM channel_members WHERE agent_id=?", [p.agent]);
+        // G6: retire the old id (chains existing tombstones forward). Binds are
+        // (new, old) then (old, new, nowIso) — swapping points the chain wrong.
+        // NOT OR IGNORE: retargeting would reopen mail inheritance.
+        d.run("UPDATE agent_retired SET renamed_to=? WHERE renamed_to=?", [p.to, p.agent]);
+        d.run("INSERT INTO agent_retired(id,renamed_to,at) VALUES(?,?,?)", [p.agent, p.to, t]);
+        // NO rewrite of message_recipients.target / recipients CSV /
+        // messages.channel / mirror dirs / events — msg_ai won't re-fire and
+        // mr_uq would throw when a message carries both ids (claude G6 probe).
         // M7 (round 2): events are point-in-time audit history (§4) — the OLD
         // id is NOT rewritten; the agents_au rename event links old→new.
         d.exec("COMMIT");
@@ -767,7 +1318,8 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     let scopes: Scope[];
     if (p.admin) scopes = [...ALL_SCOPES];
     else if (p.scopes) scopes = p.scopes;
-    else scopes = kind === "human" ? ["read:all"] : [];
+    // G3: human defaults to BOTH read scopes (operators need DM visibility).
+    else scopes = kind === "human" ? ["read:all", "read:dm"] : [];
     // §5: tokens:admin is TRANSITIVELY ROOT — it may mint any subset, including
     // scopes it does not itself hold (the round-2 M8b "must hold" rule was a
     // contradiction of §5 and is removed). Minting tokens:admin itself is still
@@ -782,6 +1334,16 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     try {
       d.exec("BEGIN IMMEDIATE");
       try {
+        // G6/N3: EVERY agents-insert path runs the mint checks BEFORE the write,
+        // inside this IMMEDIATE txn (m-c): retired-id reuse hard-rejects; an id
+        // held as another agent's role hard-rejects (server) — local root is
+        // the bootstrap path, so checks apply here too (INSERT OR IGNORE means
+        // an EXISTING row is not a mint: checks only fire for new ids).
+        if (!d.query("SELECT 1 FROM agents WHERE id=?").get(p.agent)) {
+          const mc = idMintChecks(p.agent);
+          if (mc?.error) { d.exec("ROLLBACK"); return mc.error; }
+          for (const w of mc?.warnings ?? []) seams.warn?.(w);
+        }
         // bootstrap guard ACTUALLY aborts (finding 2): second admin needs force.
         if (norm.split(",").includes("tokens:admin") && !p.force) {
           const existingAdmin = d.query(
@@ -930,25 +1492,32 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       // exist to prevent; §6 says "same txn").
       const ep = epochSafe();
       if (ep === null) throw new Error("meta.epoch missing (corrupt DB)");
+      const dm = hasScope(ctx, "read:dm") ? 1 : 0;
       if (!ascending) {
         // N2 (round 3): SNAPSHOT pages over MESSAGES (§6 "history returns
         // messages, not events") — events are retention-bounded and absent for
         // pre-events legacy rows. Cursor = events high-water read in the SAME
         // txn (§6), so the stream handoff has no hole; dedupe by msg_id.
+        // G2 (grok B1 pin): canSee is the ROW PREDICATE here, in BOTH modes —
+        // read:all alone does NOT satisfy canSee; DM omniview = read:all AND
+        // read:dm. Predicate in WHERE, never a post-LIMIT filter.
+        const visSql = `(m.channel NOT GLOB 'dm~*' OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel = m.channel AND cm.agent_id = ?) OR ? = 1)`;
         const q = p.channel
-          ? d.query("SELECT * FROM messages WHERE channel=? ORDER BY created_at DESC, rowid DESC LIMIT ?")
-          : d.query("SELECT * FROM messages ORDER BY created_at DESC, rowid DESC LIMIT ?");
-        const got = (p.channel ? q.all(p.channel, limit + 1) : q.all(limit + 1)) as MsgRow[];
+          ? d.query(`SELECT m.* FROM messages m WHERE m.channel=? AND ${visSql} ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?`)
+          : d.query(`SELECT m.* FROM messages m WHERE ${visSql} ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?`);
+        const got = (p.channel ? q.all(p.channel, ctx.principal.agentId, dm, limit + 1) : q.all(ctx.principal.agentId, dm, limit + 1)) as MsgRow[];
         const hw = Math.max((d.query("SELECT coalesce(max(seq),0) m FROM events").get() as any).m as number, gcFloor());
         d.exec("COMMIT");
         const rows = got.slice(0, limit).reverse();
         return { value: { rows, hasMore: got.length > limit, cursor: `${ep}.${hw}` } };
       }
       const dir = ascending ? "ASC" : "DESC";
+      // G2 m-d: same predicate in the WHERE BEFORE LIMIT — a post-LIMIT JS
+      // filter livelocks when a whole page is hidden (cursor never advances).
       const evs = (p.channel
-        ? d.query(`SELECT e.seq,e.msg_id FROM events e JOIN messages m ON m.id=e.msg_id WHERE e.kind='msg' AND e.seq>? AND m.channel=? ORDER BY e.seq ${dir} LIMIT ?`)
-        : d.query(`SELECT seq,msg_id FROM events WHERE kind='msg' AND seq>? ORDER BY seq ${dir} LIMIT ?`)) as any;
-      const got = (p.channel ? evs.all(seqFrom, p.channel, limit + 1) : evs.all(seqFrom, limit + 1)) as { seq: number; msg_id: string }[];
+        ? d.query(`SELECT e.seq,e.msg_id FROM events e JOIN messages m ON m.id=e.msg_id WHERE e.kind='msg' AND e.seq>? AND m.channel=? AND (m.channel NOT GLOB 'dm~*' OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel=m.channel AND cm.agent_id=?) OR ?=1) ORDER BY e.seq ${dir} LIMIT ?`)
+        : d.query(`SELECT e.seq,e.msg_id FROM events e JOIN messages m ON m.id=e.msg_id WHERE e.kind='msg' AND e.seq>? AND (m.channel NOT GLOB 'dm~*' OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel=m.channel AND cm.agent_id=?) OR ?=1) ORDER BY e.seq ${dir} LIMIT ?`)) as any;
+      const got = (p.channel ? evs.all(seqFrom, p.channel, ctx.principal.agentId, dm, limit + 1) : evs.all(seqFrom, ctx.principal.agentId, dm, limit + 1)) as { seq: number; msg_id: string }[];
       const hasMore = got.length > limit;
       const page = ascending ? got.slice(0, limit) : got.slice(0, limit).reverse();
       const rows = page.map((e) => d.query("SELECT * FROM messages WHERE id=?").get(e.msg_id) as MsgRow).filter(Boolean);
@@ -994,13 +1563,17 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       if (seq < gcFloor()) return { error: "resync", detail: "cursor below retention floor", data: { resync: true, epoch: ep, floor: gcFloor() } };
     }
     const role = roleOf(target);
+    // F: membership resolves at TAIL time from the same-snapshot Map (a since=
+    // resume replays against CURRENT membership — late-joiner semantics).
+    const mem = membershipsOf(target);
     const messages: MsgRow[] = [];
     let cur = seq;
     for (const e of tailEvents(seq, 500)) {
       cur = e.seq;
       if (e.kind !== "msg" || !e.msg_id) continue;
       const m = d.query("SELECT * FROM messages WHERE id=?").get(e.msg_id) as MsgRow | null;
-      if (m && m.sender !== target && recipientsMatch(m.recipients, target, role)) messages.push(m);
+      // G2: SSE/stream canSee on EVERY event carrying a msg_id (server mode).
+      if (m && m.sender !== target && canSeeChannel(ctx, m.channel) && recipientsMatch(m.recipients, target, role, mem, m.created_at)) messages.push(m);
     }
     return { value: { messages, cursor: `${ep}.${cur}`, done: messages.length > 0 } };
   }
@@ -1029,13 +1602,24 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     });
   }
 
-  function preflight(): { badIds: string[]; badChannels: string[] } {
+  function preflight(): { badIds: string[]; badChannels: string[]; zeroMemberDms: string[]; roleCollisions: string[] } {
     const badIds = (d.query("SELECT DISTINCT id FROM agents").all() as any[])
       .map((r) => r.id).filter((id: string) => id && !ID_RE.test(id));
+    // G1: preflight uses the SAME widened write-gate helper as post() — else
+    // every legitimate DM is flagged bad.
     const badChannels = (d.query("SELECT DISTINCT sender FROM messages").all() as any[])
       .map((r) => r.sender).filter((s: string) => s && !ID_RE.test(s))
-      .concat((d.query("SELECT name FROM channels").all() as any[]).map((r) => r.name).filter((n: string) => n && !ID_RE.test(n)));
-    return { badIds, badChannels: [...new Set(badChannels)] };
+      .concat((d.query("SELECT name FROM channels").all() as any[]).map((r) => r.name).filter((n: string) => n && !validChannelName(n)));
+    // G5 C1: zero-member dm-shaped channels are the documented repair surface.
+    const zeroMemberDms = (d.query("SELECT name FROM channels WHERE name GLOB 'dm~*'").all() as any[])
+      .map((r) => r.name)
+      .filter((n: string) => (d.query("SELECT count(*) c FROM channel_members WHERE channel=?").get(n) as any).c === 0);
+    // §5: legacy roles colliding with ids or retired ids (write-path checks
+    // don't rewrite legacy rows; preflight lists offenders).
+    const roleCollisions = (d.query("SELECT id, role FROM agents WHERE role IS NOT NULL").all() as any[])
+      .filter((r) => d.query("SELECT 1 FROM agents WHERE id=? AND id!=?").get(r.role, r.id) || d.query("SELECT 1 FROM agent_retired WHERE id=?").get(r.role))
+      .map((r) => `${r.id}!role=${r.role}`);
+    return { badIds, badChannels: [...new Set(badChannels)], zeroMemberDms, roleCollisions };
   }
 
   // local watch helpers (finding 9: no SQL above the core)
@@ -1062,6 +1646,8 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     tokenCreate, tokenVerify, tokenList, tokenRevoke, tokenTouch,
     cursorGet, cursorSet, history, waitStep, tailEvents, epoch, gcFloor, rotateEpoch, gc, preflight,
     allMessages, allMessageIds, ensureChannel,
+    groupCreate, groupJoin, groupLeave, groupDelete, groupList, groupShow,
+    canSeeChannel, membershipsOf, deliveredMsgIds, dmMembers, dmChannelForPair,
     isActive, recipientsMatch, roleOf, receiptsForMsg, renderMd, touch, close,
   };
 }

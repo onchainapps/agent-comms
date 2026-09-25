@@ -15,7 +15,7 @@ export interface Session {
   readonly agentId: string;
   joinAgent(p: { agent: string; role: string; caps?: string; fingerprint?: string | null }): Promise<Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number }>>;
   listAgents(activeOnly: boolean): Promise<Res<AgentRow[]>>;
-  post(p: { from: string; to: string; type: string; subject?: string; body: string; thread?: string | null; re?: string | null; tags?: string; channel?: string | null; as?: string | null; idempotencyKey?: string | null }): Promise<Res<{ id: string; channel: string; thread: string; file: string }>>;
+  post(p: { from: string; to: string; type: string; subject?: string; body: string; thread?: string | null; re?: string | null; tags?: string; channel?: string | null; as?: string | null; idempotencyKey?: string | null; dm?: string | null }): Promise<Res<{ id: string; channel: string; thread: string; file: string }>>;
   inbox(p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean }): Promise<Res<{ rows: MsgRow[]; unreadIds: string[] }>>;
   read(p: { agent: string; id: string }): Promise<Res<MsgRow & { receipts: Receipts }>>;
   threadOf(id: string): Promise<Res<{ rows: MsgRow[]; receipts: Receipts[] }>>;
@@ -30,6 +30,12 @@ export interface Session {
   tokenCreate(p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean }): Promise<Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string }>>;
   tokenList(): Promise<Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; created_at: string; last_used: string; revoked_at: string | null }[] }>>;
   tokenRevoke(p: { id: number }): Promise<Res<{ revoked: boolean }>>;
+  groupCreate(p: { name: string; agent?: string }): Promise<Res<{ name: string; created: boolean }>>;
+  groupJoin(p: { name: string; agent?: string }): Promise<Res<{ name: string; members: string[] }>>;
+  groupLeave(p: { name: string; agent?: string }): Promise<Res<{ name: string; left: boolean }>>;
+  groupDelete(p: { name: string }): Promise<Res<{ name: string; deleted: boolean }>>;
+  groupList(): Promise<Res<{ groups: { name: string; created_by: string; created_at: string; members: number; mine: boolean }[] }>>;
+  groupShow(p: { name: string }): Promise<Res<{ name: string; created_by: string; created_at: string; members: string[] }>>;
 }
 
 export interface BusHandle {
@@ -80,6 +86,12 @@ function wrapSessionImpl<M extends Mode>(bus: Bus<M>, ctx: Ctx<M>): Session {
     tokenCreate: (p) => a(bus.tokenCreate(c, p)),
     tokenList: () => a(bus.tokenList(c)),
     tokenRevoke: (p) => a(bus.tokenRevoke(c, p)),
+    groupCreate: (p) => a(bus.groupCreate(c, p)),
+    groupJoin: (p) => a(bus.groupJoin(c, p)),
+    groupLeave: (p) => a(bus.groupLeave(c, p)),
+    groupDelete: (p) => a(bus.groupDelete(c, p)),
+    groupList: () => a(bus.groupList(c)),
+    groupShow: (p) => a(bus.groupShow(c, p)),
   };
 }
 
