@@ -44,8 +44,10 @@ export interface BusHandle {
    *  (the CLI is its own authority); {token} ⇒ same resolution as the server. */
   session(cred?: Cred): Session;
   /** typed credential resolution for transports (finding 10c): a bad token is
-   *  a Res error (→ -32001), not an exception. */
-  resolve(cred: Cred): Res<Session>;
+   *  a Res error (→ -32001), not an exception. Transports without a local DB
+   *  (RpcBus) must verify over the wire ⇒ callers AWAIT (await on a sync Res
+   *  is a no-op; the contract suite awaits uniformly). */
+  resolve(cred: Cred): Res<Session> | Promise<Res<Session>>;
   close(): void;
 }
 
@@ -111,7 +113,7 @@ export class LocalBus implements BusHandle {
   }
   session(cred?: Cred): Session {
     if (!cred) return wrapSession(this.core, localCtx("local"));
-    const r = this.resolve(cred);
+    const r: Res<Session> = this.resolve(cred); // LocalBus.resolve is sync — narrowed by annotation
     if (r.error) throw new Error(r.detail);
     return r.value;
   }
@@ -125,18 +127,19 @@ export class LocalBus implements BusHandle {
  *  tokens.agent_id, so a cached principal would go stale). */
 export function serverHandle(core: Bus<"server">): BusHandle & { raw: Bus<"server"> } {
   if (core.mode !== "server") throw new Error("serverHandle requires a server-mode core (mode discriminant, round-2 M1)");
+  const resolve = (cred: Cred): Res<Session> => {
+    if (!("token" in cred)) return { error: "unauthorized", detail: "server sessions require a token credential" };
+    const v = core.tokenVerify(cred.token);
+    if (v.error) return v;
+    return { value: wrapSession(core, serverCtx(v.value.agentId, v.value.scopes, v.value.kind, cred)) };
+  };
   return {
     mode: "server" as const,
     raw: core,
-    resolve(cred: Cred): Res<Session> {
-      if (!("token" in cred)) return { error: "unauthorized", detail: "server sessions require a token credential" };
-      const v = core.tokenVerify(cred.token);
-      if (v.error) return v;
-      return { value: wrapSession(core, serverCtx(v.value.agentId, v.value.scopes, v.value.kind, cred)) };
-    },
+    resolve,
     session(cred?: Cred): Session {
       if (!cred) throw new Error("server sessions require a token credential");
-      const r = this.resolve(cred);
+      const r = resolve(cred); // local sync closure — the interface widens for RpcBus, not here
       if (r.error) throw new Error(r.detail);
       return r.value;
     },

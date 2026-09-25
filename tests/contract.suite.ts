@@ -186,6 +186,7 @@ export function contractSuite(name: string, make: Factory) {
         expect(((await root.receipts(id)) as any).value.sender).toBe("rn-a"); // history unchanged
         // SAME token now resolves to rn-b (rename rewrote tokens.agent_id)
         const sess2 = h.session({ token: s.value.token });
+        await sess2.channels(); // RpcBus: identity arrives on the first round-trip (x-comms-agent)
         expect(sess2.agentId).toBe("rn-b");
         expect((await sess2.post({ from: "rn-b", to: "y", type: "note", body: "b2" })).error).toBeUndefined();
       });
@@ -214,6 +215,7 @@ export function contractSuite(name: string, make: Factory) {
         const bad = await root.history({ since: "deadbeefdeadbeef.5" });
         expect(bad.error).toBe("resync");
         expect((bad as any).data.resync).toBe(true);
+        expect(typeof (bad as any).data.floor).toBe("number"); // m2 (M2 card): ONE resync payload shape — floor ALWAYS present
       });
     });
 
@@ -230,7 +232,9 @@ export function contractSuite(name: string, make: Factory) {
         expect(((await sess.waitStep({ for: "cw-target", consumer: "mcp" })) as any).value.messages.length).toBe(1); // isolated
         expect((await sess.cursorSet({ consumer: "cli", cursor: w.value.cursor.replace(/\d+$/, "0") })).error).toBe("conflict");
         expect((await sess.cursorSet({ consumer: "cli", cursor: "not-a-cursor" })).error).toBe("usage");
-        expect((await sess.cursorSet({ consumer: "cli", cursor: "deadbeefdeadbeef.99" })).error).toBe("resync");
+        const rsSet = await sess.cursorSet({ consumer: "cli", cursor: "deadbeefdeadbeef.99" });
+        expect(rsSet.error).toBe("resync");
+        expect(typeof (rsSet as any).data.floor).toBe("number"); // m2 hygiene: floor always present
         // waitStep for≠self requires read:all (finding 11/P3)
         expect((await sess.waitStep({ for: "root" })).error).toBe("forbidden");
         expect((await root.waitStep({ for: "cw-target" })).error).toBeUndefined();
@@ -306,6 +310,7 @@ export function contractSuite(name: string, make: Factory) {
         expect(w.error).toBe("resync");
         expect((w as any).data.resync).toBe(true);
         expect((w as any).data.epoch).toBe(raw.epoch()); // the NEW epoch for the client
+        expect(typeof (w as any).data.floor).toBe("number"); // m2 hygiene: floor always present
         // a cursor already at the new epoch (fresh client) is NOT a resync:
         expect((await a.cursorSet({ consumer: "cli2", cursor: `${raw.epoch()}.0`, force: true })).error).toBeUndefined();
         expect((await a.waitStep({ consumer: "cli2" })).error).toBeUndefined();
@@ -334,6 +339,7 @@ export function contractSuite(name: string, make: Factory) {
         expect(cg.error).toBe("resync");
         expect((cg as any).data.resync).toBe(true);
         expect((cg as any).data.epoch).toBe(e2);
+        expect(typeof (cg as any).data.floor).toBe("number"); // m2 hygiene: floor always present
         // the stored row was NOT rewritten by the failed get
         expect((raw.testDb.query("SELECT epoch FROM cursors WHERE agent_id='alice3' AND consumer='cli'").get() as any).epoch).not.toBe(e2);
         // recovery commit: explicit current-epoch set succeeds despite the foreign row
@@ -347,7 +353,9 @@ export function contractSuite(name: string, make: Factory) {
 
     test("bad credential ⇒ unauthorized via resolve() (finding 10c)", async () => {
       await withBus(async (h) => {
-        expect(h.resolve({ token: "ac_notarealtokenatall1234" }).error).toBe("unauthorized");
+        // awaited: transports without a local DB (RpcBus) must verify over
+        // the wire; LocalBus returns the Res synchronously and await is a no-op.
+        expect((await h.resolve({ token: "ac_notarealtokenatall1234" })).error).toBe("unauthorized");
       });
     });
 

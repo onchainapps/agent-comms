@@ -1551,6 +1551,12 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     return { value: { agentId: row.agent_id, scopes: normalizeScopes(csv(row.scopes)).split(",").filter(validScope) as Scope[], kind, tokenId: row.id } }; // finding 20: tokenId; legacy 8-name rows: unknown tokens are inert (M8)
   }
 
+  function tokenById(id: number): { agentId: string; scopes: Scope[]; revoked: boolean } | null {
+    const row = d.query("SELECT agent_id, scopes, revoked_at FROM tokens WHERE id=?").get(id) as any;
+    if (!row) return null;
+    return { agentId: row.agent_id, scopes: normalizeScopes(csv(row.scopes)).split(",").filter(validScope) as Scope[], revoked: row.revoked_at !== null };
+  }
+
   function tokenList(ctx: Ctx<M>): Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; created_at: string; last_used: string; revoked_at: string | null }[] }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (!isRootCtx(ctx) && !ctx.principal.scopes.includes("tokens:admin"))
@@ -1604,7 +1610,9 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const row = cursorRaw(agentId, consumer);
     if (!row) return { value: { epoch: e, seq: 0 } };
     if (row.epoch !== e)
-      return { error: "resync", detail: "cursor epoch stale (epoch rotated)", data: { resync: true, epoch: e } };
+      // m2 (M2 card hygiene): ONE resync payload shape on the wire — always
+      // include floor (rotateEpoch zeroes it; floor=0 is still explicit).
+      return { error: "resync", detail: "cursor epoch stale (epoch rotated)", data: { resync: true, epoch: e, floor: gcFloor() } };
     return { value: { epoch: e, seq: row.seq } };
   }
 
@@ -1613,7 +1621,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       return { error: "usage", detail: "cursor must be <hex-epoch>.<int-seq>" };
     const e = epochSafe();
     if (e === null) return { error: "internal", detail: "meta.epoch missing (corrupt DB)" };
-    if (ep !== e) return { error: "resync", detail: "epoch mismatch; resync required", data: { resync: true, epoch: e } };
+    if (ep !== e) return { error: "resync", detail: "epoch mismatch; resync required", data: { resync: true, epoch: e, floor: gcFloor() } };
     if (seq < gcFloor()) return { error: "resync", detail: `cursor below retention floor`, data: { resync: true, epoch: e, floor: gcFloor() } };
     // M4: monotonic check compares against the RAW stored row ONLY when it shares
     // the target epoch — a foreign-epoch row must not block the recovery commit.
@@ -1635,7 +1643,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     if (!m) return { error: "usage", detail: "cursor must be <epoch>.<seq>" };
     const e = epochSafe();
     if (e === null) return { error: "internal", detail: "meta.epoch missing (corrupt DB)" };
-    if (m[1] !== e) return { error: "resync", detail: "epoch mismatch", data: { resync: true, epoch: e } };
+    if (m[1] !== e) return { error: "resync", detail: "epoch mismatch", data: { resync: true, epoch: e, floor: gcFloor() } };
     const seq = Number(m[2]);
     if (seq < gcFloor()) return { error: "resync", detail: "cursor below retention floor", data: { resync: true, epoch: e, floor: gcFloor() } };
     return { value: { ep: e, seq } };
@@ -1751,6 +1759,11 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     return { value: { messages, cursor: `${ep}.${cur}`, done: messages.length > 0 } };
   }
 
+  // high-water seq for the SSE hello frame (§3: no SQL above the core)
+  function eventsHighWater(): number {
+    return Math.max((d.query("SELECT coalesce(max(seq),0) m FROM events").get() as any).m as number, gcFloor());
+  }
+
   function tailEvents(afterSeq: number, limit = 200): { seq: number; kind: string; msg_id: string | null; agent_id: string | null; at: string }[] {
     return d.query("SELECT seq,kind,msg_id,agent_id,at FROM events WHERE seq>? ORDER BY seq LIMIT ?").all(afterSeq, limit) as any;
   }
@@ -1810,6 +1823,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   function allMessageIds(): string[] {
     return (d.query("SELECT id FROM messages").all() as any[]).map((r) => r.id);
   }
+  // point lookup for the SSE broadcaster (§3: no SQL above the core)
+  function messageById(id: string): MsgRow | null {
+    return (d.query("SELECT * FROM messages WHERE id=?").get(id) as MsgRow | null) ?? null;
+  }
 
   function db_txn<T>(fn: () => T): T {
     d.exec("BEGIN IMMEDIATE");
@@ -1824,9 +1841,9 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     // shells/adapters must never reach for it (M2 RpcBus has no DB at all).
     testDb: d, home, mode, seams, DB_PATH, MSG_DIR, nowIso, stamp, newId,
     joinAgent, listAgents, post, inbox, read, threadOf, receipts, setStatus, channels, rename,
-    tokenCreate, tokenVerify, tokenList, tokenRevoke, tokenTouch,
-    cursorGet, cursorSet, history, waitStep, tailEvents, epoch, gcFloor, rotateEpoch, gc, preflight,
-    allMessages, allMessageIds, ensureChannel,
+    tokenCreate, tokenVerify, tokenById, tokenList, tokenRevoke, tokenTouch,
+    cursorGet, cursorSet, history, waitStep, tailEvents, eventsHighWater, epoch, gcFloor, rotateEpoch, gc, preflight,
+    allMessages, allMessageIds, messageById, ensureChannel,
     groupCreate, groupJoin, groupLeave, groupDelete, groupList, groupShow,
     canSeeChannel, membershipsOf, deliveredMsgIds, dmMembers, dmChannelForPair,
     isActive, recipientsMatch, roleOf, receiptsForMsg, renderMd, touch, close,
