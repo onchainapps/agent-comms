@@ -59,7 +59,7 @@ export type BusErrorCode =
   | "usage" | "not_found" | "forbidden" | "unauthorized" | "conflict" | "gone"
   | "identity_conflict" | "rate_limited" | "unavailable" | "internal" | "resync" | "contention";
 export type BusError = { error: BusErrorCode; detail: string; data?: Record<string, unknown> };
-export type Ok<T> = { error?: undefined; value: T; cursor?: string };
+export type Ok<T> = { error?: undefined; value: T }; // n3 (round 3): the ONLY cursor representation is value.cursor (string "<epoch>.<seq>") — no parallel top-level field for RpcBus to forget.
 export type Res<T> = Ok<T> | BusError;
 
 /** §7 mappings — the shell and the server map, never invent. */
@@ -174,7 +174,7 @@ interface ServerOnly {
   setStatus: (ctx: Ctx<"server">, p: { agent: string; id: string; state: string }) => Res<{ id: string; status: string }>;
   channels: (ctx: Ctx<"server">) => Res<{ name: string; n: number; last: string | null; purpose: string | null }[]>;
   rename: (ctx: Ctx<"server">, p: { agent: string; to: string; fingerprint?: string | null }) => Res<{ announced: MsgRow }>;
-  history: (ctx: Ctx<"server">, p: { channel?: string | null; limit?: number; since?: string }) => Res<{ rows: MsgRow[]; hasMore: boolean; cursor: { epoch: string; seq: number } }>;
+  history: (ctx: Ctx<"server">, p: { channel?: string | null; limit?: number; since?: string }) => Res<{ rows: MsgRow[]; hasMore: boolean; cursor: string }>;
   waitStep: (ctx: Ctx<"server">, p: { for?: string; consumer?: string; since?: string }) => Res<{ messages: MsgRow[]; cursor: string; done: boolean }>;
   tokenCreate: (ctx: Ctx<"server">, p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean }) => Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string }>;
   tokenList: (ctx: Ctx<"server">) => Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; created_at: string; last_used: string; revoked_at: string | null }[] }>;
@@ -274,23 +274,9 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   // triggers inside BEGIN IMMEDIATE, and rebuild message_recipients (rows the
   // old trigger wrote had wrong trim semantics).
   const SCHEMA_VERSION = 2;
-  const storedVersion = Number((d.query("SELECT value FROM meta WHERE key='schema_version'").get() as any)?.value ?? 0);
-  const hadTriggers = (d.query("SELECT count(*) c FROM sqlite_master WHERE type='trigger'").get() as any).c > 0;
-  if (storedVersion !== SCHEMA_VERSION && hadTriggers) {
-    d.exec("BEGIN IMMEDIATE");
-    try {
-      for (const trg of ["msg_ai", "msg_au", "reads_ai", "agents_ai", "agents_au", "tokens_ai", "tokens_au"])
-        d.exec(`DROP TRIGGER IF EXISTS ${trg}`);
-      d.exec("DELETE FROM message_recipients"); // rebuilt below by the backfill split
-      d.exec("DELETE FROM meta WHERE key='backfill_recipients'");
-      d.run("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", [String(SCHEMA_VERSION)]);
-      d.exec("COMMIT");
-    } catch (e) { d.exec("ROLLBACK"); throw e; }
-  } else if (storedVersion !== SCHEMA_VERSION) {
-    d.run("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", [String(SCHEMA_VERSION)]);
-  }
+  const readVersion = () => Number((d.query("SELECT value FROM meta WHERE key='schema_version'").get() as any)?.value ?? 0);
   const NOW_SQL = `strftime('%Y-%m-%dT%H:%M:%SZ','now')`;
-  d.exec(`
+  const TRIGGER_DDL = (`
     CREATE TRIGGER IF NOT EXISTS msg_ai AFTER INSERT ON messages BEGIN
       INSERT INTO events(kind,msg_id,agent_id,at) VALUES('msg',NEW.id,NEW.sender,coalesce(NEW.created_at,${NOW_SQL}));
       INSERT OR IGNORE INTO message_recipients(msg,target)
@@ -326,6 +312,33 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       INSERT INTO events(kind,agent_id,at) VALUES('token',NEW.agent_id,coalesce(NEW.revoked_at,${NOW_SQL}));
     END;
   `);
+  // round-3 fix (don-claude): DROP + CREATE + recipient rebuild + version write
+  // are ONE IMMEDIATE txn, version re-checked inside it, forward-only. No
+  // trigger-less window for concurrent writers; an older binary never
+  // downgrades a newer DB's triggers.
+  if (readVersion() < SCHEMA_VERSION || !d.query("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='msg_ai'").get()) {
+    d.exec("BEGIN IMMEDIATE");
+    try {
+      const v = readVersion();
+      if (v > SCHEMA_VERSION) { /* newer binary already upgraded: leave its triggers */ }
+      else if (v < SCHEMA_VERSION) {
+        for (const trg of ["msg_ai", "msg_au", "reads_ai", "agents_ai", "agents_au", "tokens_ai", "tokens_au"])
+          d.exec(`DROP TRIGGER IF EXISTS ${trg}`);
+        d.exec(TRIGGER_DDL);
+        d.exec("DELETE FROM message_recipients");
+        const splitStmt = d.query(SPLIT_SQL);
+        for (const r of d.query("SELECT id, recipients FROM messages").all() as any[])
+          for (const t of splitStmt.all(String(r.recipients ?? "")) as any[])
+            d.run("INSERT OR IGNORE INTO message_recipients(msg,target) VALUES(?,?)", [r.id, t.tok]);
+        d.run("INSERT OR REPLACE INTO meta(key,value) VALUES('backfill_recipients',?)", [nowIso()]);
+        d.run("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", [String(SCHEMA_VERSION)]);
+      } else d.exec(TRIGGER_DDL); // v == current but triggers missing (fresh DB race) — IF NOT EXISTS
+      d.exec("COMMIT");
+    } catch (e) { d.exec("ROLLBACK"); throw e; }
+  }
+  // N2 (round 3): no events seed — history snapshot pages over MESSAGES (§6),
+  // so pre-events legacy rows and gc'd-event rows stay visible without
+  // fabricating seqs.
 
   d.run(
     "INSERT OR IGNORE INTO channels(name,purpose,created_at,created_by) VALUES('general','tooling / meta / cross-project chatter','',?)",
@@ -838,11 +851,15 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     return Number((d.query("SELECT value FROM meta WHERE key='gc_floor'").get() as any)?.value ?? 0);
   }
 
+  function cursorRaw(agentId: string, consumer: string): { epoch: string; seq: number } | null {
+    const row = d.query("SELECT epoch, last_seq FROM cursors WHERE agent_id=? AND consumer=?").get(agentId, consumer) as any;
+    return row ? { epoch: row.epoch, seq: row.last_seq } : null;
+  }
   function cursorGet(agentId: string, consumer: string): { epoch: string; seq: number } {
     const e = epoch();
-    const row = d.query("SELECT epoch, last_seq FROM cursors WHERE agent_id=? AND consumer=?").get(agentId, consumer) as any;
+    const row = cursorRaw(agentId, consumer);
     if (!row || row.epoch !== e) return { epoch: e, seq: 0 };
-    return { epoch: e, seq: row.last_seq };
+    return { epoch: e, seq: row.seq };
   }
 
   function cursorSet(agentId: string, consumer: string, ep: string, seq: number, force = false): Res<null> {
@@ -874,7 +891,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     return { value: { ep: e, seq } };
   }
 
-  function history(ctx: Ctx<M>, p: { channel?: string | null; limit?: number; since?: string }): Res<{ rows: MsgRow[]; hasMore: boolean; cursor: { epoch: string; seq: number } }> {
+  function history(ctx: Ctx<M>, p: { channel?: string | null; limit?: number; since?: string }): Res<{ rows: MsgRow[]; hasMore: boolean; cursor: string }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (!isRootCtx(ctx) && !ctx.principal.scopes.includes("read:all"))
       return { error: "forbidden", detail: "history requires read:all" };
@@ -892,6 +909,20 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const ascending = !!p.since;
     d.exec("BEGIN");
     try {
+      if (!ascending) {
+        // N2 (round 3): SNAPSHOT pages over MESSAGES (§6 "history returns
+        // messages, not events") — events are retention-bounded and absent for
+        // pre-events legacy rows. Cursor = events high-water read in the SAME
+        // txn (§6), so the stream handoff has no hole; dedupe by msg_id.
+        const q = p.channel
+          ? d.query("SELECT * FROM messages WHERE channel=? ORDER BY created_at DESC, rowid DESC LIMIT ?")
+          : d.query("SELECT * FROM messages ORDER BY created_at DESC, rowid DESC LIMIT ?");
+        const got = (p.channel ? q.all(p.channel, limit + 1) : q.all(limit + 1)) as MsgRow[];
+        const hw = (d.query("SELECT coalesce(max(seq),0) m FROM events").get() as any).m as number;
+        d.exec("COMMIT");
+        const rows = got.slice(0, limit).reverse();
+        return { value: { rows, hasMore: got.length > limit, cursor: `${epoch()}.${hw}` } };
+      }
       const dir = ascending ? "ASC" : "DESC";
       const evs = (p.channel
         ? d.query(`SELECT e.seq,e.msg_id FROM events e JOIN messages m ON m.id=e.msg_id WHERE e.kind='msg' AND e.seq>? AND m.channel=? ORDER BY e.seq ${dir} LIMIT ?`)
@@ -902,7 +933,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       const rows = page.map((e) => d.query("SELECT * FROM messages WHERE id=?").get(e.msg_id) as MsgRow).filter(Boolean);
       const lastSeq = page.length ? page[page.length - 1].seq : seqFrom;
       d.exec("COMMIT");
-      return { value: { rows, hasMore, cursor: { epoch: epoch(), seq: lastSeq } }, cursor: `${epoch()}.${lastSeq}` };
+      return { value: { rows, hasMore, cursor: `${epoch()}.${lastSeq}` } };
     } catch (e) { d.exec("ROLLBACK"); throw e; }
   }
 
@@ -921,8 +952,14 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       if (c.error) return c;
       ep = c.value.ep; seq = c.value.seq;
     } else {
-      const c = cursorGet(ctx.principal.agentId, consumer);
-      ep = c.epoch; seq = c.seq;
+      // grok round-3 #1: a STORED cursor from a previous epoch is a resync
+      // signal, not a silent reset to seq 0 — rotateEpoch zeroes gc_floor, so
+      // the floor check alone can never fire after rotation. Epoch mismatch
+      // is the same resync path as a below-retention cursor (§6/§9).
+      const row = cursorRaw(ctx.principal.agentId, consumer);
+      if (row && row.epoch !== ep)
+        return { error: "resync", detail: "cursor epoch stale (epoch rotated)", data: { resync: true, epoch: ep, floor: gcFloor() } };
+      seq = row?.seq ?? 0;
       if (seq < gcFloor()) return { error: "resync", detail: "cursor below retention floor", data: { resync: true, epoch: ep, floor: gcFloor() } };
     }
     const role = roleOf(target);

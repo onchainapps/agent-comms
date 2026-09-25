@@ -247,7 +247,7 @@ describe("history handoff (§6 nit + finding 8)", () => {
     const page = bus.history(ctx, { limit: 2 }) as any;
     expect(page.value.rows.map((r: any) => r.body)).toEqual(["m3", "m4"]); // NEWEST page
     expect(page.value.hasMore).toBe(true);
-    const rest = bus.history(ctx, { since: page.cursor }) as any;
+    const rest = bus.history(ctx, { since: page.value.cursor }) as any;
     expect(rest.value.rows.map((r: any) => r.body)).toEqual([]); // cursor = last DELIVERED (m4) ⇒ no dup
     const mid = bus.history(ctx, { since: "deadbeefdeadbeef.1" }) as any; // foreign epoch ⇒ resync
     expect(mid.error).toBe("resync");
@@ -381,17 +381,42 @@ describe("round-3 pins (m2 quirk, M5 forced collision, M6 trigger upgrade)", () 
   test("M6: reopening a DB with old-generation triggers upgrades them + rebuilds recipients", () => {
     const home = tmp();
     const bus = loc(home);
-    // simulate the old generation: replace msg_ai with the pre-WSET version
-    // (space-trim only, no coalesce) and drop the version marker
-    bus.testDb.exec(`DROP TRIGGER msg_ai;
+    // n2 (round 3): replace ALL SEVEN triggers with their old-generation text
+    // (23aa4cb DDL: space-trim only, NO coalesce) so the NULL-last_seen
+    // assertion below is not vacuous.
+    bus.testDb.exec(`
+      DROP TRIGGER msg_ai; DROP TRIGGER msg_au; DROP TRIGGER reads_ai;
+      DROP TRIGGER agents_ai; DROP TRIGGER agents_au; DROP TRIGGER tokens_ai; DROP TRIGGER tokens_au;
       CREATE TRIGGER msg_ai AFTER INSERT ON messages BEGIN
         INSERT INTO events(kind,msg_id,agent_id,at) VALUES('msg',NEW.id,NEW.sender,NEW.created_at);
-        INSERT OR IGNORE INTO message_recipients(msg,target)
+        INSERT INTO message_recipients(msg,target)
         WITH RECURSIVE s(rest,tok) AS (
           SELECT coalesce(NEW.recipients,'') || ',', NULL
           UNION ALL
           SELECT substr(rest, instr(rest,',')+1), trim(substr(rest,1,instr(rest,',')-1)) FROM s WHERE rest <> '')
         SELECT NEW.id, tok FROM s WHERE tok IS NOT NULL AND tok <> '';
+      END;
+      CREATE TRIGGER msg_au AFTER UPDATE OF status ON messages BEGIN
+        INSERT INTO events(kind,msg_id,agent_id,at) VALUES('status',NEW.id,NEW.sender,NEW.updated_at);
+      END;
+      CREATE TRIGGER reads_ai AFTER INSERT ON reads BEGIN
+        INSERT INTO events(kind,msg_id,agent_id,at) VALUES('read',NEW.msg,NEW.agent,NEW.read_at);
+      END;
+      CREATE TRIGGER agents_ai AFTER INSERT ON agents BEGIN
+        INSERT INTO events(kind,agent_id,at) VALUES('presence',NEW.id,NEW.last_seen);
+      END;
+      CREATE TRIGGER agents_au AFTER UPDATE ON agents
+      WHEN OLD.id IS NOT NEW.id OR OLD.role IS NOT NEW.role OR OLD.caps IS NOT NEW.caps
+        OR (julianday(NEW.last_seen) - julianday(OLD.last_seen)) * 86400 >= 60
+      BEGIN
+        INSERT INTO events(kind,agent_id,at)
+        VALUES(CASE WHEN OLD.id IS NOT NEW.id THEN 'rename' ELSE 'presence' END, NEW.id, NEW.last_seen);
+      END;
+      CREATE TRIGGER tokens_ai AFTER INSERT ON tokens BEGIN
+        INSERT INTO events(kind,agent_id,at) VALUES('token',NEW.agent_id,NEW.created_at);
+      END;
+      CREATE TRIGGER tokens_au AFTER UPDATE OF revoked_at ON tokens BEGIN
+        INSERT INTO events(kind,agent_id,at) VALUES('token',NEW.agent_id,NEW.revoked_at);
       END;`);
     bus.testDb.exec("DELETE FROM meta WHERE key='schema_version'");
     // a row written by the OLD trigger: tab-padded recipient indexed WITH the tab
@@ -405,9 +430,72 @@ describe("round-3 pins (m2 quirk, M5 forced collision, M6 trigger upgrade)", () 
     expect(sql).toContain("coalesce");
     const targets = (bus2.testDb.query("SELECT target FROM message_recipients WHERE msg='m-old' ORDER BY target").all() as any[]).map((r) => r.target);
     expect(targets).toEqual(["a", "b"]); // rebuilt via WSET trim: "\tb" → "b" — matches csv() parity
-    // NULL last_seen insert must no longer abort (coalesce live):
+    // n2: agents_ai was ALSO old-gen (no coalesce) ⇒ NULL last_seen only survives
+    // because the migration actually replaced it:
     bus2.testDb.run("INSERT INTO agents(id,role,joined_at,last_seen) VALUES('nulld','r','2026-01-01T00:00:00Z',NULL)");
     bus2.close(); rmSync(home, { recursive: true, force: true });
+  });
+
+  test("R1: migration is forward-only — a newer stored version keeps its triggers", () => {
+    const home = tmp();
+    const bus = loc(home);
+    // simulate a DB bumped to v99 by a NEWER binary with distinctive triggers
+    bus.testDb.exec("UPDATE meta SET value='99' WHERE key='schema_version'");
+    bus.testDb.exec("DROP TRIGGER msg_ai; CREATE TRIGGER msg_ai AFTER INSERT ON messages BEGIN SELECT 1; END;");
+    bus.close();
+    const bus2 = loc(home); // must NOT downgrade v99 triggers
+    const sql = (bus2.testDb.query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='msg_ai'").get() as any).sql;
+    expect(sql).toContain("SELECT 1"); // untouched
+    expect((bus2.testDb.query("SELECT value FROM meta WHERE key='schema_version'").get() as any).value).toBe("99");
+    bus2.close(); rmSync(home, { recursive: true, force: true });
+  });
+
+  test("R1: DROP+CREATE+rebuild+version share ONE txn — no trigger-less window (race probe)", async () => {
+    // Adapted from don-claude's zz_m6race.ts: a child process posts in a tight
+    // loop while the parent repeatedly forces version bumps + reopens. Every
+    // committed message must end up with its msg event — under the old
+    // two-txn migration, ~1% permanently lost theirs.
+    const home = tmp();
+    openBus({ home, mode: "local" }).close();
+    const child = Bun.spawn(["bun", import.meta.path.replace("bus.test.ts", "m6writer.ts"), home, "3000"], { stdout: "ignore", stderr: "ignore" });
+    await Bun.sleep(200);
+    const stopAt = Date.now() + 2500;
+    for (let i = 0; Date.now() < stopAt; i++) {
+      try {
+        const b = openBus({ home, mode: "local" });
+        b.testDb.run("UPDATE meta SET value='1' WHERE key='schema_version'"); // force next-bump
+        b.close();
+        openBus({ home, mode: "local" }).close(); // runs the atomic upgrade
+      } catch { /* SQLITE_BUSY under load is fine — the writer or a retry wins */ }
+    }
+    await child.exited;
+    const b = loc(home);
+    const noEvent = (b.testDb.query("SELECT count(*) c FROM messages m WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.kind='msg' AND e.msg_id=m.id)").get() as any).c;
+    const noRcpt = (b.testDb.query("SELECT count(*) c FROM messages m WHERE NOT EXISTS (SELECT 1 FROM message_recipients r WHERE r.msg=m.id)").get() as any).c;
+    const posted = (b.testDb.query("SELECT count(*) c FROM messages").get() as any).c;
+    expect(posted).toBeGreaterThan(20); // the probe actually did work
+    expect(noEvent).toBe(0); // zero lost events — the window is gone
+    expect(noRcpt).toBe(0);
+    b.close(); rmSync(home, { recursive: true, force: true });
+  }, 30_000);
+
+  test("R2: history snapshot reads MESSAGES, not events — legacy + gc'd rows stay visible", () => {
+    const home = tmp();
+    const bus = loc(home);
+    const ctx = localCtx("don");
+    for (let i = 0; i < 5; i++) bus.post(ctx, { from: "don", to: "alice", type: "note", body: `m${i}` });
+    // legacy row WITHOUT any event (pre-events era):
+    bus.testDb.run("INSERT INTO messages(id,thread,sender,recipients,type,status,body,created_at,channel) VALUES('m-legacy','m-legacy','don','alice','note','open','OLD','2024-01-01T00:00:00Z','general')");
+    // age ALL msg events out of retention and gc ⇒ events table empties
+    bus.testDb.run("UPDATE events SET at='2020-01-01T00:00:00Z' WHERE kind='msg'");
+    bus.gc();
+    const page = bus.history(ctx, { limit: 50 }) as any;
+    const bodies = page.value.rows.map((r: any) => r.body);
+    expect(bodies).toContain("OLD"); // legacy message visible
+    expect(bodies.filter((b: string) => /^m\d$/.test(b))).toHaveLength(5); // gc'd-event messages visible
+    // cursor = events high-water in the same txn ⇒ stream handoff has no hole
+    expect(page.value.cursor).toBe(`${bus.epoch()}.${(bus.testDb.query("SELECT coalesce(max(seq),0) m FROM events").get() as any).m}`);
+    bus.close(); rmSync(home, { recursive: true, force: true });
   });
 });
 

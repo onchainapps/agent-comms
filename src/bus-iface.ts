@@ -23,7 +23,7 @@ export interface Session {
   setStatus(p: { agent: string; id: string; state: string }): Promise<Res<{ id: string; status: string }>>;
   channels(): Promise<Res<{ name: string; n: number; last: string | null; purpose: string | null }[]>>;
   rename(p: { agent: string; to: string; fingerprint?: string | null }): Promise<Res<{ announced: MsgRow }>>;
-  history(p: { channel?: string | null; limit?: number; since?: string }): Promise<Res<{ rows: MsgRow[]; hasMore: boolean; cursor: { epoch: string; seq: number } }>>;
+  history(p: { channel?: string | null; limit?: number; since?: string }): Promise<Res<{ rows: MsgRow[]; hasMore: boolean; cursor: string }>>;
   waitStep(p: { for?: string; consumer?: string; since?: string }): Promise<Res<{ messages: MsgRow[]; cursor: string; done: boolean }>>;
   cursorGet(p: { consumer?: string }): Promise<Res<{ epoch: string; seq: number }>>;
   cursorSet(p: { consumer: string; cursor: string; force?: boolean }): Promise<Res<null>>;
@@ -48,7 +48,7 @@ export interface BusHandle {
  *  The `as never` casts only satisfy tsc's deferred conditional when M is
  *  generic (Bus<M> methods take Ctx<M>); the ctx reaching here is always the
  *  mode-correct one (serverCtx/localCtx constructors + ServerOnly param types). */
-export function wrapSession<B extends { readonly mode: Mode }>(bus: B, ctx: B["mode"] extends "server" ? Ctx<"server"> : Ctx<"local">): Session {
+export function wrapSession<B extends { readonly mode: Mode }>(bus: B, ctx: [B["mode"]] extends ["local"] ? Ctx<"local"> : Ctx<"server">): Session {
   return wrapSessionImpl(bus as unknown as Bus<Mode>, ctx as Ctx<Mode>);
 }
 function wrapSessionImpl<M extends Mode>(bus: Bus<M>, ctx: Ctx<M>): Session {

@@ -515,3 +515,15 @@ alias table; (b) group-dm channel naming rule; (c) should `read:all` be split in
 `read:all` (channels) + `read:dm` (DMs) so admins can be given omniview WITHOUT DM
 privacy? Recommendation: keep ONE scope for v1 simplicity (requirement says admin sees
 all), split later if needed.
+- **F2** — M1 round-4 deltas (sanctioned, post-rereview; supersedes nothing in F):
+  trigger migration is ONE IMMEDIATE txn with version re-read inside (DROP+CREATE+
+  recipient rebuild+version), **forward-only** (stored > current ⇒ leave triggers —
+  two binary generations can share one DB without flip-flop); history SNAPSHOT mode
+  pages over MESSAGES (`created_at DESC, rowid DESC`) with cursor = events high-water
+  read in the same txn — legacy and gc'd-event messages stay visible (§6 literal);
+  since-mode still pages over events; the cursor WIRE representation is exactly ONE
+  string `value.cursor = "<epoch>.<seq>"` (Ok<T> carries no parallel field); a STORED
+  cursor whose epoch ≠ current is a resync at every entry point (waitStep no-since
+  included) — rotateEpoch zeroes gc_floor, so the floor check alone cannot catch it;
+  wrapSession ctx conditional is NON-DISTRIBUTIVE ([B["mode"]] extends ["local"]) so
+  union/generic modes fail CLOSED to server ctx (H4-H6 probes).

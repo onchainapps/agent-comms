@@ -19,3 +19,6 @@ probe_*
 *.s
 *.o
 !bin/
+
+# Bus homes for local testing (mis-rooted COMMS_HOME lands here)
+.review-bus/

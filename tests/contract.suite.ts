@@ -203,13 +203,13 @@ export function contractSuite(name: string, make: Factory) {
         const page = (await root.history({ limit: 2 })) as any;
         expect(page.value.rows.map((r: any) => r.body)).toEqual(["m3", "m4"]); // NEWEST page
         expect(page.value.hasMore).toBe(true);
-        const tip = ((await root.history({})) as any).cursor as string;
-        expect(page.cursor).toBe(tip); // cursor == newest delivered == stream resume point
+        const tip = ((await root.history({})) as any).value.cursor as string;
+        expect(page.value.cursor).toBe(tip); // cursor == newest delivered == stream resume point
         // since=<page cursor> delivers only what came AFTER (nothing here)
-        const after = (await root.history({ since: page.cursor })) as any;
+        const after = (await root.history({ since: page.value.cursor })) as any;
         expect(after.value.rows.length).toBe(0);
         await root.post({ from: "root", to: "z", type: "note", body: "m5" });
-        const after2 = (await root.history({ since: page.cursor })) as any;
+        const after2 = (await root.history({ since: page.value.cursor })) as any;
         expect(after2.value.rows.map((r: any) => r.body)).toEqual(["m5"]); // no hole, no dup
         const bad = await root.history({ since: "deadbeefdeadbeef.5" });
         expect(bad.error).toBe("resync");
@@ -263,7 +263,7 @@ export function contractSuite(name: string, make: Factory) {
           const page = (await root.history({ since: cursor, limit: 3 })) as any;
           expect(page.error).toBeUndefined();
           seen.push(...page.value.rows.map((r: any) => r.id));
-          cursor = page.cursor;
+          cursor = page.value.cursor;
           if (!page.value.hasMore) break;
         }
         expect(seen).toEqual(ids); // ordered, no gaps, no dupes — the N-a hole is gone
@@ -285,6 +285,31 @@ export function contractSuite(name: string, make: Factory) {
         expect((w1 as any).data.floor).toBe(g.floor);
         // at-or-above floor: normal operation
         expect((await root.history({ since: `${raw.epoch()}.${g.floor}` })).error).toBeUndefined();
+      });
+    });
+
+    test("stored cursor in a PREVIOUS epoch ⇒ resync, never a silent seq-0 reset (grok round-3 #1)", async () => {
+      await withBus(async (h, root) => {
+        const raw = (h as any).raw;
+        const a = ((await seedAgent(h, root, "alice2", "r", [])) as any).value.session;
+        const carol = ((await seedAgent(h, root, "carol2", "r", [])) as any).value.session;
+        const p1 = await carol.post({ from: "carol2", to: "alice2", type: "note", body: "one" });
+        const p2 = await carol.post({ from: "carol2", to: "alice2", type: "note", body: "two" });
+        void p1;
+        // client consumed msg one only: commit a cursor at ITS event seq
+        const s1 = (raw.testDb.query("SELECT seq FROM events WHERE kind='msg' AND msg_id=?").get((p1 as any).value.id) as any).seq;
+        expect((await a.cursorSet({ consumer: "cli", cursor: `${raw.epoch()}.${s1}` })).error).toBeUndefined();
+        // epoch rotates (restore/rewrite); gc_floor resets to 0 — the floor
+        // check CANNOT fire, so only an epoch check can signal resync.
+        raw.rotateEpoch();
+        const w = await a.waitStep({ consumer: "cli" });
+        expect(w.error).toBe("resync");
+        expect((w as any).data.resync).toBe(true);
+        expect((w as any).data.epoch).toBe(raw.epoch()); // the NEW epoch for the client
+        // a cursor already at the new epoch (fresh client) is NOT a resync:
+        expect((await a.cursorSet({ consumer: "cli2", cursor: `${raw.epoch()}.0`, force: true })).error).toBeUndefined();
+        expect((await a.waitStep({ consumer: "cli2" })).error).toBeUndefined();
+        void s1; void p2;
       });
     });
 
