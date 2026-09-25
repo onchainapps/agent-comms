@@ -71,7 +71,7 @@ function wrapSessionImpl<M extends Mode>(bus: Bus<M>, ctx: Ctx<M>): Session {
     rename: (p) => a(bus.rename(c, p)),
     history: (p) => a(bus.history(c, p)),
     waitStep: (p) => a(bus.waitStep(c, p)),
-    cursorGet: (p) => a({ value: bus.cursorGet(ctx.principal.agentId, p.consumer ?? "default") }),
+    cursorGet: (p) => a(bus.cursorGet(ctx.principal.agentId, p.consumer ?? "default")),
     cursorSet: (p) => {
       const m = /^([0-9a-f]{8,64})\.(\d+)$/.exec(p.cursor);
       if (!m) return Promise.resolve({ error: "usage" as const, detail: "cursor must be <epoch>.<seq>" });

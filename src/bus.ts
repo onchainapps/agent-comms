@@ -855,11 +855,17 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const row = d.query("SELECT epoch, last_seq FROM cursors WHERE agent_id=? AND consumer=?").get(agentId, consumer) as any;
     return row ? { epoch: row.epoch, seq: row.last_seq } : null;
   }
-  function cursorGet(agentId: string, consumer: string): { epoch: string; seq: number } {
+  // M4 (grok round 4): a STORED foreign-epoch row is a resync signal, NOT a silent
+  // {epoch: current, seq: 0} collapse — that let clients feed cursor.get straight
+  // into waitStep(since) and skip GC'd unconsumed events, and let cursor.set stamp
+  // them caught up. Missing row stays {epoch, seq: 0}. Row is never rewritten here.
+  function cursorGet(agentId: string, consumer: string): Res<{ epoch: string; seq: number }> {
     const e = epoch();
     const row = cursorRaw(agentId, consumer);
-    if (!row || row.epoch !== e) return { epoch: e, seq: 0 };
-    return { epoch: e, seq: row.seq };
+    if (!row) return { value: { epoch: e, seq: 0 } };
+    if (row.epoch !== e)
+      return { error: "resync", detail: "cursor epoch stale (epoch rotated)", data: { resync: true, epoch: e } };
+    return { value: { epoch: e, seq: row.seq } };
   }
 
   function cursorSet(agentId: string, consumer: string, ep: string, seq: number, force = false): Res<null> {
@@ -868,8 +874,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const e = epoch();
     if (ep !== e) return { error: "resync", detail: "epoch mismatch; resync required", data: { resync: true, epoch: e } };
     if (seq < gcFloor()) return { error: "resync", detail: `cursor below retention floor`, data: { resync: true, epoch: e, floor: gcFloor() } };
-    const cur = cursorGet(agentId, consumer);
-    if (!force && seq < cur.seq) return { error: "conflict", detail: "cursor not monotonic (use force)" };
+    // M4: monotonic check compares against the RAW stored row ONLY when it shares
+    // the target epoch — a foreign-epoch row must not block the recovery commit.
+    const cur = cursorRaw(agentId, consumer);
+    if (!force && cur && cur.epoch === ep && seq < cur.seq) return { error: "conflict", detail: "cursor not monotonic (use force)" };
     d.run("INSERT INTO cursors(agent_id,consumer,epoch,last_seq) VALUES(?,?,?,?) ON CONFLICT(agent_id,consumer) DO UPDATE SET epoch=excluded.epoch,last_seq=excluded.last_seq",
       [agentId, consumer, ep, seq]);
     return { value: null };
@@ -918,7 +926,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
           ? d.query("SELECT * FROM messages WHERE channel=? ORDER BY created_at DESC, rowid DESC LIMIT ?")
           : d.query("SELECT * FROM messages ORDER BY created_at DESC, rowid DESC LIMIT ?");
         const got = (p.channel ? q.all(p.channel, limit + 1) : q.all(limit + 1)) as MsgRow[];
-        const hw = (d.query("SELECT coalesce(max(seq),0) m FROM events").get() as any).m as number;
+        const hw = Math.max((d.query("SELECT coalesce(max(seq),0) m FROM events").get() as any).m as number, gcFloor());
         d.exec("COMMIT");
         const rows = got.slice(0, limit).reverse();
         return { value: { rows, hasMore: got.length > limit, cursor: `${epoch()}.${hw}` } };
@@ -934,7 +942,12 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       const lastSeq = page.length ? page[page.length - 1].seq : seqFrom;
       d.exec("COMMIT");
       return { value: { rows, hasMore, cursor: `${epoch()}.${lastSeq}` } };
-    } catch (e) { d.exec("ROLLBACK"); throw e; }
+    } catch (e) {
+      // M4 (grok round 3 nit): history must not throw out of the Res contract
+      // (post/rename precedent) — a SQL failure is `internal`, same as everywhere.
+      d.exec("ROLLBACK");
+      return { error: "internal", detail: `history: ${String(e)}` };
+    }
   }
 
   /** finding 9/11: the inboxWait SCAN lives here — server-reachable, fully

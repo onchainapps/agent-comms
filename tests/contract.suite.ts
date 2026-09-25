@@ -313,6 +313,38 @@ export function contractSuite(name: string, make: Factory) {
       });
     });
 
+    test("session cursorGet on a foreign-epoch row ⇒ resync; recovery commit accepted (grok round-4 #1)", async () => {
+      await withBus(async (h, root) => {
+        const raw = (h as any).raw;
+        const a = ((await seedAgent(h, root, "alice3", "r", [])) as any).value.session;
+        const carol = ((await seedAgent(h, root, "carol3", "r", [])) as any).value.session;
+        const p1 = await carol.post({ from: "carol3", to: "alice3", type: "note", body: "seen" });
+        const p2 = await carol.post({ from: "carol3", to: "alice3", type: "note", body: "UNCONSUMED" });
+        // commit cursor at p1's event seq — p2's event is UNCONSUMED
+        const s1 = (raw.testDb.query("SELECT seq FROM events WHERE kind='msg' AND msg_id=?").get((p1 as any).value.id) as any).seq;
+        expect((await a.cursorSet({ consumer: "cli", cursor: `${raw.epoch()}.${s1}` })).error).toBeUndefined();
+        // gc so p2's event is deleted (floor above s1): age it past retention first
+        raw.testDb.run("UPDATE events SET at = datetime('now','-59 days') WHERE msg_id = ?", [(p2 as any).value.id]);
+        raw.gc();
+        expect(raw.gcFloor()).toBeGreaterThan(s1);
+        // epoch rotates (restore/rewrite): gc_floor resets to 0 ⇒ floor check cannot fire
+        const e2 = raw.rotateEpoch();
+        // SESSION cursorGet — the exact hole: must be resync, NOT {value:{seq:0}}
+        const cg = await a.cursorGet({ consumer: "cli" });
+        expect(cg.error).toBe("resync");
+        expect((cg as any).data.resync).toBe(true);
+        expect((cg as any).data.epoch).toBe(e2);
+        // the stored row was NOT rewritten by the failed get
+        expect((raw.testDb.query("SELECT epoch FROM cursors WHERE agent_id='alice3' AND consumer='cli'").get() as any).epoch).not.toBe(e2);
+        // recovery commit: explicit current-epoch set succeeds despite the foreign row
+        expect((await a.cursorSet({ consumer: "cli", cursor: `${e2}.0` })).error).toBeUndefined();
+        // and history snapshot hands off a floor-safe cursor the client can resume from
+        const hist = await root.history({ limit: 10 }); // read:all lives on root
+        expect((hist as any).value.rows.map((r: any) => r.body)).toContain("UNCONSUMED");
+        expect((await a.waitStep({ consumer: "cli", since: (hist as any).value.cursor })).error).toBeUndefined();
+      });
+    });
+
     test("bad credential ⇒ unauthorized via resolve() (finding 10c)", async () => {
       await withBus(async (h) => {
         expect(h.resolve({ token: "ac_notarealtokenatall1234" }).error).toBe("unauthorized");

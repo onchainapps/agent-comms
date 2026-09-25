@@ -32,7 +32,7 @@ serverHandle(loc2);
 // @ts-expect-error H3: local core must not satisfy Bus<"server">
 const _asServer: typeof srv2 = loc2;
 void _asServer;
-// H4..H7 (round-3 n1): union/unknown mode must fail CLOSED to server ctx —
+// H4..H6, H8 (round-3 n1): union/unknown mode must fail CLOSED to server ctx —
 // the conditional is non-distributive ([B["mode"]] extends ["local"]).
 import { openBus as ob3 } from "../src/bus.ts";
 import type { Bus as BusT, Mode as ModeT } from "../src/bus.ts";
@@ -44,5 +44,8 @@ wrapSession(uni, lc2("mallory"));
 // @ts-expect-error H6: a generic forwarder cannot present Ctx<M> to the fail-closed seam
 function fwd<M extends ModeT>(b: BusT<M>, c: import("../src/bus.ts").Ctx<M>): void { wrapSession(b, c); }
 void fwd;
+// @ts-expect-error H7 (claude round-4 m2): a widened union-mode bus must not pass
+// as a server core into serverHandle (mode discriminant, not structure)
+serverHandle(uni);
 // @ts-expect-error H8: union-mode serverHandle input must be a concrete server core
 serverHandle(ob3({ home: "/nonexistent-probe5", mode: "local" as ModeT }));

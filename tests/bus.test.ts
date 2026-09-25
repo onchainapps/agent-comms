@@ -202,15 +202,21 @@ describe("cursors (§6)", () => {
   test("per-consumer isolation; monotonic unless force; epoch mismatch ⇒ resync error with data", () => {
     const home = tmp();
     const bus = srv(home);
-    expect(bus.cursorGet("a", "cli").seq).toBe(0);
+    expect((bus.cursorGet("a", "cli") as any).value.seq).toBe(0);
     bus.cursorSet("a", "cli", bus.epoch(), 10);
     bus.cursorSet("a", "mcp", bus.epoch(), 3);
-    expect(bus.cursorGet("a", "cli").seq).toBe(10);
-    expect(bus.cursorGet("a", "mcp").seq).toBe(3);
+    expect((bus.cursorGet("a", "cli") as any).value.seq).toBe(10);
+    expect((bus.cursorGet("a", "mcp") as any).value.seq).toBe(3);
     expect(bus.cursorSet("a", "cli", bus.epoch(), 5).error).toBe("conflict");
     expect(bus.cursorSet("a", "cli", bus.epoch(), 5, true).error).toBeUndefined();
     const e2 = bus.rotateEpoch();
-    expect(bus.cursorGet("a", "cli")).toEqual({ epoch: e2, seq: 0 }); // mismatch ⇒ resync baseline
+    // M4 (grok round 4): stored foreign-epoch row ⇒ resync, NOT a seq-0 collapse
+    const cg = bus.cursorGet("a", "cli");
+    expect(cg.error).toBe("resync");
+    expect((cg as any).data.resync).toBe(true);
+    expect((cg as any).data.epoch).toBe(e2);
+    // recovery commit: explicit current-epoch set is NOT blocked by the foreign row
+    expect(bus.cursorSet("a", "cli", e2, 0).error).toBeUndefined();
     const r = bus.cursorSet("a", "cli", "deadbeefdead", 7);
     expect(r.error).toBe("resync"); // N3: typed resync, not not_found
     expect((r as any).data.resync).toBe(true);
@@ -493,8 +499,17 @@ describe("round-3 pins (m2 quirk, M5 forced collision, M6 trigger upgrade)", () 
     const bodies = page.value.rows.map((r: any) => r.body);
     expect(bodies).toContain("OLD"); // legacy message visible
     expect(bodies.filter((b: string) => /^m\d$/.test(b))).toHaveLength(5); // gc'd-event messages visible
-    // cursor = events high-water in the same txn ⇒ stream handoff has no hole
-    expect(page.value.cursor).toBe(`${bus.epoch()}.${(bus.testDb.query("SELECT coalesce(max(seq),0) m FROM events").get() as any).m}`);
+    // cursor = events high-water in the same txn ⇒ stream handoff has no hole.
+    // round-4 (don-claude P1): the high-water is max(max(seq), gc_floor) — after
+    // gc the surviving max(seq) can sit BELOW the floor (here: presence seq 1,
+    // floor 7), and a sub-floor cursor resyncs at every since-entry point.
+    const hw = Math.max((bus.testDb.query("SELECT coalesce(max(seq),0) m FROM events").get() as any).m, bus.gcFloor());
+    expect(page.value.cursor).toBe(`${bus.epoch()}.${hw}`);
+    // the handoff cursor must be ACCEPTED by every since-bearing entry point:
+    expect((bus.history(ctx, { since: page.value.cursor }) as any).error).toBeUndefined();
+    expect((bus.waitStep(ctx, { since: page.value.cursor }) as any).error).toBeUndefined();
+    const [ep, sq] = page.value.cursor.split(".");
+    expect(bus.cursorSet("don", "cli", ep, Number(sq)).error).toBeUndefined();
     bus.close(); rmSync(home, { recursive: true, force: true });
   });
 });

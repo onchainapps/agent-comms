@@ -252,7 +252,7 @@ Three orthogonal axes:
 | `thread` / `receipts` | `{id}` | ungated (§5 visibility) |
 | `status` | `{id, state}` | permission per §5 |
 | `channels` | `{}` | unions channels table (empty channels included) |
-| `history` | `{channel?, since?, limit?}` | needs `read:all`; SQL-filtered, indexed. Snapshot rows **and** high-water cursor (`max(events.seq)`) read **in the same read txn**; cursor is the events high-water, not max over paged rows; returned as `<epoch>.<seq>` for the stream handoff (§6-stream). Snapshot↔stream dedupe is **by msg_id** (history returns messages, not events). |
+| `history` | `{channel?, since?, limit?}` | needs `read:all`; SQL-filtered, indexed. **Snapshot mode (no `since`):** rows are MESSAGES (`created_at DESC, rowid DESC`, newest page, returned oldest-first) — messages stay visible even when their events are gc'd or predate events; cursor = `max(max(events.seq), gc_floor)` read **in the same txn** (floor-clamped so the handoff cursor is never below retention ⇒ never instant-resyncs/livelocks), returned as `<epoch>.<seq>`. **Since mode:** pages EVENTS ASC (oldest unseen first), cursor = last delivered event, paging to `hasMore=false` delivers every row exactly once. Snapshot↔stream dedupe is **by msg_id** (history returns messages, not events). `cursor.get` on a stored foreign-epoch row is a **resync** (never a silent seq-0 collapse); a missing row is `{epoch, seq: 0}`; an explicit current-epoch `cursor.set` is the recovery commit and is not blocked by the foreign row's monotonic check. |
 | `login` / `logout` | `{token}` / `{}` | web UI only; sets/clears HttpOnly session cookie; store **in-memory — restart = logout**; **unauthenticated `login` is also CSRF-guarded per §8** |
 | `stream.ticket` | `{}` | → `{ticket}` 60 s single-use — **non-cookie clients only** (§6-stream) |
 | `inbox.wait` | `{for?, consumer?, since?, timeout?, epoch?}` | long-poll ≤60 s → `{messages[], cursor}`; `since` defaults from stored cursor for `(principal, consumer)`; **never auto-advances** — client commits via `cursor.set` (at-least-once); **does not write `reads` rows** (peek semantics; acking is explicit); the primitive for scripts/MCP |
@@ -289,8 +289,9 @@ sends it automatically, so native reconnect + `Last-Event-ID` work unmodified (s
 tickets in a query string break exactly that: EventSource reuses the consumed URL, gets 401,
 spec fails the connection permanently). Tickets remain for non-cookie clients that can't set
 headers; such a client constructs a fresh EventSource with `since=<last delivered epoch.seq>`.
-**Handoff:** `history` returns high-water cursor from the same txn as its rows (§6 table);
-stream opens `since=<cursor>`; dedupe by msg_id. Long-lived bearer never in a query string
+**Handoff:** snapshot `history` returns the floor-clamped events high-water
+(`max(max(seq), gc_floor)`) from the same txn as its rows (§6 table); stream opens
+`since=<cursor>`; dedupe by msg_id. Long-lived bearer never in a query string
 (nginx logs).
 
 **Watch durability:** `watch` persists its cursor via `cursors(agent_id, consumer)` so messages
@@ -442,12 +443,17 @@ rebaseline quirk through M1 (goldens hold); cursor-backed watch lands in M3.
   trigger migration is ONE IMMEDIATE txn with version re-read inside (DROP+CREATE+
   recipient rebuild+version), **forward-only** (stored > current ⇒ leave triggers —
   two binary generations can share one DB without flip-flop); history SNAPSHOT mode
-  pages over MESSAGES (`created_at DESC, rowid DESC`) with cursor = events high-water
-  read in the same txn — legacy and gc'd-event messages stay visible (§6 literal);
+  pages over MESSAGES (`created_at DESC, rowid DESC`) with cursor = floor-clamped events
+  high-water `max(max(seq), gc_floor)` read in the same txn — legacy and gc'd-event
+  messages stay visible (§6 literal) and the handoff cursor can never sit below
+  retention (else every since-entry point resyncs and the client livelocks);
   since-mode still pages over events; the cursor WIRE representation is exactly ONE
   string `value.cursor = "<epoch>.<seq>"` (Ok<T> carries no parallel field); a STORED
-  cursor whose epoch ≠ current is a resync at every entry point (waitStep no-since
-  included) — rotateEpoch zeroes gc_floor, so the floor check alone cannot catch it;
+  cursor whose epoch ≠ current is a resync at EVERY entry point — waitStep no-since AND
+  cursor.get (which returns Res, never a silent seq-0 collapse; the failed get must not
+  rewrite the row, and an explicit current-epoch cursor.set is the recovery commit,
+  unblocked by the foreign row) — rotateEpoch zeroes gc_floor, so the floor check alone
+  cannot catch it;
   wrapSession ctx conditional is NON-DISTRIBUTIVE ([B["mode"]] extends ["local"]) so
   union/generic modes fail CLOSED to server ctx (H4-H6 probes).
 
