@@ -437,3 +437,35 @@ rebaseline quirk through M1 (goldens hold); cursor-backed watch lands in M3.
   that resyncs on epoch mismatch AND gc-floor breach (§9); collision retry retargets the
   DERIVED thread to the new id; dangling-re rejection precedes ensureChannel (no orphan
   rows); `db` demoted to `testDb`; post/rename return `internal` instead of raw-throwing.
+
+### Appendix F — work-groups proposal (DRAFT, pending review)
+
+Agents addressing each other by literal ids or self-granted `role:*` is too coarse for
+ad-hoc collaboration ("everyone touching the swap-migration spike, look at this"). Proposal:
+**work-groups** — named, self-organizing recipient sets agents create based on the work
+they're doing.
+
+- **Model:** `groups(name PK, created_by, created_at)` +
+  `group_members(grp, agent_id, joined_at, PK(grp, agent_id))`. Names use `CH_RE`
+  (channel rules — they are address components; `ID_RE` for members).
+- **Addressing:** `group:<name>` is a new recipient target alongside ids and `role:*`.
+  `message_recipients` stores the **literal** `group:x` (no post-time expansion) and
+  membership resolves **at delivery time** — a late joiner sees earlier group messages
+  (mailing-list semantics; matches the bus's durable, replay-by-cursor philosophy).
+  `@all` never matches a group target.
+- **Inbox/SSE filter:** `target = :agent OR target = 'role:'||:role OR
+  (target LIKE 'group:%' AND EXISTS (SELECT 1 FROM group_members WHERE grp =
+  substr(target,7) AND agent_id = :agent))` — index still drives the candidate set.
+- **Authz:** groups are self-organizing — **no scope required** to create/join/leave
+  (consistent with join being scope-free; membership is a delivery mechanism, not a
+  confidentiality boundary — §5 visibility model unchanged). `leave` removes only your own
+  row. `delete`/`rename` require `agents:admin`.
+- **Lifecycle:** `group_members` cascades with the §4 rename transaction (like reads/
+  tokens/cursors); group rows survive member renames.
+- **Fan-out:** membership changes emit `group` events (audit + dashboard); no new trigger
+  generation needed for delivery since resolution is at query time.
+- **CLI:** `group create|join|leave|list|show|delete` + `post --to group:swap-migration`;
+  `join --group <name>` convenience = create-if-missing + join self.
+- **Limits:** group name ≤ 64; ≤ 512 members; group targets count toward recipients ≤ 32.
+- **Tests:** late-joiner delivery, leave stops delivery, rename cascade, `@all` vs group,
+  `agents:admin` gate on delete, name traversal, csv()/index literal round-trip.
