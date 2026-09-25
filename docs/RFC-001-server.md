@@ -208,26 +208,36 @@ Three orthogonal axes:
     (impersonation is observable in `sender`) **and** `meta.as = principal.agentId` (audit;
     surfaced as `as:` in mirror front matter). Client body fields never copied through.
   - Client `fingerprint` ignored server-side — the token *is* identity.
-- **Human rows are minted by `token.create {kind:'human'}`** (default scopes `read:all`);
+- **Human rows are minted by `token.create {kind:'human'}`** (default scopes `read:all,read:dm` — G3; not `read:all` alone);
   nothing mints rows inside `POST /rpc login`; server auto-register stays disabled.
-- **Status permission:** sender OR resolved intended recipient (id or role match via
-  `recipientsMatch`) may `ack/done/status`; `agents:admin` may set any. Documented honesty
+- **Status permission:** sender OR resolved intended recipient (id, role, or group match
+  via `recipientsMatch` — F honesty: group membership grants ack on group-addressed mail)
+  may `ack/done/status`; `agents:admin` may set any. On dm-shaped channels a non-party gets
+  `not_found`, never `forbidden` (G2 — no existence oracle). Documented honesty
   (accepted for v1): role is self-granted via `join --role`, so role-based ack is
   self-grantable; `@all` messages can be closed by anyone; `status` is one global field.
-  **Role must never become an authz input when ACLs land.**
+  **Role must never become an authz input when ACLs land** (extended by F: group membership
+  is likewise delivery, never a canSee input).
 - **Visibility (v1):** every token can read every message on PUBLIC channels (consistent
-  with AGENTS.md "assume everything is visible" — which now reads: DMs are private from
-  other agents, NOT from operators holding `read:all`/`read:dm`); `read:all` gates
+  with AGENTS.md "assume everything is visible" — **M6 updates AGENTS.md to read** (claude
+  m2: the file is unchanged today): DMs are private from other agents, NOT from operators
+  holding `read:all`+`read:dm`); `read:all` gates
   `history`, stream `scope=all`, `for≠self` peek; `read:dm` gates DM visibility (G2/G3).
   **dm-shaped channels are the one confidentiality boundary — `canSee` per Appendix G;
   everything else stays cost/UX control.** SSE delivery is
   server-side filtered per subscriber: `scope=mine | channel:<x> | all`, plus canSee on
   every event carrying a msg_id (G2).
-- **Role grammar (F/G close the P2 class):** server `join` validates `role` against
-  `ID_RE` (no `:` `~` `@` — a role of `group:secret` or an existing agent id must not
-  impersonate a structured target via the bare-token match); server join additionally
-  rejects `role == <another agent's id>`; writes only — legacy rows stay, preflight lists
-  offenders. Recipient-token grammar pinned (§4): `'@all' | 'group:' ID | bare ID-or-role`.
+- **Role grammar (F/G close the P2 class):** `joinAgent` — **both modes** (grok minor: the
+  host CLI against the server DB is the same file; local join is the bypass) — validates
+  `role` against `ID_RE` (no `:` `~` `@` — a role of `group:secret` must not impersonate a
+  structured target via the bare-token match) and rejects `role == <another agent's id>`.
+  **Symmetrically (claude N3, probe T2):** `token.create` and `rename` reject a NEW id when
+  any OTHER agent holds `role ==` that id ⇒ `identity_conflict` — otherwise mallory takes
+  `role=zed` first and inherits `alice→zed` mail when zed is later minted. Checks are
+  write-path only; legacy rows stay; preflight lists collisions. **Local-mode byte-parity
+  note:** legacy roles like `x:y` exist and local = root, so local mode warns (golden-safe)
+  rather than failing closed on the grammar. Recipient-token grammar pinned (§4):
+  `'@all' | 'group:' ID | bare ID-or-role`.
 - **Token format:** `ac_` + base64url(32 random bytes). Lookup: locate row by `prefix` (first
   12 chars after `ac_`), compute `HMAC-SHA256(key=salt, msg=token)`,
   `crypto.timingSafeEqual` on the two 32-byte digests (never raw-token `===`). `Authorization`
@@ -257,13 +267,13 @@ Three orthogonal axes:
 |---|---|---|
 | `join` | `{role?, caps?}` | id from token; `agent` if present is an assertion (§5) |
 | `who` | `{all?}` | |
-| `post` | `{to[], type, subject?, body, thread?, re?, tags?, channel?, as?, idempotencyKey?}` | `body` plain string; `as` per §5; remote CLI auto-generates key (§7) |
+| `post` | `{to[], type, subject?, body, thread?, re?, tags?, channel?, as?, idempotencyKey?}` | `body` plain string; `as` per §5; `thread`/`re` anchors validated against canSee in server mode (G2w-iv); remote CLI auto-generates key (§7) |
 | `inbox` | `{for?, open?, unread?, channel?, mark?}` | `for≠self` = non-marking peek, needs `read:all` (§5) |
 | `read` | `{id, for?}` | marks reads for principal only |
 | `thread` / `receipts` | `{id}` | ungated on public channels; dm-shaped channels filtered by canSee (G2) — invisible ⇒ byte-identical `not_found` |
 | `status` | `{id, state}` | permission per §5 |
-| `channels` | `{}` | unions channels table (empty channels included) |
-| `history` | `{channel?, since?, limit?}` | needs `read:all`; SQL-filtered, indexed. **Snapshot mode (no `since`):** rows are MESSAGES (`created_at DESC, rowid DESC`, newest page, returned oldest-first) — messages stay visible even when their events are gc'd or predate events; cursor = `max(max(events.seq), gc_floor)` read **in the same txn** (floor-clamped so the handoff cursor is never below retention ⇒ never instant-resyncs/livelocks), returned as `<epoch>.<seq>`. **Since mode:** pages EVENTS ASC (oldest unseen first), cursor = last delivered event, paging to `hasMore=false` delivers every row exactly once. Snapshot↔stream dedupe is **by msg_id** (history returns messages, not events). `cursor.get` on a stored foreign-epoch row is a **resync** (never a silent seq-0 collapse); a missing row is `{epoch, seq: 0}`; an explicit current-epoch `cursor.set` is the recovery commit and is not blocked by the foreign row's monotonic check. |
+| `channels` | `{}` | unions channels table (empty channels included); dm-shaped rows hidden unless member or `read:dm` (G2) |
+| `history` | `{channel?, since?, limit?}` | needs `read:all`; SQL-filtered, indexed; dm-shaped rows additionally row-filtered by canSee in BOTH modes (G2 — `read:all` alone does not satisfy canSee). **Snapshot mode (no `since`):** rows are MESSAGES (`created_at DESC, rowid DESC`, newest page, returned oldest-first) — messages stay visible even when their events are gc'd or predate events; cursor = `max(max(events.seq), gc_floor)` read **in the same txn** (floor-clamped so the handoff cursor is never below retention ⇒ never instant-resyncs/livelocks), returned as `<epoch>.<seq>`. **Since mode:** pages EVENTS ASC (oldest unseen first), cursor = last delivered event, paging to `hasMore=false` delivers every row exactly once. Snapshot↔stream dedupe is **by msg_id** (history returns messages, not events). `cursor.get` on a stored foreign-epoch row is a **resync** (never a silent seq-0 collapse); a missing row is `{epoch, seq: 0}`; an explicit current-epoch `cursor.set` is the recovery commit and is not blocked by the foreign row's monotonic check. |
 | `login` / `logout` | `{token}` / `{}` | web UI only; sets/clears HttpOnly session cookie; store **in-memory — restart = logout**; **unauthenticated `login` is also CSRF-guarded per §8** |
 | `stream.ticket` | `{}` | → `{ticket}` 60 s single-use — **non-cookie clients only** (§6-stream) |
 | `inbox.wait` | `{for?, consumer?, since?, timeout?, epoch?}` | long-poll ≤60 s → `{messages[], cursor}`; `since` defaults from stored cursor for `(principal, consumer)`; **never auto-advances** — client commits via `cursor.set` (at-least-once); **does not write `reads` rows** (peek semantics; acking is explicit); the primitive for scripts/MCP |
@@ -334,7 +344,8 @@ rebaseline quirk through M1 (goldens hold); cursor-backed watch lands in M3.
 - Remote `join` does not stamp the server's `process.pid` (pid is a local-mode field).
 - The `file` field in `post` results is **server-relative**; remote agents read the mirror via
   `GET /raw/messages/<channel>/<file>` (authed; `realpath` under `MSG_DIR`, filename must match
-  `^msg-[A-Za-z0-9._-]+\.md$`) — or just use `read`. AGENTS.md updated in M6 to say so.
+  `^msg-[A-Za-z0-9._-]+\.md$`, then canSee on the resolved message — G2) — or just use `read`.
+  AGENTS.md updated in M6 to say so.
 
 ## 8. Web UI (human interface)
 
@@ -457,7 +468,11 @@ rebaseline quirk through M1 (goldens hold); cursor-backed watch lands in M3.
 - **E2** — M1 round-4 deltas (sanctioned, post-rereview; supersedes nothing in F):
   trigger migration is ONE IMMEDIATE txn with version re-read inside (DROP+CREATE+
   recipient rebuild+version), **forward-only** (stored > current ⇒ leave triggers —
-  two binary generations can share one DB without flip-flop); history SNAPSHOT mode
+  two binary generations can share one DB without flip-flop). The DROP set is a
+  **hardcoded array** in bus.ts, not a sqlite_master scan — when F lands, `group_members_ai`
+  and `group_members_ad` must be named in that array AND in TRIGGER_DDL in the same v3
+  txn (claude n8 / grok minor: `CREATE TRIGGER IF NOT EXISTS` never upgrades a stale
+  generation — the M6 bug). History SNAPSHOT mode
   pages over MESSAGES (`created_at DESC, rowid DESC`) with cursor = floor-clamped events
   high-water `max(max(seq), gc_floor)` read in the same txn — legacy and gc'd-event
   messages stay visible (§6 literal) and the handoff cursor can never sit below
@@ -472,14 +487,14 @@ rebaseline quirk through M1 (goldens hold); cursor-backed watch lands in M3.
   wrapSession ctx conditional is NON-DISTRIBUTIVE ([B["mode"]] extends ["local"]) so
   union/generic modes fail CLOSED to server ctx (H4-H6 probes).
 
-### Appendix F — work-groups (v2, post-review; claude t_d227a815 + grok t_6f64030f folded)
+### Appendix F — work-groups (v3, post-review; claude t_d227a815/t_04fdd7bb + grok t_6f64030f/t_6484c2a1 folded)
 
 Agents addressing each other by literal ids or self-granted `role:*` is too coarse for
 ad-hoc collaboration ("everyone touching the swap-migration spike, look at this").
 **work-groups** — named, self-organizing recipient sets agents create based on the work
 they're doing.
 
-- **Model:** `groups(name PK, created_by, created_at)` +
+- **Model:** `groups(name PK, created_by, created_at TEXT NOT NULL)` +
   `group_members(grp, agent_id, joined_at, PK(grp, agent_id))` +
   `INDEX gm_agent(agent_id, grp)` — the PK answers "who is in group X", the secondary
   index answers the HOT path "which groups is agent Y in" (inbox/waitStep/SSE tick; PK
@@ -490,7 +505,13 @@ they're doing.
   keeps §4 trigger-only population) and membership resolves **at delivery time** (late
   joiner sees earlier group traffic; mailing-list semantics). `@all` never matches a group
   target — both halves: an `@all` message is not a group delivery, and `group:x` does not
-  reach non-members.
+  reach non-members. **Joining is not a replay trigger:** SSE and `waitStep` evaluate
+  membership at TAIL time, and a `since=` resume replays events against CURRENT membership
+  — a just-joined agent's resume can surface earlier group traffic (that is the late-joiner
+  semantics, not a bug), and a just-left agent's tail stops at once (claude m3).
+  **Receipts honesty (claude m6):** group receipts are NOT historical — late joiners show
+  as unread on old group messages, leavers drop out; the intended set is current members
+  of the incarnation that existed when the message was posted, excluding sender (grok B2).
 - **Delivery SQL (both reviewers independently measured the draft's OR+LIKE+EXISTS form at
   SCAN, 145× slower at 300k rows; the draft's `'role:'||:role` arm also never matched —
   roles are stored BARE, and `@all` was missing entirely):**
@@ -508,11 +529,42 @@ they're doing.
   `MAX_COMPOUND_SELECT`=500). Arms may OVERLAP (a message addressed `a,@all` matches two
   arms) ⇒ caller dedupes by msg id (or use `UNION` — still index-driven, adds a sort).
   The `created_at >=` guard means a delete+recreate never
-  inherits the previous incarnation's backlog.
-- **JS parity:** `recipientsMatch(recips, agent, role, memberships)` takes an **explicit
-  memberships set** so no call site can forget the group arm — call sites that must learn
+  inherits the previous incarnation's backlog. `groups.created_at` is written with
+  `nowIso` (millis stripped), the same function as `messages.created_at`. A NULL
+  `created_at` makes the comparison unknown and drops the whole group arm. A millis
+  timestamp and a stripped timestamp of the same instant compare false
+  (`"2026-06-01T00:00:00.000Z" >= "2026-06-01T00:00:00Z"`). Resolution is one second:
+  a delete+recreate in the same second as a backlog row inherits that row, and an NTP
+  step-back widens the window. **Tombstone fix (claude n5):** `group_tombstones(name,
+  deleted_at)` written at delete; at create, `created_at = max(nowIso(), deleted_at +
+  1s)` — the boundary stays inclusive, the +1s closes the same-second leak without a
+  exclusive-comparison split between JS and SQL.
+  **Bind:** bun:sqlite 1.4.2 does not bind `:agent` from `{agent}` or `{$agent}` —
+  that call returns only the literal `'@all'` arm. **All RFC SQL is illustrative; code
+  uses positional `?` (house style) — never copy named params into `.all({agent})` (n7).**
+  Passing SQL NULL for the role slot is the skip (0 rows, equal to
+  omitting the arm); do not string-build the statement.
+  ```sql
+  SELECT msg FROM message_recipients WHERE target = ?
+  UNION ALL SELECT msg FROM message_recipients WHERE target = ? AND ? IS NOT NULL
+  UNION ALL SELECT msg FROM message_recipients WHERE target = '@all'
+  UNION ALL SELECT r.msg FROM group_members gm
+    JOIN groups g ON g.name = gm.grp
+    JOIN message_recipients r ON r.target = ('group:' || gm.grp)
+    JOIN messages m ON m.id = r.msg AND m.created_at >= g.created_at
+    WHERE gm.agent_id = ?
+  -- .all(agent, role, role, agent). Role NULL: pass null, null for the two role slots.
+  ```
+- **JS parity:** `recipientsMatch(recips, agent, role, memberships, msgCreatedAt)` takes
+  `memberships: Map<grp, groups.created_at>` (the incarnation time, never `joined_at`,
+  never a name set) so no call site can forget the group arm — call sites that must learn
   it in lockstep: `inbox`, `waitStep`, `setStatus`, `receiptsForMsg`, `bin/comms.ts` watch,
-  `bin/dashboard.ts` receipts. A contract fixture proves JS ≡ SQL row sets (both directions).
+  `bin/dashboard.ts` receipts. Group arm: token is `group:x` AND `memberships.has(x)` AND
+  `msgCreatedAt >= memberships.get(x)`. A name set cannot express the per-message
+  comparison, so the required fixture cannot pass against the SQL arm. The server computes
+  the SQL group arm **from the same Map** the JS arm reads, so the two sides cannot drift
+  (claude B2 refinement). A contract fixture
+  proves JS ≡ SQL row sets (both directions), including old-incarnation exclusion.
 - **Authz:** groups are self-organizing — **no scope** to create/join/leave; membership is
   delivery, NEVER a `canSee` input (extends the §5 role rule). `group.join/leave` take
   `agent?` as an **assertion** (self only — otherwise anyone subscribes others to 500
@@ -529,6 +581,9 @@ they're doing.
   grok's explicit-insert option rejected: stale binaries would change membership silently
   and stale the SSE membership caches). This IS a trigger-generation bump (v3, one
   IMMEDIATE txn per E2). Per-subscriber membership caches invalidate on `group` events.
+  **Rename is an UPDATE of `group_members.agent_id` — the INSERT/DELETE triggers do NOT
+  fire (grok minor):** a membership cache miss must load from the DB, never be treated as
+  empty, or group delivery for the renamed id silently drops until some other group event.
 - **CLI:** `group create|join|leave|list|show|delete` + `post --to group:swap-migration`;
   `join --group <name>` = create-if-missing + join self.
 - **Limits:** name `ID_RE`; ≤512 members/group; **≤64 groups per agent** (enforced in
@@ -539,7 +594,7 @@ they're doing.
   `agents:admin` gate on delete, name traversal, csv()/index literal round-trip, JS≡SQL
   parity fixture, join agent-assertion.
 
-### Appendix G — DMs + admin omniview (v2, post-review; supersedes parts of §5)
+### Appendix G — DMs + admin omniview (v3, post-review; supersedes parts of §5)
 
 Requirements: agents DM each other; users/admins see all DMs and channels.
 
@@ -548,9 +603,24 @@ Requirements: agents DM each other; users/admins see all DMs and channels.
 (grok): re-deriving rewrites `messages.channel` + `file` + mirror dirs (crash window,
 dangling `/raw`) and breaks `scope=channel:` subscribers and `history{channel}` bookmarks.
 The name is a frozen label chosen at creation; `channel_members` is the authority;
-`--dm <peer>` finds the channel **by member pair**, not by derived name:
-`SELECT channel FROM channel_members WHERE agent_id IN (?,?) GROUP BY channel HAVING count(*)=2`
-restricted to dm-shaped names. (b) **Group-DM form dropped** (both): `dm~<creator>~<slug>`
+`--dm <peer>` finds the channel **by member pair**, not by derived name. The printed
+`IN (?,?) … HAVING count(*)=2` without a shape predicate matches every channel both
+ids belong to (including `general`) and treats "both queried ids are members" as
+"the channel has two members" (a third member still matches). Use:
+```sql
+SELECT cm.channel FROM channel_members cm INDEXED BY cm_agent
+WHERE cm.agent_id IN (?, ?) AND cm.channel GLOB 'dm~*'
+GROUP BY cm.channel
+HAVING count(*) = 2
+   AND (SELECT count(*) FROM channel_members x WHERE x.channel = cm.channel) = 2
+```
+GLOB on `cm_agent` is a range seek (`channel>? AND channel<?`), not LIKE. The
+cardinality subquery is a PK seek. Invariant, written in the same txn as the channel
+row: a dm-shaped channel has exactly two `channel_members` rows. Tie-break when several dm channels match one pair (possible after rename +
+`~n` reuse — at least one was created for a different incarnation): pick the channel with
+the **newest `channels.created_at`**, deterministic, no error (claude n1). After rename, history
+`{channel}`, `scope=channel:`, and `/raw` use the stored name from this lookup — never
+re-sort current ids into a name. (b) **Group-DM form dropped** (both): `dm~<creator>~<slug>`
 is shape-indistinguishable from `dm~<lo>~<hi>`; multi-party = Appendix F groups on an
 ordinary channel. (c) **Split the scope** (claude, overriding the draft's lean and grok's
 "keep one"): `read:dm` is a FIFTH scope name. One scope would RETROACTIVELY widen every
@@ -565,9 +635,12 @@ comparison** (not `localeCompare`: locales order `-`/`_` differently), `lo == hi
 creation collision after id-reuse. `~` is not in `ID_RE` ⇒ split unambiguous. Channel
 validation widens to `ID_RE || DM_RE` via ONE helper used by `post()` (the write gate) and
 `preflight()` (else every DM is flagged bad); `ensureChannel` stays policy-free. Read
-filters (history/inbox/watch) do NOT widen (§9 gates writes only). `--dm <peer>` sugar ⇒
-channel + recipients = **the two member ids only** (self omitted — already excluded from
-inbox/receipts); parties come from `channel_members`, not recipients.
+filters (history/inbox/watch) do NOT widen (§9 gates writes only). DM names are up to 73
+chars (`3 + 32 + 1 + 32 + 5` suffix) — no ≤64 channel-length assumption exists anywhere in
+the schema, indexes, or mirror paths (claude m1). `--dm <peer>` sugar ⇒
+channel + recipients = **the peer id only** (self is omitted from recipients at post time
+by the existing post path — claude m8 wording fix); parties come from `channel_members`,
+not recipients.
 
 **G2 — `canSee` is the ONE predicate (replaces "sender, resolved recipients, or
 read:all", which was role-spoofable: role is self-granted, so `join --role alice` read
@@ -579,10 +652,16 @@ canSee(principal, msg) = name shape of msg.channel is NOT dm-shaped
 ```
 `channel_members(channel, agent_id, PK(channel, agent_id))` + `INDEX cm_agent(agent_id,
 channel)`. Members are literal ids written at channel creation. **Role, group, and `@all`
-are never consulted for access.** Delivery (inbox arms) and visibility (canSee) are
+are never consulted for access.** `allMessages`/`allMessageIds`/`tailEvents` stay raw local
+dumps — the server never exposes them unscoped on the RPC surface; the SSE broadcaster
+filters `tailEvents` through canSee per subscriber rather than shipping the raw tail
+(grok minor; local `watch` keeps them). Delivery (inbox arms) and visibility (canSee) are
 separate questions; a dm-channel message must satisfy BOTH. The `channels.kind` column is
 at most a CHECK-enforced copy — the NAME SHAPE is the authority (GLOB in SQL), so a stale
-writer's default can't flip a DM to public.
+writer's default can't flip a DM to public. `channel_members` has no trigger and no event
+kind — `canSee` reads it LIVE (PK point lookup; cost is noise, grok probe 2.5 ms vs 2.4 ms)
+or caches it invalidated by `rename` events; a cache miss loads from the DB, never empty
+(claude n2 — the G6 member move is an UPDATE, so no trigger fires).
 **Every path that returns or accepts a message id passes canSee, and "invisible" is
 byte-identical to "missing"** (same error, same detail — no existence oracle):
 `read` (check BEFORE the `reads` INSERT — else a non-party probe writes a reads row AND
@@ -594,23 +673,55 @@ additionally needs `read:dm`), `threadOf` (threads span channels ⇒ per-row fil
 predicate per event), stream `scope=channel:x` (validate x; party check if dm-shaped),
 SSE broadcaster (canSee on every event carrying a `msg_id`), `setStatus` (non-party on
 dm ⇒ `not_found`, not `forbidden`), `post --re` (parent lookup applies canSee ⇒ B2 oracle
-closed), `/raw` (file → message → canSee), `channels()` (dm-shaped rows hidden unless
-member or `read:dm`; local mode lists all), `history` (gated by `read:all` — omniview,
-NOT row-filtered, else omniview loses DMs).
+closed), `joinAgent`'s `unresolved` count (claude n6: computed under canSee — a non-party's
+DM traffic count must not leak existence/volume), `/raw` (file → message → canSee),
+`channels()` (dm-shaped rows hidden unless
+member or `read:dm`; local mode lists all), `history` (method gate stays `read:all`;
+**canSee is the row predicate in both modes** — snapshot over messages and since over
+events. `read:all` alone does not satisfy canSee. DM omniview of history = `read:all`
+AND `read:dm`. There is NO "not row-filtered" exception — the loss IS what read:dm is for).
+```sql
+-- snapshot, no channel arg. $dm = 1 iff hasScope(read:dm). Positional:
+SELECT * FROM messages m
+WHERE m.channel NOT GLOB 'dm~*'
+   OR EXISTS (SELECT 1 FROM channel_members cm
+              WHERE cm.channel = m.channel AND cm.agent_id = ?)
+   OR ? = 1
+ORDER BY m.created_at DESC, rowid DESC LIMIT ?
+-- since mode: same predicate on the joined message; events.seq stays the PK range.
+-- history{channel}: canSee the channel ONCE, then the existing channel query.
+-- A hidden dm channel returns the same empty page as a missing channel, not a new error.
+```
 
 **G2w — write side (draft was silent; a non-party could inject into any DM).**
 (i) Posting INTO a dm-shaped channel requires the final sender (after `as`) ∈
 `channel_members`; `read:all`/`read:dm` are READ-only omniview and never grant posting;
-`post:as` impersonation stays audited via `meta.as`. (ii) dm-channel recipients must be
-literal member ids — `@all`, `role:*`, `group:*` rejected `usage` (-32602). (iii) parent
-lookup per G2.
+`post:as` impersonation stays audited via `meta.as`. (ii) dm-channel recipients must be a
+**subset of the literal member ids** (wildcards `@all`, `role:*`, `group:*` rejected
+`usage` -32602) — this is the rule the enforcement code checks; the `dm` CLI sugar sets
+recipients to exactly the peer (G1), which satisfies it (C2 reconciliation: subset is the
+predicate, equality is only what the sugar emits). (iii) parent lookup per G2.
+(iv) **`thread` is an anchor too (claude N1, probe T1 — today `thread=<any id>` is never
+validated and a public post can squat inside a party's DM thread view):** in server mode
+the thread root must reference an existing message that passes canSee, else `not_found`
+byte-identical to a missing `re` (kills both the injection and the future-id squat);
+if the thread root's channel is dm-shaped, the post's RESOLVED channel must EQUAL it —
+no cross-channel attach into a DM thread. (iii)/(ii) and the G2w-i membership check run on
+the RESOLVED channel after `re`/`thread` inheritance, BEFORE `ensureChannel` (grok: the
+inherited `--re` path skips the regex — that stays correct, the check moves).
+(v) **DM channel creation is ONE helper:** the channel row plus exactly 2
+`channel_members` rows in one txn (grok's invariant). `post {channel:"dm~x~y"}` on a
+nonexistent dm channel routes through the helper iff sender ∈ {x,y} and both ids exist as
+agents, else rejected; a non-party naming a nonexistent dm channel gets the SAME
+`not_found` as one naming an existing channel — channel existence is never an oracle.
 
 **G3 — Authz matrix delta.** §5 "every token can read every message" is amended: public
 channels unchanged; dm-shaped channels filtered by canSee. Scope enum becomes FIVE names:
 `read:all, read:dm, post:as, tokens:admin, agents:admin`. `kind:'human'` defaults
 `read:all,read:dm` (⇒ user/admin sees every DM and every channel — requirement met);
-`admin:true` = all five; `read:dm` alone = DM rows via history/stream/peek; `read:all`
-alone = channels only, no DM peek. Local mode keeps legacy see-all (host filesystem =
+`admin:true` = all five; `read:dm` alone = DM rows on ungated paths only (`read`, `threadOf`, `receipts`,
+`channels`, `/raw`, own inbox) — it does not unlock `history` or stream `scope=all`;
+`read:all` alone = channels only, no DM peek. Local mode keeps legacy see-all (host filesystem =
 root of trust; byte-parity quirk pin).
 
 **G4 — CLI/UI.** `comms.ts dm --from a --to b "text"` (post sugar); `comms.ts dms --for a`;
@@ -622,21 +733,73 @@ every DM to every token).** `meta.acl_generation` (SEPARATE from `schema_version
 is the trigger generation): server-mode `openBus` REFUSES a DB whose `acl_generation`
 exceeds the one it was compiled with (local mode may proceed — host is root). Lands in M2
 before any DM code ships. A dm-shaped channel with ZERO `channel_members` rows fails
-closed: `read:dm`/`read:all` only, listed by preflight.
+closed: `read:dm` only (not `read:all`), listed by preflight. `acl_generation` is a
+DB-wide counter, not a per-channel stamp — do not "stamp and refuse the DB until an
+admin assigns members" (that false-refuses a zero-DM DB such as `.review-bus`).
+Missing key + no naked dm channel: write `acl_generation=1` inside the open
+IMMEDIATE txn (marker re-read inside, `CREATE TABLE IF NOT EXISTS` outside the
+`schema_version` gate) and proceed. Naked dm channel: canSee fails closed per
+channel; do not refuse open. Key greater than compiled: server-mode `openBus`
+refuses. The key binds only a binary that reads it — `openBus` today never does
+(bus.ts:323). **Honesty (grok major + claude N4 concur): the key does NOT close M1
+rollback — it only binds binaries N+1 onward.** Runbook: no pre-check server process may
+open a DB that has a dm-shaped channel; replace the binary before the first DM row.
+One concrete pre-G leak already shipped: **`bin/dashboard.ts`** is direct-DB,
+unauthenticated, and `Bun.serve` with no hostname ⇒ binds 0.0.0.0 and re-serves every
+message body to the LAN — "local = host is root of trust" covers the host USER, not LAN
+visitors of a process that re-publishes the DB. FIX: standalone direct-DB dashboard binds
+`127.0.0.1` by default and refuses (or strips dm-shaped rows) when the DB contains any
+dm-shaped channel unless run `--omniview`; M6 runbook retires/replaces every pre-G binary
+(comms.ts, dashboard.ts, host CLI checkouts) before the first dm row.
+**Admin repair (C1):** for a zero-member dm-shaped channel left by a crash window, the
+repair path is host-side local-mode SQL (or a future `channel.members` admin op); until
+that method exists, G5 does not claim "an admin assigns members" — preflight listing is
+the documented surface.
 
 **G6 — rename interaction (ruling a).** The §4 rename txn additionally:
 `UPDATE OR IGNORE group_members SET agent_id=new` (then delete leftovers), same for
 `channel_members` (PK-safe via OR IGNORE + leftover delete; new id cannot pre-exist —
-rename rejects it), `message_recipients.target` old→new + recipients CSV rewritten via
-SPLIT_SQL rejoin in the same txn (index and CSV must carry the SAME token set or JS/SQL
-diverge). **No** rewrite of `messages.channel/file`, mirror dirs, or `events` (audit).
-Frozen names + member-pair lookup ⇒ renamed agent keeps the SAME conversation, no split.
+rename rejects it, and agent_retired below closes the re-mint path; **keep the leftover
+delete** — under the alias/tombstone alternative `new` may already be a member via a
+pre-rename join under the new id, claude n9). **No** rewrite of `message_recipients.target`, the recipients CSV,
+`messages.channel/file`, mirror dirs, or `events` (audit). A plain
+`UPDATE message_recipients SET target=new WHERE target=old` throws
+`UNIQUE constraint failed` on `mr_uq` whenever any message already carries both
+tokens; `OR IGNORE` leaves the stale old row. It is also core code writing
+`message_recipients`, which §4 forbids, and it is the history mutation F rejects
+for groups. Id-addressed mail stays addressed to the old id (honest, same as
+`events.agent_id`). DM continuity is the member move plus the member-pair lookup,
+not a recipient rewrite. So the old id cannot be re-minted:
+```sql
+CREATE TABLE IF NOT EXISTS agent_retired(
+  id TEXT PRIMARY KEY, renamed_to TEXT NOT NULL, at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS agent_retired_new ON agent_retired(renamed_to, id);
+-- inside the existing rename IMMEDIATE txn, after agents.id update:
+UPDATE agent_retired SET renamed_to = ? WHERE renamed_to = ?;  -- chain: alice→bob becomes alice→carol
+INSERT INTO agent_retired(id, renamed_to, at) VALUES(?, ?, ?); -- old, new, nowIso
+-- token.create and rename (server): hit ⇒ identity_conflict
+SELECT 1 FROM agent_retired WHERE id = ?;
+```
+Do not add an alias arm to delivery unless inbox continuity of id-addressed mail is
+an explicit requirement. If it is, this arm is SEARCH on `agent_retired_new` then
+`msg_rec_idx` — still no history mutation:
+```sql
+UNION ALL SELECT r.msg FROM agent_retired ar
+  JOIN message_recipients r ON r.target = ar.id
+  WHERE ar.renamed_to = ?
+```
+The JS map must carry the same old ids or the fixture splits. Frozen names +
+member-pair lookup ⇒ renamed agent keeps the SAME DM conversation, no split.
 
 **G7 — Tests (contract suite, both directions).** canonicalization (alice↔bob same
 channel, code-unit order); self-DM rejected; `~` collision impossible; non-party
 read/inbox/threadOf/receipts/waitStep/setStatus → byte-identical to a nonexistent id AND
-no `reads` row written; party visible; `read:all`-only human sees channels but NOT DMs;
+no `reads` row written; party visible; `read:all`-only human sees channels but NOT DMs
+(incl. history BOTH modes — the row-filter, not just the method gate);
 `read:dm` human (default) sees everything incl. history both modes + `channels()`; local
-non-party sees all (quirk pin); `--re` into dm by non-party `not_found`; post `@all` into
+non-party sees all (quirk pin); `--re` into dm by non-party `not_found`; **`thread=<dm
+root>` by a non-party ⇒ `not_found`; cross-channel thread attach into a dm ⇒ rejected
+(claude N1); `thread=<nonexistent>` rejected in server mode; `thread=<own public root>`
+accepted**; post `@all` into
 dm rejected; SSE event filtered for non-party subscriber; `/raw` 404-equivalent; rename
 keeps conversation via member-pair; acl_generation refusal.
