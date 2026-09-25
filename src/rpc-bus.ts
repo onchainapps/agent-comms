@@ -99,6 +99,7 @@ function makeSession(bus: RpcBus, token: string): Session {
     groupDelete: (p) => c("group.delete", p as Record<string, unknown>),
     groupList: () => c("group.list"),
     groupShow: (p) => c("group.show", p as Record<string, unknown>),
+    dmMembers: (channel) => c("dm.members", { channel }),
   };
   return sess;
 }

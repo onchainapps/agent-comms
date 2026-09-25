@@ -36,6 +36,7 @@ export interface Session {
   groupDelete(p: { name: string }): Promise<Res<{ name: string; deleted: boolean }>>;
   groupList(): Promise<Res<{ groups: { name: string; created_by: string; created_at: string; members: number; mine: boolean }[] }>>;
   groupShow(p: { name: string }): Promise<Res<{ name: string; created_by: string; created_at: string; members: string[] }>>;
+  dmMembers(channel: string): Promise<Res<string[]>>;
 }
 
 export interface BusHandle {
@@ -94,6 +95,7 @@ function wrapSessionImpl<M extends Mode>(bus: Bus<M>, ctx: Ctx<M>): Session {
     groupDelete: (p) => a(bus.groupDelete(c, p)),
     groupList: () => a(bus.groupList(c)),
     groupShow: (p) => a(bus.groupShow(c, p)),
+    dmMembers: (channel) => a(bus.dmMembersFor(c, channel)),
   };
 }
 

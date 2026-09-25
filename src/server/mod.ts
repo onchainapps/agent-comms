@@ -219,6 +219,7 @@ export function startServer(opts: ServerOpts): RunningServer {
       case "group.delete": return call(session.groupDelete({ name: String(p.name ?? "") }));
       case "group.list": return call(session.groupList());
       case "group.show": return call(session.groupShow({ name: String(p.name ?? "") }));
+      case "dm.members": return call(session.dmMembers(String(p.channel ?? "")));
       default: return { ok: false, err: rpcErr(J.noMethod, "method not found") };
     }
   }
@@ -293,13 +294,13 @@ export function startServer(opts: ServerOpts): RunningServer {
     }
     if (!out.ok) {
       const http = HTTP_FOR_CODE[out.err.code] ?? 400;
-      const headers: Record<string, string> = { "x-comms-agent": a.ok.agentId };
+      const headers: Record<string, string> = { "x-comms-agent": a.ok.agentId, "x-comms-scopes": a.ok.scopes.join(",") };
       if (out.err.code === -32004 || out.err.code === -32006) headers["retry-after"] = "1";
       return json(http, { jsonrpc: "2.0", error: out.err, id }, headers);
     }
     // in-process kick: our own writes need no 250 ms wait (§3 fan-out).
     if (WRITE_METHODS.has(body.method)) queueMicrotask(tick);
-    return json(200, { jsonrpc: "2.0", result: out.result, id }, { "x-comms-agent": a.ok.agentId });
+    return json(200, { jsonrpc: "2.0", result: out.result, id }, { "x-comms-agent": a.ok.agentId, "x-comms-scopes": a.ok.scopes.join(",") });
   }
 
   function ipBucket(req: Request): Bucket {

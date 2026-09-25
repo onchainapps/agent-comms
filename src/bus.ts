@@ -530,6 +530,18 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   const dmMembers = (channel: string): string[] =>
     (d.query("SELECT agent_id FROM channel_members WHERE channel=? ORDER BY agent_id").all(channel) as any[]).map((r) => r.agent_id);
 
+  /** G4 CLI (`dms`): member list gated by the ONE visibility predicate. Local
+   *  see-all quirk applies via canSeeChannel; server mode: member or read:dm,
+   *  else invisible ⇒ byte-identical not_found (G2). */
+  function dmMembersFor(ctx: AnyCtx, channel: string): Res<string[]> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    if (!DM_SHAPED_RE.test(channel))
+      return { error: "usage", detail: "not a dm channel" };
+    if (!canSeeChannel(ctx, channel))
+      return { error: "not_found", detail: `no such channel: ${channel}` };
+    return { value: dmMembers(channel) };
+  }
+
   /** G2 — the ONE visibility predicate. Name SHAPE is the authority (GLOB);
    *  channels.kind is at most a CHECK-enforced copy. Role/group/@all NEVER
    *  consulted. Local mode = host is root of trust ⇒ see-all (pinned quirk). */
@@ -1845,7 +1857,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     cursorGet, cursorSet, history, waitStep, tailEvents, eventsHighWater, epoch, gcFloor, rotateEpoch, gc, preflight,
     allMessages, allMessageIds, messageById, ensureChannel,
     groupCreate, groupJoin, groupLeave, groupDelete, groupList, groupShow,
-    canSeeChannel, membershipsOf, deliveredMsgIds, dmMembers, dmChannelForPair,
+    canSeeChannel, membershipsOf, deliveredMsgIds, dmMembers, dmMembersFor, dmChannelForPair,
     isActive, recipientsMatch, roleOf, receiptsForMsg, renderMd, touch, close,
   };
 }

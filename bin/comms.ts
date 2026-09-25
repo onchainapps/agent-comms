@@ -3,19 +3,25 @@
  * comms CLI — thin shell over the bus core (RFC-001 §3 piece 4).
  *
  * All DB logic lives in src/bus.ts. This file owns ONLY: argv parsing, env
- * (COMMS_HOME / COMMS_FINGERPRINT / COMMS_TEST_SEAMS), readBody (@file/stdin),
- * rendering, exit codes, and the watch polling loop. No SQL, no DB access.
+ * (COMMS_HOME / COMMS_URL / COMMS_TOKEN / COMMS_FINGERPRINT / COMMS_TEST_SEAMS),
+ * readBody (@file/stdin), rendering, exit codes, transport selection (§7),
+ * and the watch loops. No SQL, no DB access.
  * Byte-identical local-mode behavior is enforced by tests/golden.test.ts.
  *
  * Env: COMMS_HOME        project root holding .comms/ (DB) + messages/ (default: auto-detected)
- *      COMMS_FINGERPRINT stable per-runtime identity for join/rename guards
+ *      COMMS_URL         server base URL ⇒ remote transport (§7 precedence:
+ *                        COMMS_URL ⇒ remote; --local forces direct; else COMMS_HOME direct)
+ *      COMMS_TOKEN       bearer token for remote mode (or --token)
+ *      COMMS_FINGERPRINT stable per-runtime identity for join/rename guards (local mode;
+ *                        server mode IGNORES fingerprint — token is identity, §5)
  *      COMMS_TEST_SEAMS  JSON {at,seed,pid} — frozen seams for the golden harness (test-only)
  */
 import { dirname, join, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, readFileSync } from "node:fs";
-import { openBus, localCtx, EXIT_CODES, type MsgRow, type Res } from "../src/bus.ts";
+import { openBus, localCtx, EXIT_CODES, PRESENCE_TTL_MS, type Bus, type MsgRow, type Res } from "../src/bus.ts";
 import { testSeams, type Seams } from "../src/seams.ts";
+import { RpcBus } from "../src/rpc-bus.ts";
 
 function findRoot(start: string): string {
   let d = start;
@@ -26,11 +32,141 @@ function findRoot(start: string): string {
     d = p;
   }
 }
-const HOME = process.env.COMMS_HOME ?? findRoot(dirname(fileURLToPath(import.meta.url)));
-const seams: Seams | undefined = process.env.COMMS_TEST_SEAMS
-  ? testSeams(JSON.parse(process.env.COMMS_TEST_SEAMS))
-  : undefined;
-const bus = openBus({ home: HOME, mode: "local", seams });
+
+// ---------- transport (§7) ----------
+// The local DB is opened ONLY in local mode: the hosted single-writer rule
+// means a remote CLI must not open the server's SQLite file (it would run its
+// own migrations and race the server writer).
+let HOME = "";
+let localBus: Bus<"local"> | null = null;
+function core(): Bus<"local"> {
+  if (!localBus) {
+    const seams: Seams | undefined = process.env.COMMS_TEST_SEAMS
+      ? testSeams(JSON.parse(process.env.COMMS_TEST_SEAMS))
+      : undefined;
+    localBus = openBus({ home: HOME, mode: "local", seams });
+  }
+  return localBus;
+}
+
+let REMOTE: RpcBus | null = null;
+let remoteToken = "";
+let bannerPrinted = false;
+let remoteIdentity = { id: "", scopes: "" };
+
+/** One transport surface for every command. `actor` is the CLI's --agent/--from
+ *  claim: in local mode it becomes the localCtx principal (host is root); in
+ *  remote mode it travels inside params as a §5 ASSERTION and the server
+ *  resolves the principal from the token row. */
+type Call = (name: string, actor: string, p?: Record<string, unknown>) => Promise<Res<any>>;
+
+const LOCAL_CALLS: Record<string, (b: Bus<"local">, actor: string, p: any) => Res<any>> = {
+  joinAgent: (b, actor, p) => b.joinAgent(localCtx(actor), p),
+  listAgents: (b, _a, p) => ({ value: b.listAgents(p.activeOnly) }),
+  post: (b, actor, p) => b.post(localCtx(actor), p),
+  inbox: (b, actor, p) => b.inbox(localCtx(actor), p),
+  read: (b, actor, p) => b.read(localCtx(actor), p),
+  threadOf: (b, actor, p) => b.threadOf(localCtx(actor), p.id),
+  receipts: (b, actor, p) => b.receipts(localCtx(actor), p.id),
+  setStatus: (b, actor, p) => b.setStatus(localCtx(actor), p),
+  channels: (b, actor) => b.channels(localCtx(actor)),
+  rename: (b, actor, p) => b.rename(localCtx(actor), p),
+  history: (b, actor, p) => b.history(localCtx(actor), p),
+  waitStep: (b, actor, p) => b.waitStep(localCtx(actor), p),
+  cursorGet: (b, actor, p) => b.cursorGet(actor, p.consumer ?? "default"),
+  cursorSet: (b, actor, p) => b.cursorSet(actor, p.consumer, epOf(p.cursor), seqOf(p.cursor), p.force),
+  tokenCreate: (b, actor, p) => b.tokenCreate(localCtx(actor), p),
+  tokenList: (b, actor) => b.tokenList(localCtx(actor)),
+  tokenRevoke: (b, actor, p) => b.tokenRevoke(localCtx(actor), p),
+  groupCreate: (b, actor, p) => b.groupCreate(localCtx(actor), p),
+  groupJoin: (b, actor, p) => b.groupJoin(localCtx(actor), p),
+  groupLeave: (b, actor, p) => b.groupLeave(localCtx(actor), p),
+  groupDelete: (b, actor, p) => b.groupDelete(localCtx(actor), p),
+  groupList: (b, actor) => b.groupList(localCtx(actor)),
+  groupShow: (b, actor, p) => b.groupShow(localCtx(actor), p),
+  dmMembers: (b, actor, p) => b.dmMembersFor(localCtx(actor), p.channel),
+};
+const CURSOR_RE = /^([0-9a-f]{8,64})\.(\d+)$/;
+const epOf = (c: string) => { const m = CURSOR_RE.exec(String(c)); return m ? m[1] : String(c); };
+const seqOf = (c: string) => { const m = CURSOR_RE.exec(String(c)); return m ? Number(m[2]) : NaN; };
+
+// Remote wire map mirrors src/rpc-bus.ts makeSession (same server dispatch).
+const REMOTE_METHODS: Record<string, (p: any) => [string, Record<string, unknown>]> = {
+  joinAgent: (p) => ["join", p],
+  listAgents: (p) => ["who", { all: !p.activeOnly }],
+  post: (p) => ["post", { ...p, to: csvSplit(p.to) }],
+  inbox: (p) => ["inbox", p],
+  read: (p) => ["read", p],
+  threadOf: (p) => ["thread", { id: p.id }],
+  receipts: (p) => ["receipts", { id: p.id }],
+  setStatus: (p) => ["status", p],
+  channels: () => ["channels", {}],
+  rename: (p) => ["rename", p],
+  history: (p) => ["history", p],
+  waitStep: (p) => ["inbox.wait", p],
+  cursorGet: (p) => ["cursor.get", p],
+  cursorSet: (p) => ["cursor.set", p],
+  tokenCreate: (p) => ["token.create", p],
+  tokenList: () => ["token.list", {}],
+  tokenRevoke: (p) => ["token.revoke", p],
+  groupCreate: (p) => ["group.create", p],
+  groupJoin: (p) => ["group.join", p],
+  groupLeave: (p) => ["group.leave", p],
+  groupDelete: (p) => ["group.delete", p],
+  groupList: () => ["group.list", {}],
+  groupShow: (p) => ["group.show", p],
+  dmMembers: (p) => ["dm.members", { channel: p.channel }],
+};
+
+const csvSplit = (to: string) => (to ? String(to).split(",").map((s) => s.trim()).filter(Boolean) : []);
+
+/** §7 exit contract: -32004/-32006 ⇒ backoff per Retry-After, then 1. The
+ *  backoff loop lives HERE (transport policy), not in RpcBus (mechanism);
+ *  the SAME params object is re-sent, so a post's auto idempotency key is
+ *  generated once per logical post and reused across its own retries (§6). */
+const RETRY_VARIANTS = new Set(["rate_limited", "contention"]);
+async function remoteCall(name: string, p: Record<string, unknown>): Promise<Res<any>> {
+  const [method, params] = REMOTE_METHODS[name](p);
+  const deadline = Date.now() + 30_000; // bounded: flaky-LAN retry window, then exit 1
+  for (;;) {
+    let retryAfterMs = 1000;
+    const r = await REMOTE!.call(method, params, remoteToken, (h) => {
+      const a = h.get("x-comms-agent"); const s = h.get("x-comms-scopes");
+      if (a !== null) remoteIdentity = { id: a, scopes: s ?? "" };
+      const ra = Number(h.get("retry-after"));
+      if (Number.isFinite(ra) && ra > 0) retryAfterMs = ra * 1000;
+    });
+    maybeBanner();
+    if (!r.error || !RETRY_VARIANTS.has(r.error) || Date.now() >= deadline) return r;
+    await Bun.sleep(Math.min(Math.max(retryAfterMs, 250), 5000));
+  }
+}
+
+function maybeBanner() {
+  if (bannerPrinted) return;
+  bannerPrinted = true;
+  if (REMOTE) console.error(`transport=remote:${process.env.COMMS_URL} as ${remoteIdentity.id || "?"}(${remoteIdentity.scopes})`);
+}
+
+let CALL: Call = async (name, actor, p = {}) => LOCAL_CALLS[name](core(), actor, p);
+
+function setupTransport(a: Args) {
+  HOME = process.env.COMMS_HOME ?? findRoot(dirname(fileURLToPath(import.meta.url)));
+  const url = process.env.COMMS_URL;
+  const forceLocal = !!a.local;
+  if (url && !forceLocal) {
+    REMOTE = new RpcBus(url.replace(/\/+$/, ""));
+    remoteToken = (typeof a.token === "string" ? a.token : "") || process.env.COMMS_TOKEN || "";
+    CALL = async (name, _actor, p = {}) => remoteCall(name, p);
+    // §7: banner on EVERY remote command (identity from the first response's
+    // x-comms-* headers); join/who force-print even if a command would
+    // otherwise end before any response was inspected.
+  } else if (url && process.env.COMMS_HOME) {
+    // §7 ambiguity: both transports configured, --local won — say so loudly.
+    console.error(`transport=local:${HOME} (COMMS_URL=${url} ignored by --local)`);
+    bannerPrinted = true;
+  }
+}
 
 // ---------- rendering (byte-exact from the pre-refactor CLI) ----------
 function fmtRow(r: MsgRow, unread = false): string {
@@ -50,12 +186,17 @@ function readBody(spec?: string): string {
   if (spec.startsWith("@")) return readFileSync(spec.slice(1), "utf8");
   return spec;
 }
-function printWho(activeOnly: boolean) {
-  const rows = bus.listAgents(false);
+async function printWho(activeOnly: boolean) {
+  const rows: any[] = REMOTE
+    ? unwrap(await CALL("listAgents", "", { activeOnly }))
+    : core().listAgents(false); // legacy parity: fetch all, filter below (tie order pinned by golden)
   console.log(activeOnly ? "active agents:" : "known agents:");
   let shown = 0;
+  const now = Date.now(); // remote: presence judged client-side against the row's last_seen
   for (const r of rows) {
-    const act = bus.isActive(r.last_seen ?? "");
+    const act = REMOTE
+      ? Number.isFinite(Date.parse(r.last_seen ?? "")) && now - Date.parse(r.last_seen ?? "") <= PRESENCE_TTL_MS
+      : core().isActive(r.last_seen ?? "");
     if (activeOnly && !act) continue;
     shown++;
     console.log(`  ${act ? "●" : "○"} ${String(r.id).padEnd(20)} role=${String(r.role ?? "-").padEnd(14)} caps=${(r.caps || "-").padEnd(24)} seen=${r.last_seen}`);
@@ -73,84 +214,95 @@ function unwrap<T>(r: Res<T>): T {
 }
 
 // ---------- commands ----------
-function cmdJoin(a: Args) {
+async function cmdJoin(a: Args) {
   if (!a.agent || !a.role) { console.error("error: join requires --agent and --role"); process.exit(2); }
   const fp = a.fingerprint ?? process.env.COMMS_FINGERPRINT ?? null;
-  const v = unwrap(bus.joinAgent(localCtx(a.agent), { agent: a.agent, role: a.role, caps: a.caps, fingerprint: fp }));
+  // §7: remote join does not stamp the server's pid (UPDATE-only branch, §5)
+  // and the server IGNORES fingerprint — the token row is the identity.
+  const v = unwrap(await CALL("joinAgent", a.agent, { agent: a.agent, role: a.role, caps: a.caps, fingerprint: fp }));
   // F CLI: join --group <name> = create-if-missing + join self.
-  if (a.group) unwrap(bus.groupJoin(localCtx(a.agent), { name: a.group, agent: a.agent }));
-  console.log(`joined: ${a.agent} (role=${a.role}, caps=${a.caps || "-"}${a.group ? `, group=${a.group}` : ""}, ${fp ? `fp=${String(fp).slice(0, 8)}…` : "fp=UNSET — identity unprotected, set COMMS_FINGERPRINT"})`);
-  printWho(true);
+  if (a.group) unwrap(await CALL("groupJoin", a.agent, { name: a.group, agent: a.agent }));
+  console.log(`joined: ${a.agent} (role=${a.role}, caps=${a.caps || "-"}${a.group ? `, group=${a.group}` : ""}, ${REMOTE ? "remote — identity from token" : fp ? `fp=${String(fp).slice(0, 8)}…` : "fp=UNSET — identity unprotected, set COMMS_FINGERPRINT"})`);
+  await printWho(true);
   console.log(`\n${v.unresolved} unresolved message(s) in flight. Run: bun comms.ts inbox --for ${a.agent} --open`);
 }
 
-function cmdPost(a: Args) {
+async function cmdPost(a: Args) {
   if (!a.sender || !a.to) { console.error("error: post requires --from and --to"); process.exit(2); }
   const body = readBody(a.body);
-  const v = unwrap(bus.post(localCtx(a.sender), {
+  const p: Record<string, unknown> = {
     from: a.sender, to: a.to, type: a.type, subject: a.subject, body,
     thread: a.thread, re: a.re, tags: a.tags, channel: a.channel,
-  }));
+  };
+  // §6/§7: remote CLI generates ONE idempotency key per logical post; the
+  // backoff retry re-sends the same params object ⇒ same key ⇒ replay, not
+  // duplicate. Local mode never sends keys (byte-parity: local has no retry).
+  if (REMOTE) p.idempotencyKey = `cli:${a.sender}:${crypto.randomUUID()}`.slice(0, 128);
+  const v = unwrap(await CALL("post", a.sender, p));
+  // §7: `file` is server-relative in remote mode; use `read` (or GET /raw) for content.
   console.log(`posted ${v.id}  [#${v.channel}]  thread=${v.thread}  -> ${a.to}  (${basename(v.file)})`);
 }
 
 // M1.5 G1: dm sugar — channel + recipients resolve via the member PAIR.
-function cmdDm(a: Args) {
+async function cmdDm(a: Args) {
   if (!a.sender || !a.to) { console.error("error: dm requires --from and --to"); process.exit(2); }
   const body = readBody(a.body);
-  const v = unwrap(bus.post(localCtx(a.sender), {
-    from: a.sender, to: a.to, type: a.type ?? "note", subject: a.subject, body, dm: a.to,
-  }));
+  const p: Record<string, unknown> = { from: a.sender, to: a.to, type: a.type ?? "note", subject: a.subject, body, dm: a.to };
+  if (REMOTE) p.idempotencyKey = `cli:${a.sender}:${crypto.randomUUID()}`.slice(0, 128);
+  const v = unwrap(await CALL("post", a.sender, p));
   console.log(`dm ${v.id}  [#${v.channel}]  thread=${v.thread}  -> ${a.to}  (${basename(v.file)})`);
 }
 
 // G4: dms --for <agent> — the agent's dm channels (member view), newest first.
-function cmdDms(a: Args) {
+async function cmdDms(a: Args) {
   const who = a.agent ?? a.for;
   if (!who) { console.error("error: dms requires --for"); process.exit(2); }
-  const chans = unwrap(bus.channels(localCtx(who))).filter((c: any) => String(c.name).startsWith("dm~"));
-  const mine = chans.filter((c: any) => bus.dmMembers(c.name).includes(who));
-  for (const c of mine) console.log(`#${c.name}  ${c.n} msg(s)  last=${c.last ?? "?"}  members=${bus.dmMembers(c.name).join(",")}`);
+  const chans = unwrap(await CALL("channels", who, {})).filter((c: any) => String(c.name).startsWith("dm~"));
+  const mine: any[] = [];
+  for (const c of chans) {
+    const members = unwrap(await CALL("dmMembers", who, { channel: c.name }));
+    if (members.includes(who)) mine.push({ ...c, members });
+  }
+  for (const c of mine) console.log(`#${c.name}  ${c.n} msg(s)  last=${c.last ?? "?"}  members=${c.members.join(",")}`);
   console.log(mine.length ? `\n${mine.length} dm channel(s) for ${who}. Read one: bun comms.ts inbox --for ${who} --channel <name>` : `(no DM channels for ${who})`);
 }
 
 // M1.5 F: group verbs (self-organizing; delete needs agents:admin — local root is).
-function cmdGroup(a: Args) {
+async function cmdGroup(a: Args) {
   const sub = a._pos?.[0];
   const name = a.group ?? a._pos?.[1];
   const who = a.agent ?? "";
-  const ctx = localCtx(who);
   switch (sub) {
     case "create": {
-      const v = unwrap(bus.groupCreate(ctx, { name, agent: a.agent }));
+      const v = unwrap(await CALL("groupCreate", who, { name, agent: a.agent }));
       console.log(v.created ? `group created: ${v.name}` : `group already exists: ${v.name}`);
       return;
     }
     case "join": {
-      const v = unwrap(bus.groupJoin(ctx, { name, agent: a.agent }));
+      const v = unwrap(await CALL("groupJoin", who, { name, agent: a.agent }));
       console.log(`joined ${v.name} (${v.members.length} member(s): ${v.members.join(", ")})`);
       return;
     }
     case "leave": {
-      const v = unwrap(bus.groupLeave(ctx, { name, agent: a.agent }));
+      const v = unwrap(await CALL("groupLeave", who, { name, agent: a.agent }));
       console.log(v.left ? `left ${v.name}` : `was not a member of ${v.name}`);
       return;
     }
     case "list": {
-      const v = unwrap(bus.groupList(ctx));
+      const v = unwrap(await CALL("groupList", who, {}));
       if (!v.groups.length) { console.log("(no groups)"); return; }
       for (const g of v.groups)
         console.log(`  ${g.mine ? "*" : " "} ${String(g.name).padEnd(24)} ${String(g.members).padStart(3)} member(s)  by=${g.created_by} since=${g.created_at}`);
       return;
     }
     case "show": {
-      const v = unwrap(bus.groupShow(ctx, { name }));
+      const v = unwrap(await CALL("groupShow", who, { name }));
       console.log(`group ${v.name} (by ${v.created_by}, since ${v.created_at}):`);
       for (const m of v.members) console.log(`  ${m}`);
       return;
     }
     case "delete": {
-      const v = unwrap(bus.groupDelete(ctx, { name }));
+      const v = unwrap(await CALL("groupDelete", who, { name }));
       console.log(`deleted group ${v.name} (undelivered backlog drops from members' inboxes — mailing-list semantics)`);
       return;
     }
@@ -160,15 +312,15 @@ function cmdGroup(a: Args) {
   }
 }
 
-function cmdInbox(a: Args) {
-  const v = unwrap(bus.inbox(localCtx(a.agent), { agent: a.agent, open: a.open, unread: a.unread, channel: a.channel }));
+async function cmdInbox(a: Args) {
+  const v = unwrap(await CALL("inbox", a.agent, { agent: a.agent, open: a.open, unread: a.unread, channel: a.channel }));
   let shown = 0;
   for (const r of v.rows) { console.log(fmtRow(r, v.unreadIds.has(r.id))); shown++; }
   console.log(shown ? `\n${shown} message(s). '*' = unread. Read: bun comms.ts read --for ${a.agent} --id <ID>` : "(inbox empty for filter)");
 }
 
-function cmdRead(a: Args) {
-  const r = unwrap(bus.read(localCtx(a.agent), { agent: a.agent, id: a.id }));
+async function cmdRead(a: Args) {
+  const r = unwrap(await CALL("read", a.agent, { agent: a.agent, id: a.id }));
   console.log(`--- ${r.id} | thread ${r.thread} | ${r.type} | ${r.status}`);
   console.log(`from ${r.sender} -> ${r.recipients} | ${r.created_at}`);
   if (r.re) console.log(`re: ${r.re}`);
@@ -177,41 +329,80 @@ function cmdRead(a: Args) {
   console.log(`\n${fmtReceipts(r.receipts)}`);
 }
 
-function cmdReceipts(a: Args) {
-  const r = unwrap(bus.receipts(localCtx(""), a.id));
+async function cmdReceipts(a: Args) {
+  const r = unwrap(await CALL("receipts", "", { id: a.id }));
   console.log(`${r.id}  [${r.type}/${r.status}]  ${r.sender} -> ${r.recipients}`);
   console.log(`  ${r.subject}`);
   console.log(`  ${fmtReceipts(r.receipts)}`);
   console.log(`  (✓ = opened via read · ⤷ = inferred from a reply)`);
 }
 
-function cmdChannels() {
-  const list = unwrap(bus.channels(localCtx("")));
+async function cmdChannels() {
+  const list = unwrap(await CALL("channels", "", {}));
   console.log("channels:");
   for (const c of list)
     console.log(`  #${String(c.name).padEnd(14)} ${String(c.n).padStart(4)} msgs  last=${c.last ?? "-"}  ${c.purpose ?? ""}`);
   console.log(`\nfilter any view: --channel <name>  ·  post to one: post ... --channel <name> (or reply, which inherits)`);
 }
 
-function cmdThread(a: Args) {
-  const v = unwrap(bus.threadOf(localCtx(""), a.id));
+async function cmdThread(a: Args) {
+  const v = unwrap(await CALL("threadOf", "", { id: a.id }));
   console.log(`thread ${a.id}  (${v.rows.length} message(s))`);
-  v.rows.forEach((r, i) => console.log(`${fmtRow(r)}  seen ${v.receipts[i].readers.length}/${v.receipts[i].intended.length}`));
+  v.rows.forEach((r: MsgRow, i: number) => console.log(`${fmtRow(r)}  seen ${v.receipts[i].readers.length}/${v.receipts[i].intended.length}`));
 }
 
-function setStatus(agent: string, id: string, state: string) {
-  const v = unwrap(bus.setStatus(localCtx(agent), { agent, id, state }));
+async function setStatus(agent: string, id: string, state: string) {
+  const v = unwrap(await CALL("setStatus", agent, { agent, id, state }));
   console.log(`${v.id} -> ${v.status}`);
 }
 
-function cmdRename(a: Args) {
+async function cmdRename(a: Args) {
   if (!a.agent || !a.to) { console.error("error: rename requires --agent <old> --to <new>"); process.exit(2); }
   const fp = a.fingerprint ?? process.env.COMMS_FINGERPRINT ?? null;
-  unwrap(bus.rename(localCtx(a.agent), { agent: a.agent, to: a.to, fingerprint: fp }));
+  unwrap(await CALL("rename", a.agent, { agent: a.agent, to: a.to, fingerprint: fp }));
   console.log(`renamed ${a.agent} -> ${a.to} (announced to @all). New activity uses ${a.to}; history keeps ${a.agent}.`);
 }
 
+// ---------- token subcommand (§5/§6; M3) ----------
+async function cmdToken(a: Args) {
+  const sub = a._pos?.[0];
+  switch (sub) {
+    case "create": {
+      if (!a.agent) { console.error("error: token create requires --agent"); process.exit(2); }
+      const scopes = a.scopes ? String(a.scopes).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
+      const v = unwrap(await CALL("tokenCreate", a.agent, {
+        agent: a.agent, kind: a.kind, label: a.label, scopes, admin: !!a.admin, force: !!a.force,
+      }));
+      console.log(`token for ${v.agentId} (kind=${a.kind ?? "agent"}, scopes=${v.scopes}):`);
+      console.log(`  ${v.token}`);
+      console.log(`  prefix=${v.prefix} id=${v.id} — shown ONCE; store it now.`);
+      if (!REMOTE) console.log("  (local bootstrap — the host is root; server mode requires tokens:admin)");
+      return;
+    }
+    case "list": {
+      const v = unwrap(await CALL("tokenList", a.agent ?? "", {}));
+      if (!v.tokens.length) { console.log("(no tokens)"); return; }
+      for (const t of v.tokens)
+        console.log(`  #${String(t.id).padStart(3)} ${String(t.agentId).padEnd(16)} ${String(t.kind).padEnd(5)} prefix=${t.prefix} scopes=${t.scopes.join(",")}${t.revoked_at ? ` REVOKED@${t.revoked_at}` : ""} last=${t.last_used ?? "?"}`);
+      return;
+    }
+    case "revoke": {
+      const id = Number(a.id ?? a._pos?.[1]);
+      if (!Number.isFinite(id)) { console.error("error: token revoke requires --id <tokenId>"); process.exit(2); }
+      unwrap(await CALL("tokenRevoke", a.agent ?? "", { id }));
+      console.log(`token #${id} revoked (one-way door: re-verify fails closed)`);
+      return;
+    }
+    default:
+      console.error("usage: token create --agent <id> [--kind agent|human] [--scopes a,b] [--admin] [--force] [--label L] | token list | token revoke --id <N>");
+      process.exit(2);
+  }
+}
+
+// ---------- watch ----------
 async function cmdWatch(a: Args) {
+  if (REMOTE) return cmdWatchRemote(a);
+  const bus = core();
   const role = bus.roleOf(a.agent);
   // F: membership resolves at TAIL time — reload the incarnation Map every tick.
   let mem = bus.membershipsOf(a.agent);
@@ -242,6 +433,69 @@ async function cmdWatch(a: Args) {
   }
 }
 
+/**
+ * M3 cursor-backed watch (§6 Watch durability): persists position via
+ * cursors(agent_id, consumer='cli') so back-to-back `watch --exit-on-new`
+ * runs never skip what arrived between them. At-least-once: the cursor is
+ * committed AFTER printing. A resync (epoch rotated / below gc floor) is
+ * recovered by the §6 recovery commit — cursor.set to `<epoch>.<floor>`
+ * with force (a foreign row must not block it) — then delivery resumes
+ * from the floor, exactly where retained history starts.
+ */
+async function cmdWatchRemote(a: Args) {
+  const consumer = typeof a.consumer === "string" ? a.consumer : "cli";
+  const ivSec = a.interval ?? 3;
+  const capSec = a.timeout ?? 28800;
+  const scope = a.all ? (a.channel ? `all of #${a.channel}` : "ALL channels (firehose)") : (a.channel ? `#${a.channel} addressed to me` : "addressed to me");
+  console.log(`watch: ${a.agent} scope=${scope}; every ${ivSec}s; ${a.once ? "one-shot" : `cap ${capSec}s`} (remote, cursor consumer=${consumer})`);
+  let stop = false;
+  process.on("SIGTERM", () => { stop = true; });
+  const started = Date.now();
+  const recover = async (data?: Record<string, any>) => {
+    const floor = Number(data?.floor ?? 0);
+    unwrap(await CALL("cursorSet", a.agent, { consumer, cursor: `${data?.epoch}.${floor}`, force: true }));
+    console.log(`watch: resync — recovery commit to ${data?.epoch}.${floor} (retained history resumes here)`);
+  };
+  while (!stop) {
+    let hitForMe = false;
+    if (a.all) {
+      // Firehose: history since-mode ASC pages (events space — same cursor
+      // space as waitStep). Requires read:all (§6); paging to hasMore=false
+      // delivers every row exactly once.
+      const cur = await CALL("cursorGet", a.agent, { consumer });
+      if (cur.error === "resync") { await recover(cur.data); continue; }
+      const v0 = unwrap(cur);
+      let since = `${v0.epoch}.${v0.seq}`;
+      for (;;) {
+        const h = unwrap(await CALL("history", a.agent, { since, limit: 1000 }));
+        for (const r of h.rows) {
+          if (a.channel && r.channel !== a.channel) continue;
+          if (r.sender === a.agent) continue;
+          console.log(`NEW ${fmtRow(r)}`); hitForMe = true;
+        }
+        since = h.cursor;
+        if (!h.hasMore) break;
+      }
+      unwrap(await CALL("cursorSet", a.agent, { consumer, cursor: since }));
+    } else {
+      // server defaults `since` from the stored (principal, consumer) cursor;
+      // never auto-advances — we commit AFTER printing (at-least-once).
+      const w = await CALL("waitStep", a.agent, { consumer });
+      if (w.error === "resync") { await recover(w.data); continue; }
+      const v = unwrap(w);
+      for (const m of v.messages) {
+        if (a.channel && m.channel !== a.channel) continue;
+        console.log(`NEW ${fmtRow(m)}`); hitForMe = true;
+      }
+      if (v.messages.length) unwrap(await CALL("cursorSet", a.agent, { consumer, cursor: v.cursor }));
+    }
+    if (a.once) break;
+    if (hitForMe && a["exit-on-new"]) { console.log("watch: message for me; exiting"); break; }
+    if (Date.now() - started >= capSec * 1000) { console.log("watch: timeout cap reached; exiting"); break; }
+    await Bun.sleep(ivSec * 1000);
+  }
+}
+
 // ---------- arg parsing ----------
 type Args = Record<string, any>;
 function parse(argv: string[]): Args {
@@ -260,30 +514,44 @@ function parse(argv: string[]): Args {
   return a;
 }
 
-const HELP = `comms — join-able serverless agent comms (bun:sqlite)
-commands: join | rename | who | post | dm | inbox | read | thread | receipts | channels | group | ack | done | status | watch
+const HELP = `comms — join-able agent comms (local sqlite or hosted server)
+commands: join | rename | who | post | dm | dms | inbox | read | thread | receipts | channels | group | token | ack | done | status | watch
+transport: COMMS_URL+COMMS_TOKEN ⇒ remote · --local forces direct · else COMMS_HOME direct (§7)
 group: group create|join|leave|list|show|delete <name> [--agent who] · post --to group:<name>
+token: token create --agent <id> [--kind human] [--scopes a,b] [--admin] [--force] | token list | token revoke --id N
 run 'bun comms.ts <cmd> --help-ish' — see header of this file for full usage.`;
 
 async function main() {
   const a = parse(process.argv.slice(2));
+  setupTransport(a);
+  if (REMOTE && !remoteToken && a.cmd !== "help" && a.cmd !== undefined) {
+    console.error("error: COMMS_URL set but no token — pass --token or set COMMS_TOKEN");
+    process.exit(3);
+  }
   switch (a.cmd) {
-    case "join": return cmdJoin(a);
-    case "rename": return cmdRename(a);
-    case "who": return printWho(!a.all);
-    case "post": return cmdPost(a);
-    case "dm": return cmdDm(a);
-    case "dms": return cmdDms(a);
-    case "group": return cmdGroup(a);
-    case "inbox": return cmdInbox(a);
-    case "read": return cmdRead(a);
-    case "thread": return cmdThread(a);
-    case "receipts": return cmdReceipts(a);
-    case "channels": return cmdChannels();
-    case "ack": return setStatus(a.agent, a.id, "acked");
-    case "done": return setStatus(a.agent, a.id, "done");
-    case "status": return setStatus(a.agent, a.id, a.state);
+    case "join": return await cmdJoin(a);
+    case "rename": return await cmdRename(a);
+    case "who": return await printWho(!a.all);
+    case "post": return await cmdPost(a);
+    case "dm": return await cmdDm(a);
+    case "dms": return await cmdDms(a);
+    case "group": return await cmdGroup(a);
+    case "token": return await cmdToken(a);
+    case "inbox": return await cmdInbox(a);
+    case "read": return await cmdRead(a);
+    case "thread": return await cmdThread(a);
+    case "receipts": return await cmdReceipts(a);
+    case "channels": return await cmdChannels();
+    case "ack": return await setStatus(a.agent, a.id, "acked");
+    case "done": return await setStatus(a.agent, a.id, "done");
+    case "status": return await setStatus(a.agent, a.id, a.state);
     case "watch": return await cmdWatch(a);
+    case "history": {
+      const v = unwrap(await CALL("history", a.agent ?? "", { channel: a.channel, since: a.since, limit: a.limit }));
+      for (const r of v.rows) console.log(fmtRow(r));
+      console.log(`\ncursor=${v.cursor} hasMore=${v.hasMore}`);
+      return;
+    }
     default:
       console.log(HELP);
       process.exit(a.cmd ? 2 : 0);
