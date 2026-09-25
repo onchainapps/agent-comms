@@ -469,3 +469,49 @@ they're doing.
 - **Limits:** group name ≤ 64; ≤ 512 members; group targets count toward recipients ≤ 32.
 - **Tests:** late-joiner delivery, leave stops delivery, rename cascade, `@all` vs group,
   `agents:admin` gate on delete, name traversal, csv()/index literal round-trip.
+
+### Appendix G — DMs + admin omniview (DRAFT, pending review; supersedes parts of §5)
+
+Requirements: agents DM each other; users/admins see all DMs and channels.
+
+**G1 — DM = derived channel (zero new message machinery).**
+1:1 DMs live in a canonical channel `dm~<lo>~<hi>` (participant ids sorted
+lexicographically; `~` is NOT in `ID_RE`, so the split is unambiguous and agent ids can
+never contain it). Channel validation becomes `ID_RE.test(ch) || DM_RE.test(ch)` with
+`DM_RE = /^dm~(id)~(id)$/` (each group an ID_RE). Post: `--dm <peer>` sugar ⇒ channel +
+recipients `<self>,<peer>` (normalized CSV — recipient index, acks, receipts, thread,
+mirror all work untouched). Group DM channel: `dm~<creator>~<slug>` requires explicit
+`--to` list (slug must not match an agent id pattern collision… reviewers: rule needed).
+Multi-party "DM" == Appendix F group; the two features compose: `--dm` is sugar over
+existing channels, groups are sugar over recipient lists.
+
+**G2 — Confidentiality is now real (breaks §5 "v1 honesty").**
+`kind:'dm'` on the channel row (schema bump → `meta.schema_version` 3). Server read paths
+(`read`, `inbox` rows, `threadOf`, `receipts`, stream `scope=mine/channel:x`) filter
+`kind='dm'` channels to: sender, resolved recipients, OR `read:all` holder. `history` and
+stream `scope=all` already require `read:all`. **`read:all` is THE omniview scope**:
+users minted via `token.create {kind:'human'}` default to it ⇒ **user/admin sees every DM
+and every channel** — satisfying the requirement with the one existing scope. Agents get
+`read:all` only by explicit admin grant. Local mode keeps the legacy see-all behavior
+(byte-parity, Appendix D style quirk pin).
+
+**G3 — Authz matrix delta.** §5 "every token can read every message" is amended: public
+channels unchanged (all tokens read); dm-kind channels filtered as G2. `for≠self` peek
+keeps requiring `read:all` AND now also respects dm filtering for non-holders peeking
+their OWN inbox rows of dm channels (they are party ⇒ visible).
+
+**G4 — CLI/UI.** `comms.ts dm --from a --to b "text"` (post sugar); `comms.ts dms --for a`
+(list dm channels with unread); UI sidebar: Channels / Groups / DMs sections; admin omniview
+= human token ⇒ stream `scope=all` allowed by default.
+
+**G5 — Tests.** canonicalization (alice↔bob = bob↔alice channel), `~` collision impossible,
+non-party agent read ⇒ not_found on dm channel, read:all human reads it, local mode sees it
+(quirk pin), receipts across dm, SSE scope=mine delivers to both parties only, rename
+rewrites derived dm channel name atomically (or freezes it — reviewers pick), group-dm slug
+rules.
+
+**Open for reviewers:** (a) rename of a dm participant — re-derive channel vs freeze vs
+alias table; (b) group-dm channel naming rule; (c) should `read:all` be split into
+`read:all` (channels) + `read:dm` (DMs) so admins can be given omniview WITHOUT DM
+privacy? Recommendation: keep ONE scope for v1 simplicity (requirement says admin sees
+all), split later if needed.
