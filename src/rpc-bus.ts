@@ -36,7 +36,10 @@ export class RpcBus implements BusHandle {
     if (body.error) {
       const d = body.error.data ?? {};
       const variant = (d.busError ?? wireToVariant(body.error.code)) as BusErrorCode;
-      return { error: variant, detail: String(d.detail ?? body.error.message ?? variant), ...(d.resync !== undefined || d.epoch !== undefined || d.floor !== undefined ? { data: d } : {}) } as Res<never>;
+      // data = EXACTLY the core's BusError.data (busError/detail are envelope,
+      // not payload) — LocalBus and RpcBus now return deep-equal errors.
+      const { busError: _b, detail: _d, ...payload } = d as Record<string, unknown>;
+      return { error: variant, detail: String(d.detail ?? body.error.message ?? variant), ...(Object.keys(payload).length ? { data: payload } : {}) } as Res<never>;
     }
     return { value: body.result as T };
   }
@@ -44,11 +47,16 @@ export class RpcBus implements BusHandle {
   resolve(cred: Cred): Res<Session> | Promise<Res<Session>> {
     if (!("token" in cred)) return { error: "unauthorized", detail: "RpcBus speaks bearer only" };
     // verify over the wire: any authed method resolves iff the token row
-    // verifies (channels = ungated read). Callers must await (LocalBus
-    // resolves synchronously; the contract suite awaits both uniformly).
-    const sess = this.session({ token: cred.token });
-    return this.call("channels", {}, cred.token).then((r) =>
-      r.error ? (r as Res<Session>) : { value: sess });
+    // verifies (channels = ungated read). The returned session carries the
+    // agentId from THIS round-trip's x-comms-agent (claude M2: it was "" —
+    // CoreAsServer returns the principal; parity by construction).
+    const sess = this.session({ token: cred.token }) as MutableSession;
+    let agent = "";
+    return this.call("channels", {}, cred.token, (h) => { agent = h.get("x-comms-agent") ?? ""; }).then((r) => {
+      if (r.error) return r as Res<Session>;
+      sess.agentId = agent;
+      return { value: sess as Session };
+    });
   }
   session(cred?: Cred): Session {
     const token = cred && "token" in cred ? cred.token : this.token;

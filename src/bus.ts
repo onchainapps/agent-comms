@@ -1558,15 +1558,22 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       return { error: "unauthorized", detail: "unknown or revoked token" };
     const digest = createHmac("sha256", Buffer.from(row.salt)).update(token).digest();
     if (digest.length !== row.key_hash.length || !timingSafeEqual(digest, Buffer.from(row.key_hash)))
-      return { error: "unauthorized", detail: "bad token" };
+      return { error: "unauthorized", detail: "unknown or revoked token" }; // claude M2 n: ONE detail — "bad token" vs "unknown" was a prefix-existence oracle
     const kind = ((d.query("SELECT kind FROM agents WHERE id=?").get(row.agent_id) as any)?.kind ?? "agent") as "agent" | "human";
     return { value: { agentId: row.agent_id, scopes: normalizeScopes(csv(row.scopes)).split(",").filter(validScope) as Scope[], kind, tokenId: row.id } }; // finding 20: tokenId; legacy 8-name rows: unknown tokens are inert (M8)
   }
 
-  function tokenById(id: number): { agentId: string; scopes: Scope[]; revoked: boolean } | null {
+  /** Re-resolve a principal from the token ROW by id (§5: every request /
+   *  every SSE tick / every cookie request). `live` is the SAME predicate
+   *  tokenVerify applies minus the HMAC: not revoked AND agent_id not retired
+   *  (B1-legacy one-way door) — callers must not re-derive it. */
+  function tokenById(id: number): { agentId: string; scopes: Scope[]; kind: "agent" | "human"; revoked: boolean; retired: boolean; live: boolean } | null {
     const row = d.query("SELECT agent_id, scopes, revoked_at FROM tokens WHERE id=?").get(id) as any;
     if (!row) return null;
-    return { agentId: row.agent_id, scopes: normalizeScopes(csv(row.scopes)).split(",").filter(validScope) as Scope[], revoked: row.revoked_at !== null };
+    const retired = d.query("SELECT 1 FROM agent_retired WHERE id=?").get(row.agent_id) !== null;
+    const kind = ((d.query("SELECT kind FROM agents WHERE id=?").get(row.agent_id) as any)?.kind ?? "agent") as "agent" | "human";
+    const revoked = row.revoked_at !== null;
+    return { agentId: row.agent_id, scopes: normalizeScopes(csv(row.scopes)).split(",").filter(validScope) as Scope[], kind, revoked, retired, live: !revoked && !retired };
   }
 
   function tokenList(ctx: Ctx<M>): Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; created_at: string; last_used: string; revoked_at: string | null }[] }> {

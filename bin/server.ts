@@ -4,7 +4,7 @@
  * all behavior lives in src/server/mod.ts. §9: run as the service user that
  * owns .comms (0700) and comms.db (0600); exactly ONE server per DB file.
  *
- * usage: bun bin/server.ts [--home <dir>] [--port <p>] [--host <ip>] [--origin <https://…>]
+ * usage: bun bin/server.ts [--home <dir>] [--port <p>] [--host <ip>] [--origin <https://…>] [--trust-proxy]
  *   COMMS_HOME env (default ~/.comms-home) selects the bus dir.
  */
 import { homedir } from "node:os";
@@ -23,13 +23,18 @@ const home = arg("--home") ?? process.env.COMMS_HOME ?? join(homedir(), ".comms-
 const port = Number(arg("--port") ?? process.env.COMMS_PORT ?? 8700);
 const host = arg("--host") ?? process.env.COMMS_HOST ?? "127.0.0.1";
 const origin = arg("--origin") ?? process.env.COMMS_ORIGIN;
+// §9 per-IP 401 bucket key: behind nginx the socket peer is ALWAYS nginx, so
+// without this every client shares one bucket (one sprayer throttles all
+// logins). --trust-proxy ⇒ key on the RIGHTMOST X-Forwarded-For hop (the one
+// nginx appended). Never set it when the port is reachable without the proxy.
+const trustProxy = process.argv.includes("--trust-proxy") || process.env.COMMS_TRUST_PROXY === "1";
 
 if (!Number.isInteger(port) || port < 0 || port > 65535) {
   console.error("error: --port must be 0-65535");
   process.exit(2);
 }
 
-const srv = startServer({ home, port, hostname: host, origin });
+const srv = startServer({ home, port, hostname: host, origin, trustProxy });
 console.error(`agent-comms server: ${srv.url}  home=${home}`);
 console.error(`bootstrap (local, one-time): bun -e 'const {openBus,localCtx}=await import("${join(REPO, "src/bus.ts")}");const b=openBus({home:${JSON.stringify(home)},mode:"local"});console.log(b.tokenCreate(localCtx("bootstrap"),{agent:"root",admin:true}).value?.token??"(admin exists)");b.close()'`);
 console.error(`(the comms token CLI verb ships with the remote CLI, M3)`);

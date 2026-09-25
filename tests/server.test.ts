@@ -413,3 +413,233 @@ describe("M2 server transport", () => {
     } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
   });
 });
+
+// ---------------------------------------------------------------------------
+// claude M2 review (t_ab14167c) — each test FAILS on 3289b6e.
+describe("M2 review pins (claude)", () => {
+  const post = (url: string, body: unknown, headers: Record<string, string>) =>
+    fetch(`${url}/rpc`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+  const rq = (method: string, params: unknown = {}) => ({ jsonrpc: "2.0", method, params, id: 1 });
+  async function login(url: string, token: string) {
+    const li = await post(url, rq("login", { token }), {});
+    return /comms_session=([^;]+)/.exec(li.headers.get("set-cookie") ?? "")![1];
+  }
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  async function readFor(r: ReadableStreamDefaultReader<Uint8Array>, ms: number, until?: string) {
+    const dec = new TextDecoder(); let s = ""; let done = false; const t0 = Date.now();
+    while (Date.now() - t0 < ms && !(until && s.includes(until))) {
+      const x = await Promise.race([r.read(), sleep(ms - (Date.now() - t0)).then(() => null)]);
+      if (x === null) break; if (x.done) { done = true; break; } s += dec.decode(x.value);
+    }
+    return { s, done };
+  }
+
+  test("B1: cookie session re-resolves the token ROW per request — revoke kills it, rename re-keys it, retired id never posts", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0 });
+    try {
+      const root = new RpcBus(srv.url, tok).session({ token: tok });
+      const a = (await root.tokenCreate({ agent: "ck-a" })) as any;
+      const sid = await login(srv.url, a.value.token);
+      const ck = { cookie: `comms_session=${sid}` };
+      await root.rename({ agent: "ck-a", to: "ck-b" });
+      const r1 = await post(srv.url, rq("post", { to: ["root"], type: "note", body: "after rename" }), ck);
+      expect(r1.status).toBe(200);
+      expect(r1.headers.get("x-comms-agent")).toBe("ck-b"); // NOT the retired ck-a
+      const id = ((await r1.json()) as any).result.id;
+      expect(((srv.handle as any).raw.messageById(id)).sender).toBe("ck-b");
+      await root.tokenRevoke({ id: a.value.id });
+      const r2 = await post(srv.url, rq("channels"), ck);
+      expect(r2.status).toBe(401);
+      expect(srv.sessions.has(sid)).toBe(false); // session dies with the token
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("M1: per-IP 401 bucket is ENFORCED (429 + Retry-After), checked before HMAC, keyed on the socket peer not X-Forwarded-For", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0 });
+    try {
+      const st: number[] = [];
+      for (let i = 0; i < 14; i++)
+        st.push((await post(srv.url, rq("channels"), { authorization: `Bearer ac_${"x".repeat(40)}${i}`, "x-forwarded-for": `10.0.0.${i}` })).status);
+      expect(st.slice(0, 10).every((s) => s === 401)).toBe(true);
+      expect(st.slice(10).every((s) => s === 429)).toBe(true); // XFF rotation does NOT mint fresh buckets
+      const lim = await post(srv.url, rq("channels"), { authorization: `Bearer ${tok}` });
+      expect(lim.status).toBe(429); // exhausted ⇒ refused BEFORE the HMAC, even for a valid token
+      expect(Number(lim.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
+      const lg = await post(srv.url, rq("login", { token: "ac_" + "q".repeat(40) }), {});
+      expect(lg.status).toBe(429); // login shares the bucket
+      const sse = await fetch(`${srv.url}/stream`, { headers: { authorization: `Bearer ac_${"z".repeat(40)}` } });
+      expect(sse.status).toBe(429); // and /stream
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("M2: revoked token's open SSE stream is CLOSED (not a silent zombie); bad Last-Event-ID does not leak a stream slot", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0, limits: { tailerMs: 40 } });
+    try {
+      const root = new RpcBus(srv.url, tok).session({ token: tok });
+      const b = (await root.tokenCreate({ agent: "zz-b" })) as any;
+      const res = await fetch(`${srv.url}/stream`, { headers: { authorization: `Bearer ${b.value.token}` } });
+      const rd = res.body!.getReader(); await rd.read();
+      await root.tokenRevoke({ id: b.value.id });
+      const after = await readFor(rd, 2000);
+      expect(after.done).toBe(true);
+      expect(after.s).toContain("event: revoked");
+      const c = (await root.tokenCreate({ agent: "zz-c" })) as any;
+      const H = { authorization: `Bearer ${c.value.token}`, "last-event-id": "garbage" };
+      expect((await fetch(`${srv.url}/stream`, { headers: H })).status).toBe(400);
+      expect((await fetch(`${srv.url}/stream`, { headers: H })).status).toBe(400);
+      expect(srv.streamCount(c.value.id)).toBe(0);
+      const ok = await fetch(`${srv.url}/stream`, { headers: { authorization: `Bearer ${c.value.token}` } });
+      expect(ok.status).toBe(200);
+      ok.body?.cancel();
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  }, 20_000);
+
+  test("M3: a resuming laggard does not head-of-line block live subscribers", async () => {
+    const home = tmp();
+    const bb = openBus({ home, mode: "local" });
+    const tok = (bb.tokenCreate(localCtx("bootstrap"), { agent: "root", admin: true }) as any).value.token as string;
+    bb.testDb.exec("BEGIN");
+    const ins = bb.testDb.query("INSERT INTO events(kind,msg_id,agent_id,at) VALUES('presence',NULL,'root','2026-09-25T00:00:00Z')");
+    for (let i = 0; i < 6000; i++) ins.run();
+    bb.testDb.exec("COMMIT");
+    const ep = bb.epoch(); bb.close();
+    const srv = startServer({ home, port: 0 }); // DEFAULT 250 ms tailer
+    try {
+      const H = { authorization: `Bearer ${tok}` };
+      const live = await fetch(`${srv.url}/stream?scope=all`, { headers: H });
+      const lr = live.body!.getReader(); await lr.read();
+      const lag = await fetch(`${srv.url}/stream?scope=all`, { headers: { ...H, "last-event-id": `${ep}.0` } });
+      const lagR = lag.body!.getReader();
+      void (async () => { try { for (;;) if ((await lagR.read()).done) break; } catch { } })();
+      await sleep(50);
+      const t0 = Date.now();
+      const id = ((await (await post(srv.url, rq("post", { to: ["x"], type: "note", body: "live" }), H)).json()) as any).result.id;
+      const got = await readFor(lr, 2500, id);
+      expect(got.s).toContain(id);
+      expect(Date.now() - t0).toBeLessThan(1000); // was ≈2.7 s on 3289b6e (12 laggard pages × 250 ms)
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  }, 20_000);
+
+  test("M4: hello.seq on resume = the resume cursor (deltas apply AFTER it); same-epoch cursor above high-water ⇒ resync", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0, limits: { tailerMs: 40 } });
+    try {
+      const root = new RpcBus(srv.url, tok).session({ token: tok });
+      for (let i = 0; i < 3; i++) await root.post({ from: "root", to: "x", type: "note", body: "p" + i });
+      const ep = (srv.handle as any).raw.epoch();
+      const r = await fetch(`${srv.url}/stream?scope=all`, { headers: { authorization: `Bearer ${tok}`, "last-event-id": `${ep}.0` } });
+      const got = await readFor(r.body!.getReader(), 600);
+      const hello = JSON.parse(/event: hello\ndata: (.*)\n/.exec(got.s)![1]);
+      expect(hello.seq).toBe(0);
+      const seqs = [...got.s.matchAll(/id: [0-9a-f]+\.(\d+)/g)].map((m) => Number(m[1]));
+      expect(seqs.length).toBeGreaterThan(0);
+      expect(seqs.every((s) => s > hello.seq)).toBe(true); // was: every replayed seq <= hello.seq
+      const fut = await fetch(`${srv.url}/stream?scope=all`, { headers: { authorization: `Bearer ${tok}`, "last-event-id": `${ep}.999999` } });
+      expect((await readFor(fut.body!.getReader(), 500)).s).toContain("event: resync");
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("M5: chunked body with no Content-Length is capped (no unbounded pre-auth buffering)", async () => {
+    const home = tmp(); bootstrap(home);
+    const srv = startServer({ home, port: 0 });
+    try {
+      const chunk = new Uint8Array(1024 * 1024).fill(0x20); let sent = 0;
+      const body = new ReadableStream({ pull(c) { if (sent >= 4) { c.close(); return; } sent++; c.enqueue(chunk); } });
+      let status = 0;
+      try { status = (await fetch(`${srv.url}/rpc`, { method: "POST", headers: { "content-type": "application/json" }, body, duplex: "half" } as any)).status; } catch { status = -1; /* reset = also capped */ }
+      expect(status === 413 || status === -1).toBe(true);
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("m: RpcBus.resolve returns the principal's agentId; error data deep-equals the core's; 500 never leaks exception text; wrong-typed post ⇒ usage", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0 });
+    try {
+      const rb = new RpcBus(srv.url, tok);
+      const r = (await rb.resolve({ token: tok })) as any;
+      expect(r.value.agentId).toBe("root");
+      const h = (await rb.session({ token: tok }).history({ since: "deadbeefdeadbeef.5" })) as any;
+      const core = (srv.handle as any).raw;
+      const lh = core.history({ principal: { agentId: "root", kind: "agent", scopes: ["read:all"] }, actor: "root" }, { since: "deadbeefdeadbeef.5" });
+      expect(h.data).toEqual(lh.data);
+      const bad = await post(srv.url, rq("post", { to: [{}], type: "note", body: { x: 1 }, tags: 5 }), { authorization: `Bearer ${tok}` });
+      const bj = (await bad.json()) as any;
+      expect(bad.status).toBe(400);
+      expect(bj.error.data.busError).toBe("usage");
+      expect(JSON.stringify(bj)).not.toContain("is not a function");
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("m: non-admin scope=mine stream gets no token events for OTHER agents; ticket mint is metered; lowercase bearer scheme accepted", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0, limits: { tailerMs: 40, readBurst: 5, readRefill: 0.0001 } });
+    try {
+      const root = new RpcBus(srv.url, tok).session({ token: tok });
+      const a = (await root.tokenCreate({ agent: "pl-a" })) as any;
+      const res = await fetch(`${srv.url}/stream?scope=mine`, { headers: { authorization: `Bearer ${a.value.token}` } });
+      const rd = res.body!.getReader(); await rd.read();
+      await root.tokenCreate({ agent: "victim-svc" });
+      await root.post({ from: "root", to: "pl-a", type: "note", body: "sentinel" }); // proves the stream is live
+      const seen = (await readFor(rd, 1500, "event: msg")).s;
+      expect(seen).toContain("event: msg");
+      expect(seen).not.toMatch(/event: token\n[^\n]*\ndata: [^\n]*victim-svc/);
+      const st: number[] = [];
+      for (let i = 0; i < 8; i++) st.push((await fetch(`${srv.url}/stream.ticket`, { method: "POST", headers: { authorization: `Bearer ${a.value.token}` } })).status);
+      expect(st).toContain(429);
+      const lc = await post(srv.url, rq("channels"), { authorization: `bearer ${tok}` });
+      expect(lc.status).toBe(200);
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("m: trustProxy keys the 401 bucket on the RIGHTMOST X-Forwarded-For hop (client-supplied leftmost ignored); cookie cannot mint stream tickets; pinned origin + absent Origin ⇒ CSRF 403", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0, trustProxy: true, origin: "https://comms.example" });
+    try {
+      const st: number[] = [];
+      for (let i = 0; i < 12; i++) // attacker rotates the LEFT hop; nginx appends the real peer on the right
+        st.push((await post(srv.url, rq("channels"), { authorization: `Bearer ac_${"x".repeat(40)}${i}`, "x-forwarded-for": `6.6.6.${i}, 203.0.113.9` })).status);
+      expect(st.slice(10)).toEqual([429, 429]);
+      const other = await post(srv.url, rq("channels"), { authorization: `Bearer ${tok}`, "x-forwarded-for": "198.51.100.7" });
+      expect(other.status).toBe(200); // a different real client is unaffected
+      const li = await post(srv.url, rq("login", { token: tok }), { origin: "https://comms.example", "x-forwarded-for": "198.51.100.7" });
+      const sid = /comms_session=([^;]+)/.exec(li.headers.get("set-cookie") ?? "")![1];
+      const tk = await fetch(`${srv.url}/stream.ticket`, { method: "POST", headers: { cookie: `comms_session=${sid}`, origin: "https://evil.example", "content-type": "application/x-www-form-urlencoded" } });
+      expect(tk.status).toBe(401); // tickets are bearer-only (§6: non-cookie clients) — no CSRF-unchecked cookie write
+      const noOrigin = await post(srv.url, rq("channels"), { cookie: `comms_session=${sid}` });
+      expect(noOrigin.status).toBe(403);
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("m: read event with no message row is dropped (G2: no visibility proof ⇒ no frame)", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0, limits: { tailerMs: 40 } });
+    try {
+      const root = new RpcBus(srv.url, tok).session({ token: tok });
+      const c = (await root.tokenCreate({ agent: "rd-c" })) as any;
+      const res = await fetch(`${srv.url}/stream?scope=mine`, { headers: { authorization: `Bearer ${c.value.token}` } });
+      const rd = res.body!.getReader(); await rd.read();
+      (srv.handle as any).raw.testDb.run("INSERT INTO events(kind,msg_id,agent_id,at) VALUES('read','no-such-msg','alice','2026-09-25T00:00:00Z')");
+      await root.post({ from: "root", to: "rd-c", type: "note", body: "sentinel" });
+      const seen = (await readFor(rd, 1500, "event: msg")).s;
+      expect(seen).toContain("event: msg");
+      expect(seen).not.toContain("no-such-msg");
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("m: epoch rotated under a live stream ⇒ resync frame + close (ids carried the dead epoch)", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0, limits: { tailerMs: 40 } });
+    try {
+      const res = await fetch(`${srv.url}/stream?scope=all`, { headers: { authorization: `Bearer ${tok}` } });
+      const rd = res.body!.getReader(); await rd.read();
+      (srv.handle as any).raw.rotateEpoch();
+      const got = await readFor(rd, 1000);
+      expect(got.s).toContain("event: resync");
+      expect(got.s).toContain('"floor"');
+      expect(got.done).toBe(true);
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+});
