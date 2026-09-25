@@ -1861,6 +1861,15 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     return (d.query("SELECT * FROM messages WHERE id=?").get(id) as MsgRow | null) ?? null;
   }
 
+  // §7 /raw: resolve a mirror filename back to its authoritative message row.
+  // (SQLite is the source of truth — the file is just the byte we serve.)
+  // messages.file is stored home-relative ("messages/<channel>/<name>"), so
+  // rebuild that exact shape — a basename match against another channel's
+  // identically-named file can never slip through.
+  function messageByFile(channel: string, file: string): MsgRow | null {
+    return (d.query("SELECT * FROM messages WHERE channel=? AND file=?").get(channel, `messages/${channel}/${file}`) as MsgRow | null) ?? null;
+  }
+
   function db_txn<T>(fn: () => T): T {
     d.exec("BEGIN IMMEDIATE");
     try { const v = fn(); d.exec("COMMIT"); return v; }
@@ -1876,7 +1885,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     joinAgent, listAgents, post, inbox, read, threadOf, receipts, setStatus, channels, rename,
     tokenCreate, tokenVerify, tokenById, tokenList, tokenRevoke, tokenTouch,
     cursorGet, cursorSet, history, waitStep, tailEvents, eventsHighWater, epoch, gcFloor, rotateEpoch, gc, preflight,
-    allMessages, allMessageIds, messageById, ensureChannel,
+    allMessages, allMessageIds, messageById, messageByFile, ensureChannel,
     groupCreate, groupJoin, groupLeave, groupDelete, groupList, groupShow,
     canSeeChannel, membershipsOf, deliveredMsgIds, dmMembers, dmMembersFor, dmChannelForPair,
     isActive, recipientsMatch, roleOf, receiptsForMsg, renderMd, touch, close,

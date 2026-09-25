@@ -642,4 +642,58 @@ describe("M2 review pins (claude)", () => {
       expect(got.done).toBe(true);
     } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
   });
+
+  // ---------- §7 GET /raw/messages/<channel>/<file> ----------
+  test("§7 /raw: mirror bytes served to addressee; 401 without cred; traversal + regex rejected pre-join", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0 });
+    try {
+      const rpc2 = new RpcBus(srv.url, tok);
+      const root = rpc2.session({ token: tok });
+      const p = await root.post({ from: "root", to: "peeker", type: "note", body: "raw bytes here" });
+      expect(p.error).toBeUndefined();
+      const file = String((p as any).value.file).split("/").pop()!;
+      const hit = await fetch(`${srv.url}/raw/messages/general/${file}`, { headers: { authorization: `Bearer ${tok}` } });
+      expect(hit.status).toBe(200);
+      expect(await hit.text()).toContain("raw bytes here");
+      const noauth = await fetch(`${srv.url}/raw/messages/general/${file}`);
+      expect(noauth.status).toBe(401);
+      // regex gates run BEFORE any join:
+      for (const evil of ["../etc/passwd", "msg-x.txt", "msg%2Fx.md", "MSG-x.md"]) {
+        const r = await fetch(`${srv.url}/raw/messages/general/${evil}`, { headers: { authorization: `Bearer ${tok}` } });
+        const rb: any = await r.json().catch(() => null);
+        expect([r.status, rb?.error?.code].join()).toBe("404,-32003");
+      }
+      const badChan = await fetch(`${srv.url}/raw/messages/..%2Fx/${file}`, { headers: { authorization: `Bearer ${tok}` } });
+      expect(badChan.status).toBe(404);
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("§7 /raw DM: participant 200; non-party 404 (invisible==missing); read:dm holder 200", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0 });
+    try {
+      const rpc2 = new RpcBus(srv.url, tok);
+      const root = rpc2.session({ token: tok });
+      const t1 = await root.tokenCreate({ agent: "r1" });
+      const t2 = await root.tokenCreate({ agent: "r2" });
+      const tD = await root.tokenCreate({ agent: "rdm", scopes: ["read:dm"] });
+      const s1 = rpc2.session({ token: (t1 as any).value.token });
+      const s2 = rpc2.session({ token: (t2 as any).value.token });
+      await s1.joinAgent({ agent: "r1", role: "r1" });
+      await s2.joinAgent({ agent: "r2", role: "r2" });
+      const p = await s1.post({ from: "r1", to: "r2", type: "note", body: "dm secret", dm: "r2" });
+      expect(p.error).toBeUndefined();
+      const chan = (p as any).value.channel, file = String((p as any).value.file).split("/").pop()!;
+      expect(chan).toMatch(/^dm~/);
+      const part = await fetch(`${srv.url}/raw/messages/${chan}/${file}`, { headers: { authorization: `Bearer ${(t2 as any).value.token}` } });
+      expect(part.status).toBe(200);
+      expect(await part.text()).toContain("dm secret");
+      const tOut = await root.tokenCreate({ agent: "rout" });
+      const out = await fetch(`${srv.url}/raw/messages/${chan}/${file}`, { headers: { authorization: `Bearer ${(tOut as any).value.token}` } });
+      expect(out.status).toBe(404); // plain agent, non-member, no read:dm ⇒ invisible == missing
+      const peek = await fetch(`${srv.url}/raw/messages/${chan}/${file}`, { headers: { authorization: `Bearer ${(tD as any).value.token}` } });
+      expect(peek.status).toBe(200);
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
 });

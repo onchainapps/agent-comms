@@ -265,6 +265,9 @@ async function cmdPost(a: Args) {
   const body = readBody(a.body);
   const p: Record<string, unknown> = {
     from: a.sender, to: a.to, type: a.type, subject: a.subject, body,
+    // --as: RFC §5 impersonation (requires post:as in server mode); legacy CLI
+    // silently ignored the flag in local mode — core treats absent as no-op.
+    ...(a.as ? { as: String(a.as) } : {}),
     thread: a.thread, re: a.re, tags: a.tags, channel: a.channel,
   };
   // §6/§7: remote CLI generates ONE idempotency key per logical post; the

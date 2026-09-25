@@ -6,9 +6,11 @@
  * kick) → one SSE broadcaster at GET /stream; tickets, CSRF (cookie + login),
  * rate-limit buckets (§9). The core is opened ONCE in server mode.
  */
-import { openBus, serverCtx, RPC_CODES, type BusErrorCode, type Scope, type Cred } from "../bus.ts";
+import { openBus, serverCtx, validChannelName, RPC_CODES, type BusErrorCode, type Scope, type Cred } from "../bus.ts";
 import { serverHandle, wrapSession, type BusHandle, type Session } from "../bus-iface.ts";
 import type { Seams } from "../seams.ts";
+import { join, sep } from "node:path";
+import { realpathSync } from "node:fs";
 
 // ---------- §9 limits ----------
 export const LIMITS = {
@@ -26,6 +28,9 @@ export const LIMITS = {
 };
 
 const WRITE_METHODS = new Set(["join", "post", "status", "rename", "token.create", "token.revoke", "group.create", "group.join", "group.leave", "group.delete", "cursor.set", "login"]);
+
+// §7 /raw filename gate: msg-<...>.md, no '/' (regex runs before any join).
+const FILE_RE = /^msg-[A-Za-z0-9._-]+\.md$/;
 
 // ---------- JSON-RPC plumbing ----------
 const J = {
@@ -584,6 +589,35 @@ export function startServer(opts: ServerOpts): RunningServer {
       if (req.method === "GET" && url.pathname === "/health") return json(200, { ok: true, epoch: core.epoch() });
       if (req.method === "POST" && url.pathname === "/rpc") return handleRpc(req, ip);
       if (req.method === "GET" && url.pathname === "/stream") return handleStream(req, ip);
+      // §7 GET /raw/messages/<channel>/<file> — mirror bytes for remote agents.
+      // Auth: same bearer/cookie chain as /rpc. File regex + channel regex run
+      // BEFORE any path join; realpath must stay under MSG_DIR; the resolved
+      // message must pass canSee (invisible == missing).
+      if (req.method === "GET" && url.pathname.startsWith("/raw/messages/")) {
+        const rest = url.pathname.slice("/raw/messages/".length);
+        const seg = rest.split("/");
+        // match on the RAW percent-encoded segments (decodeURIComponent could
+        // smuggle %00/%2F past the regex), then decode the safe remainder.
+        if (seg.length !== 2 || !FILE_RE.test(seg[1]) || !validChannelName(seg[0]))
+          return json(404, { jsonrpc: "2.0", error: rpcErr(-32003, "not found"), id: null });
+        const chan = decodeURIComponent(seg[0]);
+        const file = decodeURIComponent(seg[1]);
+        const a = auth(req, ip);
+        if ("err" in a) return failResp(a, null);
+        const t = bucketFor(a.ok.tokenId, "raw").take(); // read bucket
+        if (!t.ok) return json(429, { jsonrpc: "2.0", error: rpcErr(-32004, "rate limited", { busError: "rate_limited", detail: "rate limit exceeded" }), id: null }, { "retry-after": String(Math.max(1, Math.ceil(t.retryAfterMs / 1000))) });
+        const msg = core.messageByFile(chan, file);
+        if (!msg || !core.canSeeChannel(serverCtx(a.ok.agentId, a.ok.scopes), msg.channel))
+          return json(404, { jsonrpc: "2.0", error: rpcErr(-32003, "not found"), id: null });
+        const abs = join(core.MSG_DIR, chan, file);
+        let real: string | null = null;
+        try { real = realpathSync(abs); } catch { /* missing file on disk ⇒ not found */ }
+        const rootReal = realpathSync(core.MSG_DIR);
+        if (real === null || !(real === rootReal || real.startsWith(rootReal + sep)))
+          return json(404, { jsonrpc: "2.0", error: rpcErr(-32003, "not found"), id: null });
+        const f = Bun.file(real);
+        return new Response(f, { headers: { "content-type": "text/markdown; charset=utf-8", "x-comms-agent": a.ok.agentId, "x-comms-scopes": a.ok.scopes.join(",") } });
+      }
       if (req.method === "POST" && url.pathname === "/stream.ticket") {
         // §6: tickets are for NON-COOKIE clients only ⇒ bearer required (a
         // cookie-authed mint was also a CSRF-unchecked write).
