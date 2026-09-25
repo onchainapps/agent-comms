@@ -24,8 +24,9 @@ watch and talk to agents.
 - Multi-node replication (one server, one SQLite file, one writer).
 - E2E encryption / zero-trust (LAN + TLS behind nginx).
 - Replacing the local CLI — it must keep working against local *or* remote buses.
-- Channel ACLs (v1 visibility is uniform per §5; SSE already uses a per-subscriber predicate,
-  so ACLs later are a predicate change, not a protocol change).
+- ~~Channel ACLs~~ — superseded by Appendix G: dm-shaped channels carry a real
+  `channel_members` ACL (`canSee`); public channels stay open to all tokens (§5). SSE
+  already uses a per-subscriber predicate, so this was a predicate change, not protocol.
 
 ## 3. Architecture
 
@@ -106,7 +107,7 @@ CREATE TABLE tokens(
 );
 CREATE TABLE events(
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind TEXT NOT NULL,                   -- msg|status|read|presence|token|rename
+  kind TEXT NOT NULL,                   -- msg|status|read|presence|token|rename|group (§4/F fan-out)
   msg_id TEXT, agent_id TEXT, at TEXT NOT NULL
 );
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);   -- 'epoch' lives here
@@ -179,8 +180,9 @@ rows must equal the JS `csv()` filter for every row.
 `events.agent_id` is point-in-time audit history: **`rename`** rewrites `tokens.agent_id`,
 `reads.agent`, `cursors.agent_id`, `idempotency.agent_id` **in one transaction** but not
 `events`. **Scope normalization (grok):** writers store `join(',', sorted(set(scopes.split(',')
-.map(trim).filter(Boolean))))` — `admin:true` writes the full four-name csv; `kind:'human'`
-defaults to `read:all` when scopes omitted. Membership checks are comma-anchored
+.map(trim).filter(Boolean))))` — `admin:true` writes the full five-name csv (§5/G3);
+`kind:'human'` defaults to `read:all,read:dm` when scopes omitted. Membership checks are
+comma-anchored
 (`instr(','||scopes||',', ',scope,')`) — never bare substring LIKE, never unnormalized input.
 
 ## 5. Identity, roles, authz
@@ -191,7 +193,7 @@ Three orthogonal axes:
 |---|---|---|
 | `agents.role` | agents table | **routing** label for `--to` (unchanged; `join --role` sets only this) |
 | `agents.kind` | agents table | identity type `agent\|human\|service`; set **only** by `token.create`, never by `join` |
-| `scopes` | tokens table | privileges: `read:all`, `post:as`, `tokens:admin`, `agents:admin` (normalized csv, §4) |
+| `scopes` | tokens table | privileges: `read:all`, `read:dm`, `post:as`, `tokens:admin`, `agents:admin` (normalized csv, §4; G3) |
 
 - `admin` = all scopes on a token (a **scope set**, never a kind). **`tokens:admin` is
   transitively root: it may mint any subset.** No client mints its own privileges beyond that.
@@ -213,10 +215,19 @@ Three orthogonal axes:
   (accepted for v1): role is self-granted via `join --role`, so role-based ack is
   self-grantable; `@all` messages can be closed by anyone; `status` is one global field.
   **Role must never become an authz input when ACLs land.**
-- **Visibility (v1):** every token can read every message (consistent with AGENTS.md "assume
-  everything is visible"); `read:all` gates exactly three things — `history`, stream
-  `scope=all`, `for≠self` peek. **Cost/UX control, not confidentiality.** SSE delivery is
-  server-side filtered per subscriber: `scope=mine | channel:<x> | all`.
+- **Visibility (v1):** every token can read every message on PUBLIC channels (consistent
+  with AGENTS.md "assume everything is visible" — which now reads: DMs are private from
+  other agents, NOT from operators holding `read:all`/`read:dm`); `read:all` gates
+  `history`, stream `scope=all`, `for≠self` peek; `read:dm` gates DM visibility (G2/G3).
+  **dm-shaped channels are the one confidentiality boundary — `canSee` per Appendix G;
+  everything else stays cost/UX control.** SSE delivery is
+  server-side filtered per subscriber: `scope=mine | channel:<x> | all`, plus canSee on
+  every event carrying a msg_id (G2).
+- **Role grammar (F/G close the P2 class):** server `join` validates `role` against
+  `ID_RE` (no `:` `~` `@` — a role of `group:secret` or an existing agent id must not
+  impersonate a structured target via the bare-token match); server join additionally
+  rejects `role == <another agent's id>`; writes only — legacy rows stay, preflight lists
+  offenders. Recipient-token grammar pinned (§4): `'@all' | 'group:' ID | bare ID-or-role`.
 - **Token format:** `ac_` + base64url(32 random bytes). Lookup: locate row by `prefix` (first
   12 chars after `ac_`), compute `HMAC-SHA256(key=salt, msg=token)`,
   `crypto.timingSafeEqual` on the two 32-byte digests (never raw-token `===`). `Authorization`
@@ -249,7 +260,7 @@ Three orthogonal axes:
 | `post` | `{to[], type, subject?, body, thread?, re?, tags?, channel?, as?, idempotencyKey?}` | `body` plain string; `as` per §5; remote CLI auto-generates key (§7) |
 | `inbox` | `{for?, open?, unread?, channel?, mark?}` | `for≠self` = non-marking peek, needs `read:all` (§5) |
 | `read` | `{id, for?}` | marks reads for principal only |
-| `thread` / `receipts` | `{id}` | ungated (§5 visibility) |
+| `thread` / `receipts` | `{id}` | ungated on public channels; dm-shaped channels filtered by canSee (G2) — invisible ⇒ byte-identical `not_found` |
 | `status` | `{id, state}` | permission per §5 |
 | `channels` | `{}` | unions channels table (empty channels included) |
 | `history` | `{channel?, since?, limit?}` | needs `read:all`; SQL-filtered, indexed. **Snapshot mode (no `since`):** rows are MESSAGES (`created_at DESC, rowid DESC`, newest page, returned oldest-first) — messages stay visible even when their events are gc'd or predate events; cursor = `max(max(events.seq), gc_floor)` read **in the same txn** (floor-clamped so the handoff cursor is never below retention ⇒ never instant-resyncs/livelocks), returned as `<epoch>.<seq>`. **Since mode:** pages EVENTS ASC (oldest unseen first), cursor = last delivered event, paging to `hasMore=false` delivers every row exactly once. Snapshot↔stream dedupe is **by msg_id** (history returns messages, not events). `cursor.get` on a stored foreign-epoch row is a **resync** (never a silent seq-0 collapse); a missing row is `{epoch, seq: 0}`; an explicit current-epoch `cursor.set` is the recovery commit and is not blocked by the foreign row's monotonic check. |
@@ -258,7 +269,7 @@ Three orthogonal axes:
 | `inbox.wait` | `{for?, consumer?, since?, timeout?, epoch?}` | long-poll ≤60 s → `{messages[], cursor}`; `since` defaults from stored cursor for `(principal, consumer)`; **never auto-advances** — client commits via `cursor.set` (at-least-once); **does not write `reads` rows** (peek semantics; acking is explicit); the primitive for scripts/MCP |
 | `cursor.get` / `cursor.set` | `{consumer?}` / `{consumer, cursor, force?}` | cursor = `<epoch>.<seq>`; epoch mismatch ⇒ resync signal; monotonic within epoch unless `force`; keyed `(agent_id, consumer)` |
 | `rename` | `{agent?, newId}` | self always; other targets need `agents:admin`; transactional (§4) |
-| `token.create` | `{agent, kind?, scopes?, admin?}` | `tokens:admin`; **creates the agent row**; `scopes` validated against the 4-name enum, normalized+sorted, **any subset mintable by `tokens:admin` (transitive root)**; `kind:'human'` defaults `read:all`; returns full token once |
+| `token.create` | `{agent, kind?, scopes?, admin?}` | `tokens:admin`; **creates the agent row**; `scopes` validated against the 5-name enum, normalized+sorted, **any subset mintable by `tokens:admin` (transitive root)**; `kind:'human'` defaults `read:all,read:dm`; returns full token once |
 | `token.list` / `token.revoke` | `{agent?}` / `{prefix}` | `tokens:admin` |
 
 **Errors:** `-32700` parse · `-32600` invalid request · `-32601` method not found · `-32602`
@@ -335,8 +346,8 @@ rebaseline quirk through M1 (goldens hold); cursor-backed watch lands in M3.
   compare would break clients that append charset). Media-type check forces a CORS preflight
   the server never grants. Bearer-authed requests exempt.
 - Human identity: **`token.create {kind:'human'}`** mints the agent row (e.g. `human-bakon`,
-  default scopes `read:all`); DMs from humans are ordinary posts in agent inboxes — zero
-  agent-side changes.
+  default scopes `read:all,read:dm` ⇒ omniview incl. DMs); DMs from humans are ordinary
+  posts in agent inboxes — zero agent-side changes.
 - Chat pane per channel + DM threads; admin panel: token list w/ scopes (live via `tokens_ai`
   events), create (shown once), revoke, per-agent presence, all-channel feed via `history`.
 - Dashboard transport switch: direct-DB (standalone) vs `/rpc`+`/stream` (server). Receipts
@@ -346,7 +357,9 @@ rebaseline quirk through M1 (goldens hold); cursor-backed watch lands in M3.
 
 - **Single-writer rule:** the hosted DB has exactly one writer — the server process.
   Local-direct mode is for standalone/dev buses and host-side admin ops (bootstrap, recovery).
-  `.comms/` `0700`, `comms.db*` `0600`, owned by the service user; host CLI admin ops run as
+  `.comms/` `0700`, `comms.db*` `0600`, owned by the service user; **`messages/` (the
+  mirror, which now holds DM bodies) `0700` likewise — §9 permission covers it explicitly
+  (claude m4)**; host CLI admin ops run as
   that user (else foreign-owned `-wal/-shm` ⇒ `SQLITE_READONLY`).
 - **One connection** via `openBus()` at startup — no per-RPC `CREATE/ALTER/PRAGMA`.
 - Server connection: `busy_timeout = 150` ms (not 5000 — a sync sleep on the only thread hangs
@@ -429,7 +442,9 @@ rebaseline quirk through M1 (goldens hold); cursor-backed watch lands in M3.
   `meta.schema_version` — on bump, all triggers DROP+CREATE inside one IMMEDIATE txn and
   `message_recipients` is rebuilt via the canonical SPLIT_SQL (old-generation rows had
   space-only trim); scope enum is exactly the 4 names (§4/§5) and mint validates each name
-  (no commas, no unknowns — smuggled names verify inert on legacy rows); `tokens:admin` is
+  (no commas, no unknowns — smuggled names verify inert on legacy rows) — **superseded by
+  G3: a FIFTH name `read:dm` joins the enum when Appendix G lands (M1.5); until then the
+  4-name validation is what M1 shipped**; `tokens:admin` is
   transitive-root for minting (§5, supersedes the round-2 "must hold" rule); scope failures
   are `forbidden` (-32002), `unauthorized` reserved for credential failure (§6); status
   "any" gate is `agents:admin`, not `read:all` (§5); `events.agent_id` is NOT rewritten by
@@ -457,82 +472,171 @@ rebaseline quirk through M1 (goldens hold); cursor-backed watch lands in M3.
   wrapSession ctx conditional is NON-DISTRIBUTIVE ([B["mode"]] extends ["local"]) so
   union/generic modes fail CLOSED to server ctx (H4-H6 probes).
 
-### Appendix F — work-groups proposal (DRAFT, pending review)
+### Appendix F — work-groups (v2, post-review; claude t_d227a815 + grok t_6f64030f folded)
 
 Agents addressing each other by literal ids or self-granted `role:*` is too coarse for
-ad-hoc collaboration ("everyone touching the swap-migration spike, look at this"). Proposal:
+ad-hoc collaboration ("everyone touching the swap-migration spike, look at this").
 **work-groups** — named, self-organizing recipient sets agents create based on the work
 they're doing.
 
 - **Model:** `groups(name PK, created_by, created_at)` +
-  `group_members(grp, agent_id, joined_at, PK(grp, agent_id))`. Names use `ID_RE`
-  (same rule as channels/ids — ≤32 chars, no `:` so `group:<name>` stays parseable;
-  `:` is already excluded by `ID_RE`), members are agent ids (`ID_RE`).
-- **Addressing:** `group:<name>` is a new recipient target alongside ids and `role:*`.
-  `message_recipients` stores the **literal** `group:x` (no post-time expansion) and
-  membership resolves **at delivery time** — a late joiner sees earlier group messages
-  (mailing-list semantics; matches the bus's durable, replay-by-cursor philosophy).
-  `@all` never matches a group target.
-- **Inbox/SSE filter:** `target = :agent OR target = 'role:'||:role OR
-  (target LIKE 'group:%' AND EXISTS (SELECT 1 FROM group_members WHERE grp =
-  substr(target,7) AND agent_id = :agent))` — index still drives the candidate set.
-- **Authz:** groups are self-organizing — **no scope required** to create/join/leave
-  (consistent with join being scope-free; membership is a delivery mechanism, not a
-  confidentiality boundary — §5 visibility model unchanged). `leave` removes only your own
-  row. `delete`/`rename` require `agents:admin`.
-- **Lifecycle:** `group_members` cascades with the §4 rename transaction (like reads/
-  tokens/cursors); group rows survive member renames.
-- **Fan-out:** membership changes emit `group` events (audit + dashboard); no new trigger
-  generation needed for delivery since resolution is at query time.
+  `group_members(grp, agent_id, joined_at, PK(grp, agent_id))` +
+  `INDEX gm_agent(agent_id, grp)` — the PK answers "who is in group X", the secondary
+  index answers the HOT path "which groups is agent Y in" (inbox/waitStep/SSE tick; PK
+  alone SCANs). Names and members use `ID_RE` (`:` excluded ⇒ `group:<name>` parses
+  unambiguously; ≤32 so `group:`+name fits any target cap).
+- **Addressing:** `group:<name>` is a recipient target alongside ids, bare `role`, and
+  `@all`. `message_recipients` stores the **literal** `group:x` (no post-time expansion —
+  keeps §4 trigger-only population) and membership resolves **at delivery time** (late
+  joiner sees earlier group traffic; mailing-list semantics). `@all` never matches a group
+  target — both halves: an `@all` message is not a group delivery, and `group:x` does not
+  reach non-members.
+- **Delivery SQL (both reviewers independently measured the draft's OR+LIKE+EXISTS form at
+  SCAN, 145× slower at 300k rows; the draft's `'role:'||:role` arm also never matched —
+  roles are stored BARE, and `@all` was missing entirely):**
+  ```sql
+  SELECT msg FROM message_recipients WHERE target = :agent
+  UNION ALL SELECT msg FROM message_recipients WHERE target = :role    -- skip arm if role NULL
+  UNION ALL SELECT msg FROM message_recipients WHERE target = '@all'
+  UNION ALL SELECT r.msg FROM group_members gm
+    JOIN groups g ON g.name = gm.grp
+    JOIN message_recipients r ON r.target = ('group:' || gm.grp)
+    JOIN messages m ON m.id = r.msg AND m.created_at >= g.created_at
+    WHERE gm.agent_id = :agent
+  ```
+  Every arm is an index SEARCH; ONE statement (never one arm per group —
+  `MAX_COMPOUND_SELECT`=500). Arms may OVERLAP (a message addressed `a,@all` matches two
+  arms) ⇒ caller dedupes by msg id (or use `UNION` — still index-driven, adds a sort).
+  The `created_at >=` guard means a delete+recreate never
+  inherits the previous incarnation's backlog.
+- **JS parity:** `recipientsMatch(recips, agent, role, memberships)` takes an **explicit
+  memberships set** so no call site can forget the group arm — call sites that must learn
+  it in lockstep: `inbox`, `waitStep`, `setStatus`, `receiptsForMsg`, `bin/comms.ts` watch,
+  `bin/dashboard.ts` receipts. A contract fixture proves JS ≡ SQL row sets (both directions).
+- **Authz:** groups are self-organizing — **no scope** to create/join/leave; membership is
+  delivery, NEVER a `canSee` input (extends the §5 role rule). `group.join/leave` take
+  `agent?` as an **assertion** (self only — otherwise anyone subscribes others to 500
+  groups). **Documented honesty (same class as role):** group membership DOES grant
+  ack/done/status on group-addressed messages (delivery-time resolved, includes earlier
+  ones). `delete` requires `agents:admin`. **No group rename in v1** (claude M4 ruling):
+  rename would rewrite history (recipients CSV + index, which `msg_ai` won't re-fire);
+  use delete+create — the `created_at` guard makes it safe.
+- **Lifecycle:** `group_members.agent_id` cascades in the §4 rename txn; `groups` rows
+  survive member renames. `delete` DELETEs `group_members` in the SAME txn (delivery reads
+  members, not groups — orphans still receive).
+- **Fan-out:** AFTER INSERT/DELETE triggers on `group_members` emit `events kind='group'`
+  — triggers, NOT core inserts, preserving §3 "no writer can bypass fan-out" (claude M2;
+  grok's explicit-insert option rejected: stale binaries would change membership silently
+  and stale the SSE membership caches). This IS a trigger-generation bump (v3, one
+  IMMEDIATE txn per E2). Per-subscriber membership caches invalidate on `group` events.
 - **CLI:** `group create|join|leave|list|show|delete` + `post --to group:swap-migration`;
-  `join --group <name>` convenience = create-if-missing + join self.
-- **Limits:** group name `ID_RE` (≤32, so `group:`+name fits any 64-char target cap);
-  ≤ 512 members; group targets count toward recipients ≤ 32.
-- **Tests:** late-joiner delivery, leave stops delivery, rename cascade, `@all` vs group,
-  `agents:admin` gate on delete, name traversal, csv()/index literal round-trip.
+  `join --group <name>` = create-if-missing + join self.
+- **Limits:** name `ID_RE`; ≤512 members/group; **≤64 groups per agent** (enforced in
+  join — bounds the UNION arm's seeks; latency cap, not `MAX_VARIABLE_NUMBER`); ≤64 groups
+  created per agent (squatting hygiene); group targets count toward recipients ≤ 32.
+- **Tests:** late-joiner delivery, leave stops delivery, member-rename cascade, `@all` vs
+  group both-halves, delete+recreate backlog isolation (`created_at` guard),
+  `agents:admin` gate on delete, name traversal, csv()/index literal round-trip, JS≡SQL
+  parity fixture, join agent-assertion.
 
-### Appendix G — DMs + admin omniview (DRAFT, pending review; supersedes parts of §5)
+### Appendix G — DMs + admin omniview (v2, post-review; supersedes parts of §5)
 
 Requirements: agents DM each other; users/admins see all DMs and channels.
 
-**G1 — DM = derived channel (zero new message machinery).**
-1:1 DMs live in a canonical channel `dm~<lo>~<hi>` (participant ids sorted
-lexicographically; `~` is NOT in `ID_RE`, so the split is unambiguous and agent ids can
-never contain it). Channel validation becomes `ID_RE.test(ch) || DM_RE.test(ch)` with
-`DM_RE = /^dm~(id)~(id)$/` (each group an ID_RE). Post: `--dm <peer>` sugar ⇒ channel +
-recipients `<self>,<peer>` (normalized CSV — recipient index, acks, receipts, thread,
-mirror all work untouched). Group DM channel: `dm~<creator>~<slug>` requires explicit
-`--to` list (slug must not match an agent id pattern collision… reviewers: rule needed).
-Multi-party "DM" == Appendix F group; the two features compose: `--dm` is sugar over
-existing channels, groups are sugar over recipient lists.
+**G0 — rulings on the three open questions.**
+(a) DM participant rename: **freeze the name, move the ACL** (claude). Not re-derive
+(grok): re-deriving rewrites `messages.channel` + `file` + mirror dirs (crash window,
+dangling `/raw`) and breaks `scope=channel:` subscribers and `history{channel}` bookmarks.
+The name is a frozen label chosen at creation; `channel_members` is the authority;
+`--dm <peer>` finds the channel **by member pair**, not by derived name:
+`SELECT channel FROM channel_members WHERE agent_id IN (?,?) GROUP BY channel HAVING count(*)=2`
+restricted to dm-shaped names. (b) **Group-DM form dropped** (both): `dm~<creator>~<slug>`
+is shape-indistinguishable from `dm~<lo>~<hi>`; multi-party = Appendix F groups on an
+ordinary channel. (c) **Split the scope** (claude, overriding the draft's lean and grok's
+"keep one"): `read:dm` is a FIFTH scope name. One scope would RETROACTIVELY widen every
+existing `read:all` credential — minted under §5's "cost/UX control, not confidentiality"
+promise — into a DM-omniview credential; splitting later protects nothing (existing tokens
+either lose DMs or keep them). Cost now: one enum name + normalizer + default.
 
-**G2 — Confidentiality is now real (breaks §5 "v1 honesty").**
-`kind:'dm'` on the channel row (schema bump → `meta.schema_version` 3). Server read paths
-(`read`, `inbox` rows, `threadOf`, `receipts`, stream `scope=mine/channel:x`) filter
-`kind='dm'` channels to: sender, resolved recipients, OR `read:all` holder. `history` and
-stream `scope=all` already require `read:all`. **`read:all` is THE omniview scope**:
-users minted via `token.create {kind:'human'}` default to it ⇒ **user/admin sees every DM
-and every channel** — satisfying the requirement with the one existing scope. Agents get
-`read:all` only by explicit admin grant. Local mode keeps the legacy see-all behavior
-(byte-parity, Appendix D style quirk pin).
+**G1 — DM = derived-label channel (zero new message machinery).**
+1:1 DMs live in a canonical channel `dm~<lo>~<hi>` — participant ids sorted by **code-unit
+comparison** (not `localeCompare`: locales order `-`/`_` differently), `lo == hi` rejected
+(no self-DM); `DM_RE = /^dm~(ID)~(ID)(~[1-9][0-9]{0,3})?$/` — the `~n` suffix only on
+creation collision after id-reuse. `~` is not in `ID_RE` ⇒ split unambiguous. Channel
+validation widens to `ID_RE || DM_RE` via ONE helper used by `post()` (the write gate) and
+`preflight()` (else every DM is flagged bad); `ensureChannel` stays policy-free. Read
+filters (history/inbox/watch) do NOT widen (§9 gates writes only). `--dm <peer>` sugar ⇒
+channel + recipients = **the two member ids only** (self omitted — already excluded from
+inbox/receipts); parties come from `channel_members`, not recipients.
+
+**G2 — `canSee` is the ONE predicate (replaces "sender, resolved recipients, or
+read:all", which was role-spoofable: role is self-granted, so `join --role alice` read
+alice's DMs — probe-verified end to end).**
+```
+canSee(principal, msg) = name shape of msg.channel is NOT dm-shaped
+                       OR principal.agentId ∈ channel_members(msg.channel)
+                       OR hasScope(principal, read:dm)
+```
+`channel_members(channel, agent_id, PK(channel, agent_id))` + `INDEX cm_agent(agent_id,
+channel)`. Members are literal ids written at channel creation. **Role, group, and `@all`
+are never consulted for access.** Delivery (inbox arms) and visibility (canSee) are
+separate questions; a dm-channel message must satisfy BOTH. The `channels.kind` column is
+at most a CHECK-enforced copy — the NAME SHAPE is the authority (GLOB in SQL), so a stale
+writer's default can't flip a DM to public.
+**Every path that returns or accepts a message id passes canSee, and "invisible" is
+byte-identical to "missing"** (same error, same detail — no existence oracle):
+`read` (check BEFORE the `reads` INSERT — else a non-party probe writes a reads row AND
+emits a `kind=read` event leaking the id), `inbox` (confidentiality subject is the
+CALLER, not `p.agent`; `for≠self` peek needs `read:all`, and seeing the other's DM rows
+additionally needs `read:dm`), `threadOf` (threads span channels ⇒ per-row filter;
+`not_found` only if ALL rows filtered; never build receipts for a hidden row),
+`receipts` (`not_found` before `receiptsForMsg`), `waitStep`/stream `scope=mine` (JS
+predicate per event), stream `scope=channel:x` (validate x; party check if dm-shaped),
+SSE broadcaster (canSee on every event carrying a `msg_id`), `setStatus` (non-party on
+dm ⇒ `not_found`, not `forbidden`), `post --re` (parent lookup applies canSee ⇒ B2 oracle
+closed), `/raw` (file → message → canSee), `channels()` (dm-shaped rows hidden unless
+member or `read:dm`; local mode lists all), `history` (gated by `read:all` — omniview,
+NOT row-filtered, else omniview loses DMs).
+
+**G2w — write side (draft was silent; a non-party could inject into any DM).**
+(i) Posting INTO a dm-shaped channel requires the final sender (after `as`) ∈
+`channel_members`; `read:all`/`read:dm` are READ-only omniview and never grant posting;
+`post:as` impersonation stays audited via `meta.as`. (ii) dm-channel recipients must be
+literal member ids — `@all`, `role:*`, `group:*` rejected `usage` (-32602). (iii) parent
+lookup per G2.
 
 **G3 — Authz matrix delta.** §5 "every token can read every message" is amended: public
-channels unchanged (all tokens read); dm-kind channels filtered as G2. `for≠self` peek
-keeps requiring `read:all` AND now also respects dm filtering for non-holders peeking
-their OWN inbox rows of dm channels (they are party ⇒ visible).
+channels unchanged; dm-shaped channels filtered by canSee. Scope enum becomes FIVE names:
+`read:all, read:dm, post:as, tokens:admin, agents:admin`. `kind:'human'` defaults
+`read:all,read:dm` (⇒ user/admin sees every DM and every channel — requirement met);
+`admin:true` = all five; `read:dm` alone = DM rows via history/stream/peek; `read:all`
+alone = channels only, no DM peek. Local mode keeps legacy see-all (host filesystem =
+root of trust; byte-parity quirk pin).
 
-**G4 — CLI/UI.** `comms.ts dm --from a --to b "text"` (post sugar); `comms.ts dms --for a`
-(list dm channels with unread); UI sidebar: Channels / Groups / DMs sections; admin omniview
-= human token ⇒ stream `scope=all` allowed by default.
+**G4 — CLI/UI.** `comms.ts dm --from a --to b "text"` (post sugar); `comms.ts dms --for a`;
+UI sidebar Channels / Groups / DMs; UI titles render from `channel_members`, never from
+the frozen name; admin omniview = human token (`read:all,read:dm`) ⇒ `scope=all` default.
 
-**G5 — Tests.** canonicalization (alice↔bob = bob↔alice channel), `~` collision impossible,
-non-party agent read ⇒ not_found on dm channel, read:all human reads it, local mode sees it
-(quirk pin), receipts across dm, SSE scope=mine delivers to both parties only, rename
-rewrites derived dm channel name atomically (or freezes it — reviewers pick), group-dm slug
-rules.
+**G5 — Migration safety (draft failed OPEN — an older binary serving a v3 DB would show
+every DM to every token).** `meta.acl_generation` (SEPARATE from `schema_version`, which
+is the trigger generation): server-mode `openBus` REFUSES a DB whose `acl_generation`
+exceeds the one it was compiled with (local mode may proceed — host is root). Lands in M2
+before any DM code ships. A dm-shaped channel with ZERO `channel_members` rows fails
+closed: `read:dm`/`read:all` only, listed by preflight.
 
-**Open for reviewers:** (a) rename of a dm participant — re-derive channel vs freeze vs
-alias table; (b) group-dm channel naming rule; (c) should `read:all` be split into
-`read:all` (channels) + `read:dm` (DMs) so admins can be given omniview WITHOUT DM
-privacy? Recommendation: keep ONE scope for v1 simplicity (requirement says admin sees
-all), split later if needed.
+**G6 — rename interaction (ruling a).** The §4 rename txn additionally:
+`UPDATE OR IGNORE group_members SET agent_id=new` (then delete leftovers), same for
+`channel_members` (PK-safe via OR IGNORE + leftover delete; new id cannot pre-exist —
+rename rejects it), `message_recipients.target` old→new + recipients CSV rewritten via
+SPLIT_SQL rejoin in the same txn (index and CSV must carry the SAME token set or JS/SQL
+diverge). **No** rewrite of `messages.channel/file`, mirror dirs, or `events` (audit).
+Frozen names + member-pair lookup ⇒ renamed agent keeps the SAME conversation, no split.
+
+**G7 — Tests (contract suite, both directions).** canonicalization (alice↔bob same
+channel, code-unit order); self-DM rejected; `~` collision impossible; non-party
+read/inbox/threadOf/receipts/waitStep/setStatus → byte-identical to a nonexistent id AND
+no `reads` row written; party visible; `read:all`-only human sees channels but NOT DMs;
+`read:dm` human (default) sees everything incl. history both modes + `channels()`; local
+non-party sees all (quirk pin); `--re` into dm by non-party `not_found`; post `@all` into
+dm rejected; SSE event filtered for non-party subscriber; `/raw` 404-equivalent; rename
+keeps conversation via member-pair; acl_generation refusal.
