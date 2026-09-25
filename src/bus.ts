@@ -847,6 +847,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   function epoch(): string {
     return (d.query("SELECT value FROM meta WHERE key='epoch'").get() as any).value;
   }
+  // claude round-5 m1c: epoch reads on Res-returning paths must not throw raw.
+  function epochSafe(): string | null {
+    return (d.query("SELECT value FROM meta WHERE key='epoch'").get() as any)?.value ?? null;
+  }
   function gcFloor(): number {
     return Number((d.query("SELECT value FROM meta WHERE key='gc_floor'").get() as any)?.value ?? 0);
   }
@@ -860,7 +864,8 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   // into waitStep(since) and skip GC'd unconsumed events, and let cursor.set stamp
   // them caught up. Missing row stays {epoch, seq: 0}. Row is never rewritten here.
   function cursorGet(agentId: string, consumer: string): Res<{ epoch: string; seq: number }> {
-    const e = epoch();
+    const e = epochSafe();
+    if (e === null) return { error: "internal", detail: "meta.epoch missing (corrupt DB)" };
     const row = cursorRaw(agentId, consumer);
     if (!row) return { value: { epoch: e, seq: 0 } };
     if (row.epoch !== e)
@@ -871,7 +876,8 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   function cursorSet(agentId: string, consumer: string, ep: string, seq: number, force = false): Res<null> {
     if (!Number.isFinite(seq) || !/^[0-9a-f]{8,64}$/.test(ep))
       return { error: "usage", detail: "cursor must be <hex-epoch>.<int-seq>" };
-    const e = epoch();
+    const e = epochSafe();
+    if (e === null) return { error: "internal", detail: "meta.epoch missing (corrupt DB)" };
     if (ep !== e) return { error: "resync", detail: "epoch mismatch; resync required", data: { resync: true, epoch: e } };
     if (seq < gcFloor()) return { error: "resync", detail: `cursor below retention floor`, data: { resync: true, epoch: e, floor: gcFloor() } };
     // M4: monotonic check compares against the RAW stored row ONLY when it shares
@@ -892,7 +898,8 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   function parseCursor(since: string): Res<{ ep: string; seq: number }> {
     const m = /^([0-9a-f]{8,64})\.(\d+)$/.exec(since);
     if (!m) return { error: "usage", detail: "cursor must be <epoch>.<seq>" };
-    const e = epoch();
+    const e = epochSafe();
+    if (e === null) return { error: "internal", detail: "meta.epoch missing (corrupt DB)" };
     if (m[1] !== e) return { error: "resync", detail: "epoch mismatch", data: { resync: true, epoch: e } };
     const seq = Number(m[2]);
     if (seq < gcFloor()) return { error: "resync", detail: "cursor below retention floor", data: { resync: true, epoch: e, floor: gcFloor() } };
@@ -917,6 +924,12 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const ascending = !!p.since;
     d.exec("BEGIN");
     try {
+      // claude round-5 m1: epoch read INSIDE the txn before COMMIT — a
+      // cross-process rotateEpoch between COMMIT and epoch() would pair the
+      // new epoch with the old hw (exactly the cross-epoch pairing epochs
+      // exist to prevent; §6 says "same txn").
+      const ep = epochSafe();
+      if (ep === null) throw new Error("meta.epoch missing (corrupt DB)");
       if (!ascending) {
         // N2 (round 3): SNAPSHOT pages over MESSAGES (§6 "history returns
         // messages, not events") — events are retention-bounded and absent for
@@ -929,7 +942,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
         const hw = Math.max((d.query("SELECT coalesce(max(seq),0) m FROM events").get() as any).m as number, gcFloor());
         d.exec("COMMIT");
         const rows = got.slice(0, limit).reverse();
-        return { value: { rows, hasMore: got.length > limit, cursor: `${epoch()}.${hw}` } };
+        return { value: { rows, hasMore: got.length > limit, cursor: `${ep}.${hw}` } };
       }
       const dir = ascending ? "ASC" : "DESC";
       const evs = (p.channel
@@ -941,11 +954,14 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       const rows = page.map((e) => d.query("SELECT * FROM messages WHERE id=?").get(e.msg_id) as MsgRow).filter(Boolean);
       const lastSeq = page.length ? page[page.length - 1].seq : seqFrom;
       d.exec("COMMIT");
-      return { value: { rows, hasMore, cursor: `${epoch()}.${lastSeq}` } };
+      return { value: { rows, hasMore, cursor: `${ep}.${lastSeq}` } };
     } catch (e) {
       // M4 (grok round 3 nit): history must not throw out of the Res contract
       // (post/rename precedent) — a SQL failure is `internal`, same as everywhere.
-      d.exec("ROLLBACK");
+      // claude round-5 m1: only roll back when a txn is actually open — a throw
+      // AFTER COMMIT would otherwise make ROLLBACK itself throw ("no transaction
+      // is active") and escape the Res contract.
+      if (d.inTransaction) d.exec("ROLLBACK");
       return { error: "internal", detail: `history: ${String(e)}` };
     }
   }
@@ -959,7 +975,9 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     if (target !== ctx.principal.agentId && !hasScope(ctx, "read:all"))
       return { error: "forbidden", detail: "inbox.wait for another agent requires read:all" };
     const consumer = p.consumer ?? "default";
-    let ep = epoch(); let seq: number;
+    const ep0 = epochSafe();
+    if (ep0 === null) return { error: "internal", detail: "meta.epoch missing (corrupt DB)" };
+    let ep = ep0; let seq: number;
     if (p.since) {
       const c = parseCursor(p.since); // M3: epoch AND gc_floor checked
       if (c.error) return c;

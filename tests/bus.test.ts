@@ -267,6 +267,24 @@ describe("history handoff (§6 nit + finding 8)", () => {
     expect(bus.history(serverCtx("x", []), {}).error).toBe("forbidden");
     bus.close(); rmSync(home, { recursive: true, force: true });
   });
+
+  test("history internal-Res catch is live and rollback-guarded (claude round-5 m1)", () => {
+    const home = tmp();
+    const bus = srv(home);
+    const ctx = serverCtx("don", ["read:all"]);
+    bus.testDb.run("INSERT INTO agents(id,role,last_seen) VALUES('don','d','2026-01-01T00:00:00Z')");
+    bus.post(ctx, { from: "don", to: "other", type: "note", body: "x" });
+    // Force the catch: drop meta.epoch so the in-txn epoch() read throws (claude Q4).
+    // Mutation M-d (rethrow instead of internal Res) must fail HERE, and the
+    // guarded ROLLBACK must not itself throw ("no transaction is active").
+    bus.testDb.run("DELETE FROM meta WHERE key='epoch'");
+    const snap = bus.history(ctx, {}) as any;
+    expect(snap.error).toBe("internal");
+    expect(String(snap.detail)).toContain("history:");
+    const since = bus.history(ctx, { since: "deadbeefdeadbeef.0" }) as any; // parseCursor epoch read must stay in Res, not raw-throw
+    expect(since.error).toBe("internal");
+    bus.close(); rmSync(home, { recursive: true, force: true });
+  });
 });
 
 describe("local-mode quirks pinned (finding 14 / §10)", () => {
