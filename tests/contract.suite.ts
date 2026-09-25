@@ -2,7 +2,7 @@
  * Contract suite (RFC-001 §3): ONE suite, every Bus implementation.
  * M1 runs it against the local core driven with SERVER semantics through the
  * same handle the M2 server uses; M2 adds RpcBus over HTTP. Divergence in
- * results or error variants = CI failure by construction.
+ * results, error variants, or data = CI failure (data compared by toEqual).
  *
  * Covers the §5 rules the reviewers proved were untested: read for≠self,
  * status agent-param spoof, token.create authz + subset rule + bootstrap guard,
@@ -476,6 +476,42 @@ export function contractSuite(name: string, make: Factory) {
         expect(ch1.some((n: string) => n.startsWith("dm~"))).toBe(false);
         const ch2 = ((await dmAll.channels()) as any).value.map((x: any) => x.name);
         expect(ch2.some((n: string) => n.startsWith("dm~"))).toBe(true);
+      });
+    });
+
+    test("G7 dm.members parity (fold m2): member sees list, non-party byte-identical not_found, non-dm name ⇒ usage", async () => {
+      await withBus(async (h, root) => {
+        const { alice } = await dmPair(h, root);
+        const p = await alice.post({ from: "dm-alice", to: "dm-bob", type: "note", body: "x", dm: "dm-bob" });
+        const chan = (p as any).value.channel as string;
+        // member view
+        const mem = (await alice.dmMembers(chan)) as any;
+        expect(mem.error).toBeUndefined();
+        expect(mem.value).toEqual(["dm-alice", "dm-bob"]);
+        // non-party: SAME detail as a missing channel (G2 byte-identical rule)
+        const mal = ((await seedAgent(h, root, "dmm-mal", "m")) as any).value.session as Session;
+        const hid = (await mal.dmMembers(chan)) as any;
+        const miss = (await mal.dmMembers("dm~zz1~zz2")) as any;
+        expect(hid.error).toBe("not_found");
+        expect(hid.detail).toBe(`no such channel: ${chan}`);
+        expect(miss.error).toBe("not_found");
+        // non-dm-shaped name ⇒ usage (decided by DM_SHAPED_RE on the input
+        // string alone — not an existence oracle)
+        const pub = (await mal.dmMembers("g7-public-x")) as any;
+        expect(pub.error).toBe("usage");
+        void root;
+      });
+    });
+
+    test("consumer grammar cap (claude M3 m2): bad/long consumer ⇒ usage, never a new row", async () => {
+      await withBus(async (h, root) => {
+        expect((await root.cursorSet({ consumer: "x".repeat(65), cursor: `${(h as any).raw.epoch()}.0` })).error).toBe("usage");
+        expect((await root.cursorSet({ consumer: "bad name!", cursor: `${(h as any).raw.epoch()}.0` })).error).toBe("usage");
+        expect((await root.cursorGet({ consumer: "UPPER" })).error).toBe("usage");
+        // namespaced CLI consumers stay legal
+        expect((await root.cursorSet({ consumer: "cli#g7-chan", cursor: `${(h as any).raw.epoch()}.0` })).error).toBeUndefined();
+        expect((await root.cursorSet({ consumer: "cli.all", cursor: `${(h as any).raw.epoch()}.0` })).error).toBeUndefined();
+        expect((await root.cursorSet({ consumer: "cli@peer1", cursor: `${(h as any).raw.epoch()}.0` })).error).toBeUndefined();
       });
     });
 

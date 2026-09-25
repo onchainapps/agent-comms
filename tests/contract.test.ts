@@ -8,7 +8,8 @@ import { startServer } from "../src/server/mod.ts";
 import { RpcBus } from "../src/rpc-bus.ts";
 
 // M2 impl: RpcBus over real HTTP against the real server (§3 acceptance —
-// ONE suite, divergence between transports = CI failure by construction).
+// ONE suite; divergence between transports in variants or data is a CI
+// failure — data compared by toEqual).
 // raw = a SECOND local-mode connection to the same DB: integration probes for
 // foreign-writer fan-out + row-level assertions (the hosted single-writer rule
 // is relaxed ONLY in tests, same as the contract factory above uses a second

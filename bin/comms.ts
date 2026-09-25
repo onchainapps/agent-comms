@@ -19,7 +19,7 @@
 import { dirname, join, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, readFileSync } from "node:fs";
-import { openBus, localCtx, EXIT_CODES, PRESENCE_TTL_MS, type Bus, type MsgRow, type Res } from "../src/bus.ts";
+import { openBus, localCtx, EXIT_CODES, type Bus, type MsgRow, type Res } from "../src/bus.ts";
 import { testSeams, type Seams } from "../src/seams.ts";
 import { RpcBus } from "../src/rpc-bus.ts";
 
@@ -91,7 +91,9 @@ const epOf = (c: string) => { const m = CURSOR_RE.exec(String(c)); return m ? m[
 const seqOf = (c: string) => { const m = CURSOR_RE.exec(String(c)); return m ? Number(m[2]) : NaN; };
 
 // Remote wire map mirrors src/rpc-bus.ts makeSession (same server dispatch).
-const REMOTE_METHODS: Record<string, (p: any) => [string, Record<string, unknown>]> = {
+// Exported for the m1 no-32601 pin (claude M3): the map must never drift from
+// the server's rpcCall surface.
+export const REMOTE_METHODS: Record<string, (p: any) => [string, Record<string, unknown>]> = {
   joinAgent: (p) => ["join", p],
   listAgents: (p) => ["who", { all: !p.activeOnly }],
   post: (p) => ["post", { ...p, to: csvSplit(p.to) }],
@@ -125,20 +127,42 @@ const csvSplit = (to: string) => (to ? String(to).split(",").map((s) => s.trim()
  *  the SAME params object is re-sent, so a post's auto idempotency key is
  *  generated once per logical post and reused across its own retries (§6). */
 const RETRY_VARIANTS = new Set(["rate_limited", "contention"]);
+/** retry window (ms) — env override exists for tests/impatient scripts only. */
+const RETRY_WINDOW_MS = Number(process.env.COMMS_RETRY_WINDOW_MS ?? 30_000) || 30_000;
+/** per-request deadline: a server that accepts TCP but never answers must
+ *  not hang the CLI forever (fetch has no default timeout). */
+const REQUEST_TIMEOUT_MS = Number(process.env.COMMS_RPC_TIMEOUT_MS ?? 10_000) || 10_000;
+/** claude M3 M6: AMBIGUOUS transport failures (reset / timeout — the server
+ *  may have committed; the flaky-LAN case §6's auto idempotency key exists
+ *  FOR) are retried inside the same bounded window with the SAME params
+ *  object, but only for calls whose replay is harmless: reads, cursor
+ *  commits (monotonic; conflict handled by the caller), status (same value),
+ *  join (UPDATE-only presence refresh) and post (same key ⇒ server replays
+ *  the original result). NOT token.create (a second secret), rename,
+ *  group.*. `refused` never reached the server ⇒ fail fast (exit 1). */
+const RETRY_UNAVAILABLE = new Set([
+  "joinAgent", "listAgents", "post", "inbox", "read", "threadOf", "receipts", "setStatus",
+  "channels", "history", "waitStep", "cursorGet", "cursorSet", "tokenList", "groupList", "groupShow", "dmMembers",
+]);
 async function remoteCall(name: string, p: Record<string, unknown>): Promise<Res<any>> {
   const [method, params] = REMOTE_METHODS[name](p);
-  const deadline = Date.now() + 30_000; // bounded: flaky-LAN retry window, then exit 1
+  const deadline = Date.now() + RETRY_WINDOW_MS; // bounded: flaky-LAN retry window, then exit 1
+  let backoff = 250;
   for (;;) {
     let retryAfterMs = 1000;
     const r = await REMOTE!.call(method, params, remoteToken, (h) => {
       const a = h.get("x-comms-agent"); const s = h.get("x-comms-scopes");
-      if (a !== null) remoteIdentity = { id: a, scopes: s ?? "" };
+      // claude M2-fold m1: never overwrite known scopes with "" (a pre-auth
+      // or header-less response must not blank an already-resolved identity).
+      if (a !== null) remoteIdentity = { id: a, scopes: s !== null ? s : remoteIdentity.scopes };
       const ra = Number(h.get("retry-after"));
       if (Number.isFinite(ra) && ra > 0) retryAfterMs = ra * 1000;
     });
     maybeBanner();
-    if (!r.error || !RETRY_VARIANTS.has(r.error) || Date.now() >= deadline) return r;
-    await Bun.sleep(Math.min(Math.max(retryAfterMs, 250), 5000));
+    if (!r.error || Date.now() >= deadline) return r;
+    if (RETRY_VARIANTS.has(r.error)) { await Bun.sleep(Math.min(Math.max(retryAfterMs, 250), 5000)); continue; }
+    if (r.error === "unavailable" && RETRY_UNAVAILABLE.has(name) && r.data?.transport !== "refused") { await Bun.sleep(backoff); backoff = Math.min(backoff * 2, 5000); continue; }
+    return r;
   }
 }
 
@@ -155,14 +179,15 @@ function setupTransport(a: Args) {
   const url = process.env.COMMS_URL;
   const forceLocal = !!a.local;
   if (url && !forceLocal) {
-    REMOTE = new RpcBus(url.replace(/\/+$/, ""));
+    REMOTE = new RpcBus(url.replace(/\/+$/, ""), undefined, REQUEST_TIMEOUT_MS);
     remoteToken = (typeof a.token === "string" ? a.token : "") || process.env.COMMS_TOKEN || "";
     CALL = async (name, _actor, p = {}) => remoteCall(name, p);
     // §7: banner on EVERY remote command (identity from the first response's
     // x-comms-* headers); join/who force-print even if a command would
     // otherwise end before any response was inspected.
-  } else if (url && process.env.COMMS_HOME) {
-    // §7 ambiguity: both transports configured, --local won — say so loudly.
+  } else if (url) {
+    // §7 ambiguity: COMMS_URL set but --local won — say so even without
+    // COMMS_HOME (claude M3 m5: the user set COMMS_URL and it is ignored).
     console.error(`transport=local:${HOME} (COMMS_URL=${url} ignored by --local)`);
     bannerPrinted = true;
   }
@@ -187,16 +212,24 @@ function readBody(spec?: string): string {
   return spec;
 }
 async function printWho(activeOnly: boolean) {
-  const rows: any[] = REMOTE
-    ? unwrap(await CALL("listAgents", "", { activeOnly }))
-    : core().listAgents(false); // legacy parity: fetch all, filter below (tie order pinned by golden)
+  // claude M3 (ruling b): presence is judged by the SERVER clock — the same
+  // core isActive() the local path uses, i.e. true parity. The client clock
+  // is never consulted (skew would flip ●/○ and, worse, re-filter rows the
+  // server already judged active). Active set = server's activeOnly answer;
+  // `who --all` = all rows + that set. No wire change, one extra read.
+  let rows: any[];
+  let activeIds: Set<string> | null = null;
+  if (REMOTE) {
+    const act: any[] = unwrap(await CALL("listAgents", "", { activeOnly: true }));
+    activeIds = new Set(act.map((r) => r.id));
+    rows = activeOnly ? act : unwrap(await CALL("listAgents", "", { activeOnly: false }));
+  } else {
+    rows = core().listAgents(false); // legacy parity: fetch all, filter below (tie order pinned by golden)
+  }
   console.log(activeOnly ? "active agents:" : "known agents:");
   let shown = 0;
-  const now = Date.now(); // remote: presence judged client-side against the row's last_seen
   for (const r of rows) {
-    const act = REMOTE
-      ? Number.isFinite(Date.parse(r.last_seen ?? "")) && now - Date.parse(r.last_seen ?? "") <= PRESENCE_TTL_MS
-      : core().isActive(r.last_seen ?? "");
+    const act = activeIds ? activeIds.has(r.id) : core().isActive(r.last_seen ?? "");
     if (activeOnly && !act) continue;
     shown++;
     console.log(`  ${act ? "●" : "○"} ${String(r.id).padEnd(20)} role=${String(r.role ?? "-").padEnd(14)} caps=${(r.caps || "-").padEnd(24)} seen=${r.last_seen}`);
@@ -314,8 +347,11 @@ async function cmdGroup(a: Args) {
 
 async function cmdInbox(a: Args) {
   const v = unwrap(await CALL("inbox", a.agent, { agent: a.agent, open: a.open, unread: a.unread, channel: a.channel }));
+  // claude M3 B2: core returns a Set, the wire (and the Session contract)
+  // an array — one CALL surface must normalize ONE shape.
+  const unread = new Set<string>(v.unreadIds);
   let shown = 0;
-  for (const r of v.rows) { console.log(fmtRow(r, v.unreadIds.has(r.id))); shown++; }
+  for (const r of v.rows) { console.log(fmtRow(r, unread.has(r.id))); shown++; }
   console.log(shown ? `\n${shown} message(s). '*' = unread. Read: bun comms.ts read --for ${a.agent} --id <ID>` : "(inbox empty for filter)");
 }
 
@@ -443,11 +479,24 @@ async function cmdWatch(a: Args) {
  * from the floor, exactly where retained history starts.
  */
 async function cmdWatchRemote(a: Args) {
-  const consumer = typeof a.consumer === "string" ? a.consumer : "cli";
   const ivSec = a.interval ?? 3;
   const capSec = a.timeout ?? 28800;
+  // claude M3: resolve the PRINCIPAL first (cheap read; identity comes from
+  // the token row via x-comms-agent) — the consumer key and the `for` param
+  // both depend on whether --for names the principal or someone else.
+  await CALL("cursorGet", a.agent, { consumer: "cli" });
+  const me = remoteIdentity.id;
+  const target: string = a.agent ?? me;
+  const other = !!me && target !== me;
+  // claude M3 M2/M3: consumer NAMESPACING. The cursor is one position in the
+  // events space; a client-side filter (--channel) or a different target
+  // (--for other, read:all peek) or a different predicate (--all) that
+  // commits into the SAME row would permanently skip what the other
+  // views haven't printed yet. Plain `watch --for <me>` keeps 'cli'.
+  const consumer = typeof a.consumer === "string" ? a.consumer
+    : `cli${other ? `@${target}` : ""}${a.all ? ".all" : ""}${a.channel ? `#${a.channel}` : ""}`;
   const scope = a.all ? (a.channel ? `all of #${a.channel}` : "ALL channels (firehose)") : (a.channel ? `#${a.channel} addressed to me` : "addressed to me");
-  console.log(`watch: ${a.agent} scope=${scope}; every ${ivSec}s; ${a.once ? "one-shot" : `cap ${capSec}s`} (remote, cursor consumer=${consumer})`);
+  console.log(`watch: ${target} scope=${scope}; every ${ivSec}s; ${a.once ? "one-shot" : `cap ${capSec}s`} (remote, cursor consumer=${consumer})`);
   let stop = false;
   process.on("SIGTERM", () => { stop = true; });
   const started = Date.now();
@@ -456,38 +505,70 @@ async function cmdWatchRemote(a: Args) {
     unwrap(await CALL("cursorSet", a.agent, { consumer, cursor: `${data?.epoch}.${floor}`, force: true }));
     console.log(`watch: resync — recovery commit to ${data?.epoch}.${floor} (retained history resumes here)`);
   };
+  /** commit AFTER printing (at-least-once). `conflict` = a concurrent watcher
+   *  on the same consumer already committed further ⇒ benign (it printed
+   *  those rows), never fatal. Returns false when a resync was recovered. */
+  const commit = async (cursor: string): Promise<boolean> => {
+    const r = await CALL("cursorSet", a.agent, { consumer, cursor });
+    if (r.error === "resync") { await recover(r.data); return false; }
+    if (r.error === "conflict") return true;
+    unwrap(r);
+    return true;
+  };
+  // our last known committed position (skip no-op commits when idle)
+  const c0 = await CALL("cursorGet", a.agent, { consumer });
+  let committed = c0.error ? "" : `${c0.value.epoch}.${c0.value.seq}`;
   while (!stop) {
     let hitForMe = false;
     if (a.all) {
       // Firehose: history since-mode ASC pages (events space — same cursor
       // space as waitStep). Requires read:all (§6); paging to hasMore=false
-      // delivers every row exactly once.
+      // delivers every row exactly once. Channel filter is pushed SERVER-side
+      // (history supports it) — no pulling the whole bus to print one channel.
       const cur = await CALL("cursorGet", a.agent, { consumer });
       if (cur.error === "resync") { await recover(cur.data); continue; }
       const v0 = unwrap(cur);
       let since = `${v0.epoch}.${v0.seq}`;
+      let resynced = false;
       for (;;) {
-        const h = unwrap(await CALL("history", a.agent, { since, limit: 1000 }));
+        const hr = await CALL("history", a.agent, { since, limit: 1000, ...(a.channel ? { channel: a.channel } : {}) });
+        // claude M3 M4: a fresh consumer ({epoch, 0}) on a GC'd server is
+        // below the floor ⇒ history resyncs; that is the SAME §6 recovery.
+        if (hr.error === "resync") { await recover(hr.data); resynced = true; break; }
+        const h = unwrap(hr);
         for (const r of h.rows) {
-          if (a.channel && r.channel !== a.channel) continue;
-          if (r.sender === a.agent) continue;
+          if (r.sender === target) continue;
           console.log(`NEW ${fmtRow(r)}`); hitForMe = true;
         }
         since = h.cursor;
         if (!h.hasMore) break;
       }
-      unwrap(await CALL("cursorSet", a.agent, { consumer, cursor: since }));
+      if (resynced) continue;
+      if (since !== `${v0.epoch}.${v0.seq}` && !(await commit(since))) continue;
     } else {
       // server defaults `since` from the stored (principal, consumer) cursor;
       // never auto-advances — we commit AFTER printing (at-least-once).
-      const w = await CALL("waitStep", a.agent, { consumer });
-      if (w.error === "resync") { await recover(w.data); continue; }
-      const v = unwrap(w);
-      for (const m of v.messages) {
-        if (a.channel && m.channel !== a.channel) continue;
-        console.log(`NEW ${fmtRow(m)}`); hitForMe = true;
+      // claude M3 B1: waitStep scans ≤500 EVENTS per step and returns the
+      // scanned-to cursor even when nothing matched. Committing only when
+      // messages.length>0 livelocked the watcher forever behind any 500
+      // irrelevant events. Commit whenever the cursor ADVANCED, and drain
+      // (no sleep) while it keeps advancing.
+      let resynced = false;
+      let last = committed;
+      for (;;) {
+        const w = await CALL("waitStep", a.agent, { consumer, ...(other ? { for: target } : {}) });
+        if (w.error === "resync") { await recover(w.data); committed = ""; resynced = true; break; }
+        const v = unwrap(w);
+        for (const m of v.messages) {
+          if (a.channel && m.channel !== a.channel) continue;
+          console.log(`NEW ${fmtRow(m)}`); hitForMe = true;
+        }
+        if (v.cursor === last) break; // caught up: nothing scanned past our position
+        last = v.cursor;
+        if (!(await commit(v.cursor))) { committed = ""; resynced = true; break; }
+        committed = v.cursor;
       }
-      if (v.messages.length) unwrap(await CALL("cursorSet", a.agent, { consumer, cursor: v.cursor }));
+      if (resynced) continue;
     }
     if (a.once) break;
     if (hitForMe && a["exit-on-new"]) { console.log("watch: message for me; exiting"); break; }
@@ -519,6 +600,7 @@ commands: join | rename | who | post | dm | dms | inbox | read | thread | receip
 transport: COMMS_URL+COMMS_TOKEN ⇒ remote · --local forces direct · else COMMS_HOME direct (§7)
 group: group create|join|leave|list|show|delete <name> [--agent who] · post --to group:<name>
 token: token create --agent <id> [--kind human] [--scopes a,b] [--admin] [--force] | token list | token revoke --id N
+watch --all (remote) pages history since-cursors: public rows are visible to every token; dm~ rows need membership or read:dm (ruling c).
 run 'bun comms.ts <cmd> --help-ish' — see header of this file for full usage.`;
 
 async function main() {
@@ -557,4 +639,6 @@ async function main() {
       process.exit(a.cmd ? 2 : 0);
   }
 }
-await main();
+// import.meta.main guard: tests/cli-remote imports REMOTE_METHODS for the
+// wire-map pin without executing the CLI.
+if (import.meta.main) await main();

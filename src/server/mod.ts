@@ -379,42 +379,52 @@ export function startServer(opts: ServerOpts): RunningServer {
     if ("err" in a) return failResp(a, id); // per-IP bucket already checked (pre-HMAC) + charged inside auth()
     // cookie requests passed CSRF at the top (bearer-exempt pre-check).
 
+    // claude M3 M1: ONE identity-header builder for every post-auth response
+    // (429 bucket, 400 param check, 503, 500, dispatch error) — the banner is
+    // transport truth only if no authed path can omit half of it.
+    const ident = (o: Authed) => ({ "x-comms-agent": o.agentId, "x-comms-scopes": o.scopes.join(",") });
     // §9 buckets keyed by token id.
     const bucket = bucketFor(a.ok.tokenId, body.method);
     const t = bucket.take();
     if (!t.ok)
       return json(429, { jsonrpc: "2.0", error: rpcErr(-32004, "rate limited", { busError: "rate_limited", detail: "rate limit exceeded" }), id },
-        { "retry-after": String(Math.max(1, Math.ceil(t.retryAfterMs / 1000))), "x-comms-agent": a.ok.agentId });
+        { "retry-after": String(Math.max(1, Math.ceil(t.retryAfterMs / 1000))), ...ident(a.ok) });
 
     // wire types are erased (finding 1 class): string-typed post fields that
     // arrive as objects/numbers must be usage, not a TypeError → 500.
     if (body.method === "post" && !(["from", "type", "subject", "body", "thread", "re", "tags", "channel", "as", "idempotencyKey", "dm"].every((k) => isStrOpt(p[k]))
         && (isStrOpt(p.to) || (Array.isArray(p.to) && p.to.every((x: unknown) => typeof x === "string")))))
-      return json(400, { jsonrpc: "2.0", error: busToRpc({ error: "usage", detail: "invalid params: post fields must be strings (to: string[])" }), id }, { "x-comms-agent": a.ok.agentId });
+      return json(400, { jsonrpc: "2.0", error: busToRpc({ error: "usage", detail: "invalid params: post fields must be strings (to: string[])" }), id }, ident(a.ok));
 
     let out: Awaited<ReturnType<typeof rpcCall>>;
     try {
-      core.tokenTouch(a.ok.tokenId); // last_used ≤ 1/min inside core — a WRITE: inside the BUSY→503 mapping
+      // last_used ≤ 1/min inside core — a WRITE: inside the BUSY→503 mapping.
+      // claude M3 M7: the same debounced write refreshes PRESENCE (UPDATE-only
+      // touch in server mode — never inserts, never resurrects a retired id):
+      // server-mode core never touch()es, so a remote agent running `watch`
+      // for hours went ○ after 15 min while local watch stays ●.
+      if (core.tokenTouch(a.ok.tokenId)) core.touch(a.ok.agentId);
       out = await rpcCall(a.ok.session, body.method, p);
     } catch (e: any) {
       const msg = String(e?.message ?? e);
       if (/SQLITE_BUSY|database is locked/i.test(msg))
-        return json(503, { jsonrpc: "2.0", error: rpcErr(-32006, "contention", { busError: "contention", detail: "db busy; retry" }), id }, { "retry-after": "1", "x-comms-agent": a.ok.agentId });
+        return json(503, { jsonrpc: "2.0", error: rpcErr(-32006, "contention", { busError: "contention", detail: "db busy; retry" }), id }, { "retry-after": "1", ...ident(a.ok) });
       core.seams.warn?.(`agent-comms rpc ${body.method}: ${msg}`); // server log only — no exception text on the wire
-      return json(500, { jsonrpc: "2.0", error: rpcErr(J.internal, "internal", { busError: "internal", detail: "internal error" }), id }, { "x-comms-agent": a.ok.agentId });
+      return json(500, { jsonrpc: "2.0", error: rpcErr(J.internal, "internal", { busError: "internal", detail: "internal error" }), id }, ident(a.ok));
     }
     if (!out.ok) {
       const http = HTTP_FOR_CODE[out.err.code] ?? 400;
-      const headers: Record<string, string> = { "x-comms-agent": a.ok.agentId, "x-comms-scopes": a.ok.scopes.join(",") };
+      const headers: Record<string, string> = { ...ident(a.ok) };
       if (out.err.code === -32004 || out.err.code === -32006) headers["retry-after"] = "1";
       return json(http, { jsonrpc: "2.0", error: out.err, id }, headers);
     }
     // in-process kick: our own writes need no 250 ms wait (§3 fan-out).
     if (WRITE_METHODS.has(body.method)) queueMicrotask(tick);
     // x-comms-agent = the token ROW's agent AFTER the call (a self-rename
-    // returns the NEW id, not the pre-call one).
-    const after = body.method === "rename" ? core.tokenById(a.ok.tokenId)?.agentId ?? a.ok.agentId : a.ok.agentId;
-    const afterScopes = body.method === "rename" ? core.tokenById(a.ok.tokenId)?.scopes ?? a.ok.scopes : a.ok.scopes;
+    // returns the NEW id, not the pre-call one). claude fold n1: read ONCE.
+    const row = body.method === "rename" ? core.tokenById(a.ok.tokenId) : null;
+    const after = row?.agentId ?? a.ok.agentId;
+    const afterScopes = row?.scopes ?? a.ok.scopes;
     return json(200, { jsonrpc: "2.0", result: out.result, id }, { "x-comms-agent": after, "x-comms-scopes": afterScopes.join(",") });
   }
 

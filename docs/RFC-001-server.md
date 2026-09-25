@@ -287,7 +287,7 @@ Three orthogonal axes:
 | `thread` / `receipts` | `{id}` | ungated on public channels; dm-shaped channels filtered by canSee (G2) — invisible ⇒ byte-identical `not_found` |
 | `status` | `{id, state}` | permission per §5 |
 | `channels` | `{}` | unions channels table (empty channels included); dm-shaped rows hidden unless member or `read:dm` (G2) |
-| `history` | `{channel?, since?, limit?}` | needs `read:all`; SQL-filtered, indexed; dm-shaped rows additionally row-filtered by canSee in BOTH modes (G2 — `read:all` alone does not satisfy canSee). **Snapshot mode (no `since`):** rows are MESSAGES (`created_at DESC, rowid DESC`, newest page, returned oldest-first) — messages stay visible even when their events are gc'd or predate events; cursor = `max(max(events.seq), gc_floor)` read **in the same txn** (floor-clamped so the handoff cursor is never below retention ⇒ never instant-resyncs/livelocks), returned as `<epoch>.<seq>`. **Since mode:** pages EVENTS ASC (oldest unseen first), cursor = last delivered event, paging to `hasMore=false` delivers every row exactly once. Snapshot↔stream dedupe is **by msg_id** (history returns messages, not events). `cursor.get` on a stored foreign-epoch row is a **resync** (never a silent seq-0 collapse); a missing row is `{epoch, seq: 0}`; an explicit current-epoch `cursor.set` is the recovery commit and is not blocked by the foreign row's monotonic check. |
+| `history` | `{channel?, since?, limit?}` | **gate (claude M3 ruling c/m3):** the UNFILTERED global snapshot needs `read:all`; a `channel`-filtered or `since`-paged view is ungated — public rows are readable by every token (§5), consistent with stream `scope=channel:`. SQL-filtered, indexed; dm-shaped rows additionally row-filtered by canSee in BOTH modes (G2 — `read:all` alone does not satisfy canSee). **Snapshot mode (no `since`):** rows are MESSAGES (`created_at DESC, rowid DESC`, newest page, returned oldest-first) — messages stay visible even when their events are gc'd or predate events; cursor = `max(max(events.seq), gc_floor)` read **in the same txn** (floor-clamped so the handoff cursor is never below retention ⇒ never instant-resyncs/livelocks), returned as `<epoch>.<seq>`. **Since mode:** pages EVENTS ASC (oldest unseen first), cursor = last delivered event, paging to `hasMore=false` delivers every row exactly once. Snapshot↔stream dedupe is **by msg_id** (history returns messages, not events). `cursor.get` on a stored foreign-epoch row is a **resync** (never a silent seq-0 collapse); a missing row is `{epoch, seq: 0}`; an explicit current-epoch `cursor.set` is the recovery commit and is not blocked by the foreign row's monotonic check. `consumer` matches `[a-z0-9._#@~-]{1,64}` (grammar cap — caller-supplied keys must not grow unbounded). |
 | `login` / `logout` | `{token}` / `{}` | web UI only; sets/clears HttpOnly session cookie; store **in-memory — restart = logout**; **unauthenticated `login` is also CSRF-guarded per §8** |
 | `stream.ticket` | `{}` | → `{ticket}` 60 s single-use — **non-cookie clients only** (§6-stream) |
 | `inbox.wait` | `{for?, consumer?, since?, timeout?, epoch?}` | long-poll ≤60 s → `{messages[], cursor}`; `since` defaults from stored cursor for `(principal, consumer)`; **never auto-advances** — client commits via `cursor.set` (at-least-once); **does not write `reads` rows** (peek semantics; acking is explicit); the primitive for scripts/MCP |
@@ -336,9 +336,11 @@ rebaseline quirk through M1 (goldens hold); cursor-backed watch lands in M3.
 ## 7. CLI / transport compatibility
 
 - Precedence: `COMMS_URL` set ⇒ remote; `--local` forces direct; else `COMMS_HOME` direct.
-  **Transport banner** (`transport=local:<path> | remote:<url> as <id>(<scopes>)`) on stderr
-  **only in remote mode, or when COMMS_URL and COMMS_HOME are both set (ambiguity), and always
-  on `join`/`who`** — not every command (agent-token cost, stderr goldens).
+  **Transport banner** (`transport=local:<path> | remote:<url> as <id>(<scopes>)`) on stderr:
+  **remote ⇒ every command** (identity rides the first response's `x-comms-*` headers — zero
+  extra RPC, so the old agent-token cost does not apply); **ambiguity (`--local` while
+  `COMMS_URL` is set) ⇒ once**; **plain local ⇒ never** (stderr goldens hold). Identity and
+  scopes come from the token ROW, never from client claims.
 - In remote mode `--from/--agent` are assertions per §5; AGENTS.md usage stays verbatim *when
   ids match the token* — documented, not implied.
 - Exit-code contract:

@@ -9,6 +9,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openBus, localCtx } from "../src/bus.ts";
+import { REMOTE_METHODS } from "../bin/comms.ts"; // m1 pin: CLI wire map vs live server
 
 const REPO = import.meta.dir + "/..";
 const CLI = join(REPO, "bin/comms.ts");
@@ -211,7 +212,7 @@ describe("M3 remote CLI", () => {
     } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
   });
 
-  test("dms + dm over remote: member sees, non-party gets byte-identical not_found (exit 1)", async () => {
+  test("dms + dm over remote: member views list; non-party dm.members ⇒ not_found w/ identical detail (contract suite pins exit path)", async () => {
     const home = tmp();
     const tok = bootstrap(home);
     const srv = await spawnServer(home);
@@ -276,12 +277,218 @@ describe("M3 remote CLI", () => {
     } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
   });
 
+  test("m1 pin: every REMOTE_METHODS wire target exists on the live server (never -32601)", async () => {
+    const home = tmp();
+    const tok = bootstrap(home);
+    const srv = await spawnServer(home);
+    try {
+      const methods = new Set(Object.values(REMOTE_METHODS).map((f) => f({})[0]));
+      expect(methods.size).toBeGreaterThanOrEqual(24);
+      for (const method of methods) {
+        const res = await fetch(`${srv.url}/rpc`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
+          body: JSON.stringify({ jsonrpc: "2.0", method, params: {}, id: 1 }),
+        });
+        const body: any = await res.json();
+        // any error EXCEPT method-not-found proves the wire target exists
+        expect(body.error?.code ?? 0, `${method} ⇒ -32601 (wire map drifted from server dispatch)`).not.toBe(-32601);
+        void res;
+      }
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
   test("remote post retry window: dead server ⇒ unavailable ⇒ exit 1 (bounded, no hang)", () => {
     const home = tmp();
+    // claude M3 M6: refused fails fast; the window only bounds ambiguous retries.
     const r = cli(["post", "--from", "x", "--to", "y", "--type", "note", "--body", "z"], {
       COMMS_URL: "http://127.0.0.1:1", COMMS_TOKEN: "ac_deadbeef",
     });
     expect(r.code).toBe(1);
     rmSync(home, { recursive: true, force: true });
+  });
+});
+
+// ---------- claude M3 review pins (t_954be034) ----------
+const tokOf = (out: string) => out.split("\n").find((l) => l.trim().startsWith("ac_"))!.trim();
+const postedId = (out: string) => /(?:posted|dm) (\S+)\s/.exec(out)![1];
+
+describe("M3 review pins (claude)", () => {
+  test("B1: >500 irrelevant events between cursor and my message ⇒ watch still delivers (no livelock) and the cursor advances", async () => {
+    const home = tmp();
+    const tok = bootstrap(home);
+    const srv = await spawnServer(home);
+    const env = { COMMS_URL: srv.url, COMMS_TOKEN: tok };
+    try {
+      const bTok = tokOf(cli(["token", "create", "--agent", "bob"], env).out);
+      const raw = openBus({ home, mode: "local" }); // test-relaxed second opener (as the rotate test)
+      for (let i = 0; i < 600; i++) raw.post(localCtx("carol"), { from: "carol", to: "bob", type: "note", body: `noise ${i}` });
+      raw.close();
+      const id = postedId(cli(["post", "--from", "bob", "--to", "root", "--type", "note", "--body", "FOR-ROOT"], { COMMS_URL: srv.url, COMMS_TOKEN: bTok }).out);
+      const w = cli(["watch", "--for", "root", "--once"], env);
+      expect(w.code).toBe(0);
+      expect(w.out).toContain(id);
+      const raw2 = openBus({ home, mode: "local" });
+      const c = raw2.testDb.query("SELECT last_seq FROM cursors WHERE agent_id='root' AND consumer='cli'").get() as any;
+      expect(c.last_seq).toBe(raw2.eventsHighWater());
+      raw2.close();
+      // and nothing is re-delivered on the next run
+      expect(cli(["watch", "--for", "root", "--once"], env).out).not.toContain(id);
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  }, 60_000);
+
+  test("B2: remote inbox with rows renders (unreadIds array over the wire, Set locally)", async () => {
+    const home = tmp();
+    const tok = bootstrap(home);
+    const srv = await spawnServer(home);
+    const env = { COMMS_URL: srv.url, COMMS_TOKEN: tok };
+    try {
+      const bTok = tokOf(cli(["token", "create", "--agent", "bob"], env).out);
+      const id = postedId(cli(["post", "--from", "bob", "--to", "root", "--type", "note", "--body", "x"], { COMMS_URL: srv.url, COMMS_TOKEN: bTok }).out);
+      const ib = cli(["inbox", "--for", "root"], env);
+      expect(ib.code).toBe(0);
+      expect(ib.out).toContain(` *${id}`);
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("M2/M3: --channel and --for <other> watches use their own consumer (never burn the plain 'cli' cursor); non-read:all --for other ⇒ 3", async () => {
+    const home = tmp();
+    const tok = bootstrap(home);
+    const srv = await spawnServer(home);
+    const env = { COMMS_URL: srv.url, COMMS_TOKEN: tok };
+    try {
+      const bTok = tokOf(cli(["token", "create", "--agent", "bob"], env).out);
+      cli(["token", "create", "--agent", "dave"], env);
+      const benv = { COMMS_URL: srv.url, COMMS_TOKEN: bTok };
+      const g = postedId(cli(["post", "--from", "bob", "--to", "root", "--type", "note", "--body", "general-msg"], benv).out);
+      const o = postedId(cli(["post", "--from", "bob", "--to", "root", "--type", "note", "--body", "ops-msg", "--channel", "ops"], benv).out);
+      const toDave = postedId(cli(["post", "--from", "bob", "--to", "dave", "--type", "note", "--body", "d"], benv).out);
+      const w1 = cli(["watch", "--for", "root", "--once", "--channel", "ops"], env);
+      expect(w1.out).toContain(o);
+      expect(w1.out).toContain("consumer=cli#ops");
+      const w2 = cli(["watch", "--for", "root", "--once"], env);
+      expect(w2.out).toContain(g); // was skipped: the #ops run committed past it
+      // --for other (read:all) watches THAT agent's inbox, under its own consumer
+      const w3 = cli(["watch", "--for", "dave", "--once"], env);
+      expect(w3.out).toContain("consumer=cli@dave");
+      expect(w3.out).toContain(toDave);
+      expect(w3.out).not.toContain(g);
+      // non-read:all token claiming another agent ⇒ forbidden ⇒ 3 (was: silently watched own inbox, exit 0)
+      expect(cli(["watch", "--for", "dave", "--once"], benv).code).toBe(3);
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("M4: watch --all on a GC'd server (fresh consumer below floor) recovers via §6 resync instead of exiting 1", async () => {
+    const home = tmp();
+    const tok = bootstrap(home);
+    const srv = await spawnServer(home);
+    const env = { COMMS_URL: srv.url, COMMS_TOKEN: tok };
+    try {
+      const bTok = tokOf(cli(["token", "create", "--agent", "bob"], env).out);
+      const benv = { COMMS_URL: srv.url, COMMS_TOKEN: bTok };
+      cli(["post", "--from", "bob", "--to", "root", "--type", "note", "--body", "old"], benv);
+      const raw = openBus({ home, mode: "local" });
+      raw.testDb.run("INSERT INTO meta(key,value) VALUES('gc_floor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [String(raw.eventsHighWater())]);
+      raw.close();
+      const id = postedId(cli(["post", "--from", "bob", "--to", "carol", "--type", "note", "--body", "after-gc"], benv).out);
+      const w = cli(["watch", "--for", "root", "--all", "--once"], env);
+      expect(w.code).toBe(0);
+      expect(w.out).toContain("resync");
+      expect(w.out).toContain(id); // recovery commit to <epoch>.<floor>, then delivery resumes in the SAME run
+      const w2 = cli(["watch", "--for", "root", "--all", "--once"], env);
+      expect(w2.code).toBe(0);
+      expect(w2.out).not.toContain(id);
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("M1: every post-auth error path carries BOTH identity headers (400 param check banners scopes too)", async () => {
+    const home = tmp();
+    const tok = bootstrap(home);
+    const srv = await spawnServer(home);
+    try {
+      const r = await fetch(`${srv.url}/rpc`, {
+        method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "post", params: { to: ["x"], type: "note", body: "b", tags: true }, id: 1 }),
+      });
+      expect(r.status).toBe(400);
+      expect(r.headers.get("x-comms-agent")).toBe("root");
+      expect(r.headers.get("x-comms-scopes")).toContain("tokens:admin");
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("M5: a peer that accepts TCP and never answers ⇒ bounded exit 1 (was: hung forever)", async () => {
+    const l = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {}, open() {} } });
+    try {
+      const t0 = Date.now();
+      // async spawn: a sync spawn would block this process's event loop, and
+      // the listener above lives on it
+      const p = Bun.spawn([process.execPath, CLI, "who"], {
+        cwd: tmp(), env: { ...process.env, COMMS_URL: `http://127.0.0.1:${l.port}`, COMMS_TOKEN: "ac_x", COMMS_RPC_TIMEOUT_MS: "300", COMMS_RETRY_WINDOW_MS: "500" },
+        stdout: "ignore", stderr: "ignore", stdin: "ignore",
+      });
+      expect(await p.exited).toBe(1);
+      expect(Date.now() - t0).toBeLessThan(8_000);
+    } finally { l.stop(true); }
+  }, 15_000);
+
+  test("M6: reset AFTER the server committed ⇒ CLI retries with the SAME idempotency key ⇒ exactly one message; refused stays fast exit 1", async () => {
+    const home = tmp();
+    const tok = bootstrap(home);
+    const srv = await spawnServer(home);
+    const up = new URL(srv.url);
+    // raw TCP proxy: connection #1 is forwarded to the server, but the reply
+    // is swallowed and the client socket reset (server COMMITTED, client saw
+    // ECONNRESET). Later connections relay both ways.
+    let conns = 0;
+    const proxy = Bun.listen<{ n: number; up?: any; q: Uint8Array[] }>({
+      hostname: "127.0.0.1", port: 0,
+      socket: {
+        async open(s) {
+          s.data = { n: ++conns, q: [] };
+          s.data.up = await Bun.connect({ hostname: up.hostname, port: Number(up.port), socket: {
+            data(_u, chunk) { if (s.data.n === 1) s.terminate(); else s.write(chunk); },
+            close() { s.end(); },
+          } });
+          for (const c of s.data.q) s.data.up.write(c);
+        },
+        data(s, chunk) { if (s.data.up) s.data.up.write(chunk); else s.data.q.push(new Uint8Array(chunk)); },
+        close(s) { s.data.up?.end(); },
+      },
+    });
+    try {
+      const bTok = tokOf(cli(["token", "create", "--agent", "bob"], { COMMS_URL: srv.url, COMMS_TOKEN: tok }).out);
+      const p = Bun.spawn([process.execPath, CLI, "post", "--from", "bob", "--to", "root", "--type", "note", "--body", "exactly-once"], {
+        cwd: tmp(), env: { ...process.env, COMMS_URL: `http://127.0.0.1:${proxy.port}`, COMMS_TOKEN: bTok }, stdout: "pipe", stderr: "pipe", stdin: "ignore",
+      });
+      expect(await p.exited).toBe(0);
+      expect(conns).toBeGreaterThanOrEqual(2); // it DID retry
+      const raw = openBus({ home, mode: "local" });
+      const n = (raw.testDb.query("SELECT count(*) n FROM messages WHERE body='exactly-once'").get() as any).n;
+      raw.close();
+      expect(n).toBe(1);
+      // refused: never reached a server ⇒ no retry loop, fast exit 1
+      const t0 = Date.now();
+      expect(cli(["post", "--from", "x", "--to", "y", "--type", "note", "--body", "z"], { COMMS_URL: "http://127.0.0.1:1", COMMS_TOKEN: "ac_x" }).code).toBe(1);
+      expect(Date.now() - t0).toBeLessThan(5_000);
+    } finally { proxy.stop(true); srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  }, 60_000);
+
+  test("M7 + ruling b: remote activity refreshes presence server-side; who judges ● by the SERVER clock", async () => {
+    const home = tmp();
+    const tok = bootstrap(home);
+    const srv = await spawnServer(home);
+    const env = { COMMS_URL: srv.url, COMMS_TOKEN: tok };
+    try {
+      const bTok = tokOf(cli(["token", "create", "--agent", "bob"], env).out);
+      const benv = { COMMS_URL: srv.url, COMMS_TOKEN: bTok };
+      cli(["join", "--agent", "bob", "--role", "w"], benv);
+      const raw = openBus({ home, mode: "local" });
+      raw.testDb.run("UPDATE agents SET last_seen='2020-01-01T00:00:00Z' WHERE id='bob'");
+      raw.testDb.run("UPDATE tokens SET last_used='2020-01-01T00:00:00Z' WHERE agent_id='bob'"); // debounce window elapsed
+      raw.close();
+      cli(["inbox", "--for", "bob"], benv); // any authed request
+      const w = cli(["who"], env);
+      expect(w.out).toMatch(/● bob/);
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
   });
 });

@@ -1594,12 +1594,15 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     return { value: { revoked: true } };
   }
 
-  function tokenTouch(id: number) {
+  /** returns true iff it wrote (the ≤1/min debounce passed) — the server
+   *  piggybacks the presence refresh on the same debounce (claude M3 M7). */
+  function tokenTouch(id: number): boolean {
     const row = d.query("SELECT last_used FROM tokens WHERE id=?").get(id) as any;
-    if (!row) return;
+    if (!row) return false;
     const prev = Date.parse(row.last_used);
-    if (Number.isFinite(prev) && seams.now().getTime() - prev < 60_000) return;
+    if (Number.isFinite(prev) && seams.now().getTime() - prev < 60_000) return false;
     d.run("UPDATE tokens SET last_used=? WHERE id=?", [nowIso(), id]);
+    return true;
   }
 
   // ---------- cursors (§6) ----------
@@ -1623,7 +1626,11 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   // {epoch: current, seq: 0} collapse — that let clients feed cursor.get straight
   // into waitStep(since) and skip GC'd unconsumed events, and let cursor.set stamp
   // them caught up. Missing row stays {epoch, seq: 0}. Row is never rewritten here.
+  // claude M3 m2: consumer is caller-supplied (--consumer / cursor.set) —
+  // grammar + 64 B cap, else one token can mint unbounded long cursor rows.
+  const CONSUMER_RE = /^[a-z0-9._#@~-]{1,64}$/;
   function cursorGet(agentId: string, consumer: string): Res<{ epoch: string; seq: number }> {
+    if (!CONSUMER_RE.test(consumer)) return { error: "usage", detail: "consumer must match [a-z0-9._#@~-]{1,64}" };
     const e = epochSafe();
     if (e === null) return { error: "internal", detail: "meta.epoch missing (corrupt DB)" };
     const row = cursorRaw(agentId, consumer);
@@ -1636,6 +1643,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   }
 
   function cursorSet(agentId: string, consumer: string, ep: string, seq: number, force = false): Res<null> {
+    if (!CONSUMER_RE.test(consumer)) return { error: "usage", detail: "consumer must match [a-z0-9._#@~-]{1,64}" };
     if (!Number.isFinite(seq) || !/^[0-9a-f]{8,64}$/.test(ep))
       return { error: "usage", detail: "cursor must be <hex-epoch>.<int-seq>" };
     const e = epochSafe();
@@ -1670,8 +1678,14 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
 
   function history(ctx: Ctx<M>, p: { channel?: string | null; limit?: number; since?: string }): Res<{ rows: MsgRow[]; hasMore: boolean; cursor: string }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
-    if (!isRootCtx(ctx) && !ctx.principal.scopes.includes("read:all"))
-      return { error: "forbidden", detail: "history requires read:all" };
+    // claude M3 m3 + ruling (c): the gate is the UNFILTERED GLOBAL SNAPSHOT
+    // only. A channel-filtered or since-paged view returns exactly what the
+    // canSee row predicate allows — public rows are readable by every token
+    // (§5), dm~ rows need membership or read:dm. This makes history{channel}
+    // consistent with stream scope=channel: (both ungated). No 6th scope.
+    const unfiltered = (p.channel === undefined || p.channel === null) && !p.since;
+    if (!isRootCtx(ctx) && unfiltered && !ctx.principal.scopes.includes("read:all"))
+      return { error: "forbidden", detail: "unfiltered history snapshot requires read:all" };
     const limit = Math.min(Math.max(p.limit ?? 200, 1), 1000);
     let seqFrom = 0;
     if (p.since) {

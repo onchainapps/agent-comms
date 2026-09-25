@@ -5,7 +5,8 @@
  * (finding 10a). Every method returns Res; the server carries the exact
  * BusError variant on error.data.busError so the reconstructed variant is
  * lossless — the contract suite compares variants, so any wire drift between
- * LocalBus and RpcBus is a CI failure BY CONSTRUCTION.
+ * LocalBus and RpcBus is a CI failure (variants AND data compared —
+ * data via toEqual, m4 rule).
  */
 import type { BusErrorCode, Res, Scope, Cred } from "./bus.ts";
 import type { BusHandle, Session } from "./bus-iface.ts";
@@ -16,23 +17,32 @@ export class RpcError extends Error {
 
 export class RpcBus implements BusHandle {
   readonly mode = "server" as const;
-  constructor(private url: string, private token?: string) {}
+  constructor(private url: string, private token?: string, private timeoutMs = 30_000) {}
   readonly _kick = { n: 0 }; // §6: post→stream handoff counter (M4 UI uses it)
 
   async call<T = unknown>(method: string, params: Record<string, unknown> = {}, cred?: string, onMeta?: (h: Headers) => void): Promise<Res<T>> {
     let res: Response;
+    let body: any;
     try {
+      // claude M3 M5: fetch has no default timeout — a peer that accepts TCP
+      // and never answers hung the CLI forever (past the 30 s retry window).
+      // A timeout is `unavailable` (retryable by the caller's policy); the
+      // signal also covers the body read.
       res = await fetch(`${this.url}/rpc`, {
         method: "POST",
         headers: { "content-type": "application/json", ...(cred ? { authorization: `Bearer ${cred}` } : {}) },
         body: JSON.stringify({ jsonrpc: "2.0", method, params, id: ++this._kick.n }),
+        signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch (e) {
-      return { error: "unavailable", detail: `rpc transport: ${String(e)}` };
+      return { error: "unavailable", detail: `rpc transport: ${String(e)}`, data: { transport: transportKind(e) } };
     }
     onMeta?.(res.headers); // x-comms-agent: per-request identity from the token ROW (§5)
-    let body: any;
-    try { body = await res.json(); } catch { return { error: "internal", detail: `rpc: non-JSON response (HTTP ${res.status})` }; }
+    try { body = await res.json(); } catch (e) {
+      if ((e as any)?.name === "TimeoutError" || (e as any)?.name === "AbortError" || (e as any)?.code === "ECONNRESET")
+        return { error: "unavailable", detail: `rpc transport: ${String(e)}`, data: { transport: transportKind(e) } };
+      return { error: "internal", detail: `rpc: non-JSON response (HTTP ${res.status})` };
+    }
     if (body.error) {
       const d = body.error.data ?? {};
       const variant = (d.busError ?? wireToVariant(body.error.code)) as BusErrorCode;
@@ -64,6 +74,18 @@ export class RpcBus implements BusHandle {
     return makeSession(this, token);
   }
   close(): void {} // stateless
+}
+
+/** transport-failure class (claude M3 M6): `refused` never reached the
+ *  server (safe AND pointless to retry — fail fast); `reset`/`timeout` are
+ *  AMBIGUOUS (the server may have committed) — the case §6's idempotency key
+ *  exists for. Mechanism only: the retry POLICY lives in the shell. */
+function transportKind(e: unknown): "refused" | "reset" | "timeout" | "other" {
+  const x = e as any;
+  if (x?.name === "TimeoutError" || x?.name === "AbortError") return "timeout";
+  if (x?.code === "ConnectionRefused" || x?.code === "ECONNREFUSED") return "refused";
+  if (x?.code === "ECONNRESET" || x?.code === "EPIPE") return "reset";
+  return "other";
 }
 
 function wireToVariant(code: number): BusErrorCode {
