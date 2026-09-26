@@ -2,8 +2,17 @@
 /**
  * dashboard — live web view of the agent comms bus.
  *
- * Read-only: opens comms.db and streams state over SSE. Never writes.
- *   bun agent-comms/dashboard.ts [--port 8787]
+ * Read-only. Two transports (§8 M4 transport switch):
+ *   direct-DB (default):  opens comms.db readonly and streams state over SSE.
+ *                         Never writes. Pre-G binary ⇒ dm rows stripped unless
+ *                         --omniview.
+ *   server (--url):       logs in once via the login RPC (token from
+ *                         COMMS_TOKEN/--token), then builds state from
+ *                         /rpc only — who/channels/history/receipts/groups.
+ *                         Receipts come from the CORE (receipts RPC), not the
+ *                         dashboard's duplicate receiptsOf (direct-DB mode
+ *                         keeps the JS duplicate: it has no core to call).
+ *   bun agent-comms/dashboard.ts [--port 8787] [--url http://host:8700 --token ***]
  * Then open http://localhost:8787
  *
  * Env: COMMS_HOME (default: script dir), PORT.
@@ -26,6 +35,11 @@ const HOME = process.env.COMMS_HOME ?? findRoot(dirname(fileURLToPath(import.met
 const DB_PATH = join(HOME, ".comms", "comms.db");
 const argPort = process.argv.includes("--port") ? process.argv[process.argv.indexOf("--port") + 1] : undefined;
 const PORT = Number(argPort ?? process.env.PORT ?? 8787);
+// §8 M4 transport switch: --url ⇒ server mode (RPC-only, cookie-free bearer;
+// the hosted DB stays single-writer — this process must NOT open it).
+const argUrl = process.argv.includes("--url") ? process.argv[process.argv.indexOf("--url") + 1] : undefined;
+const SERVER_URL = (argUrl ?? process.env.COMMS_URL ?? "").replace(/\/+$/, "");
+const TOKEN = (process.argv.includes("--token") ? process.argv[process.argv.indexOf("--token") + 1] : undefined) ?? process.env.COMMS_TOKEN ?? "";
 // N4 (claude F/G review): Bun.serve without hostname binds the v6 wildcard
 // (`*:port` — ss-verified), re-serving every message body to the LAN from an
 // unauthenticated direct-DB process. Default to loopback; --host opts out.
@@ -36,25 +50,36 @@ const HOST = argHost ?? "127.0.0.1";
 // is root of trust" does not extend to LAN visitors of a DB re-publisher.
 const OMNIVIEW = process.argv.includes("--omniview");
 
-const db = new Database(DB_PATH, { readonly: true });
-db.exec("PRAGMA busy_timeout = 3000");
-// M4 (claude NEW): NO startup latch — the filter is ALWAYS on unless
-// --omniview. A startup-time probe let a dashboard started before the first DM
-// serve DM bodies forever (probe: "dm body served after startup: true"). When
-// no DMs exist the filter is a no-op, so there is nothing to latch.
-if (!OMNIVIEW) console.error("dashboard: dm rows hidden (direct-DB pre-G binary); pass --omniview to show, or use the M4 web UI");
+// §8 M4: server mode NEVER opens the DB (§9 single-writer rule — a second
+// reader on the hosted file is tolerated by WAL but the whole point of --url
+// is that this process holds no handle at all).
+let db: import("bun:sqlite").Database | null = null;
+if (!SERVER_URL) {
+  db = new Database(DB_PATH, { readonly: true });
+  db.exec("PRAGMA busy_timeout = 3000");
+  // M4 (claude NEW): NO startup latch — the filter is ALWAYS on unless
+  // --omniview. A startup-time probe let a dashboard started before the first DM
+  // serve DM bodies forever (probe: "dm body served after startup: true"). When
+  // no DMs exist the filter is a no-op, so there is nothing to latch.
+  if (!OMNIVIEW) console.error("dashboard: dm rows hidden (direct-DB pre-G binary); pass --omniview to show, or use the M4 web UI");
+}
+const DB = () => {
+  if (!db) throw new Error("dashboard: direct-DB path used in server mode");
+  return db;
+};
 
-function state() {
-  const agents = db.query("SELECT id, role, caps, last_seen, joined_at FROM agents WHERE id IS NOT NULL ORDER BY last_seen DESC").all() as any[];
-  const messages = db.query(
+function stateDb() {
+  const d = DB();
+  const agents = d.query("SELECT id, role, caps, last_seen, joined_at FROM agents WHERE id IS NOT NULL ORDER BY last_seen DESC").all() as any[];
+  const messages = d.query(
     "SELECT id, thread, re, sender, recipients, type, status, tags, subject, body, created_at, updated_at, channel FROM messages ORDER BY created_at ASC"
   ).all() as any[];
-  const reads = db.query("SELECT agent, msg, read_at FROM reads").all() as any[];
-  const channels = db.query("SELECT channel name, COUNT(*) n FROM messages GROUP BY channel ORDER BY n DESC").all() as any[];
+  const reads = d.query("SELECT agent, msg, read_at FROM reads").all() as any[];
+  const channels = d.query("SELECT channel name, COUNT(*) n FROM messages GROUP BY channel ORDER BY n DESC").all() as any[];
   // F: receipts call site must resolve group: targets — same incarnation guard
   // as the core (grp -> {created_at, members}).
-  const groups = db.query("SELECT name, created_at FROM groups").all();
-  const gm = db.query("SELECT grp, agent_id FROM group_members").all();
+  const groups = d.query("SELECT name, created_at FROM groups").all();
+  const gm = d.query("SELECT grp, agent_id FROM group_members").all();
   const gmap: Record<string, { at: string; members: string[] }> = {};
   for (const g of groups as any[]) gmap[g.name] = { at: g.created_at, members: [] };
   for (const r of gm as any[]) gmap[r.grp]?.members.push(r.agent_id);
@@ -70,6 +95,63 @@ function state() {
     C = channels.filter((c) => !isDm(c.name));
   }
   return { now: new Date().toISOString(), agents, messages: M, reads: R, channels: C, groups: gmap };
+}
+
+// ---------- §8 M4 server transport ----------
+let rpcid = 0;
+async function rpc(method: string, params: Record<string, unknown> = {}): Promise<any> {
+  const res = await fetch(`${SERVER_URL}/rpc`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },
+    body: JSON.stringify({ jsonrpc: "2.0", method, params, id: ++rpcid }),
+  });
+  const body: any = await res.json().catch(() => null);
+  if (!res.ok || !body || body.error) {
+    const e = body?.error;
+    throw new Error(`${method}: ${(e?.data && e.data.detail) || e?.message || "HTTP " + res.status}`);
+  }
+  return body.result;
+}
+// history snapshot paging (since-mode would GC-truncate a young bus's feed;
+// snapshot pages the whole messages table, which is what the rail needs).
+async function stateRpc(): Promise<any> {
+  const [agents, chans] = await Promise.all([rpc("who", { all: true }), rpc("channels", {})]);
+  const messages: any[] = [];
+  let cursor: string | undefined;
+  for (let pages = 0; ; pages++) {
+    const page = await rpc("history", cursor ? { since: cursor, limit: 500 } : { limit: 500 });
+    messages.push(...page.rows);
+    if (!page.hasMore || pages > 80) break;
+    cursor = page.cursor;
+  }
+  messages.sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
+  // groups: list + show per group (members needed by the JS receiptsOf below).
+  const gmap: Record<string, { at: string; members: string[] }> = {};
+  try {
+    const gl = await rpc("group.list", {});
+    for (const g of gl.groups) {
+      let members: string[] = [];
+      try { members = (await rpc("group.show", { name: g.name })).members; } catch { /* deleted mid-poll */ }
+      gmap[g.name] = { at: g.created_at, members };
+    }
+  } catch { /* groups unsupported on an older server — plain targets still work */ }
+  return {
+    now: new Date().toISOString(),
+    agents,
+    messages,
+    reads: [], // server mode: receipts come from the CORE (see /api/receipts)
+    channels: chans.map((c: any) => ({ name: c.name, n: c.n })),
+    groups: gmap,
+    serverMode: true,
+  };
+}
+const stateCache = { at: 0, val: null as any };
+async function state(): Promise<any> {
+  if (!SERVER_URL) return stateDb();
+  if (Date.now() - stateCache.at < 1200 && stateCache.val) return stateCache.val;
+  const v = await stateRpc();
+  stateCache.at = Date.now(); stateCache.val = v;
+  return v;
 }
 
 const HTML = /* html */ `<!doctype html>
@@ -213,6 +295,23 @@ function receiptsOf(m,agents,reads,messages,groups){
   messages.forEach(x=>{if(x.re===m.id&&!rmap.has(x.sender))rmap.set(x.sender,null);}); // inferred via reply
   return intended.map(id=>({id,read:rmap.has(id),at:rmap.get(id)}));
 }
+// §8 M4 server mode: receipts come from the CORE (receipts RPC via the proxy),
+// never from this JS duplicate. Cache per id; re-render when fresh data lands.
+let serverMode=false; const rcCache=new Map(); const rcPending=new Set();
+function coreReceipts(id){
+  if(!rcCache.has(id)&&!rcPending.has(id)){
+    rcPending.add(id);
+    fetch("/api/receipts?id="+encodeURIComponent(id)).then(r=>r.json()).then(j=>{
+      rcPending.delete(id);
+      if(j&&j.receipts){
+        rcCache.set(id,(j.receipts.intended||[]).map(x=>({id:x,read:false,at:null}))
+          .map(r2=>{const rd=(j.receipts.readers||[]).find(q=>q.id===r2.id);return rd?{id:r2.id,read:true,at:rd.at}:r2;}));
+        render(last);
+      } else rcCache.set(id,[]);
+    }).catch(()=>{rcPending.delete(id);rcCache.set(id,null);});
+  }
+  return rcCache.get(id); // undefined = loading, null = failed, [] = none
+}
 function renderChannels(channels){
   const list=(channels||[]).slice();
   const total=list.reduce((s,c)=>s+c.n,0);
@@ -233,8 +332,9 @@ function renderFeed(s){
     const tcol=color(m.type,"--"); const scol=color(m.status,"--s-");
     const fresh=!seen.has(m.id)&&!first; if(!seen.has(m.id))seen.add(m.id);
     const opened=openIds.has(m.id);
-    const rc=receiptsOf(m,agents,reads,messages,groups); const nread=rc.filter(r=>r.read).length;
-    const receiptsHtml=rc.length?
+    const rc=serverMode?coreReceipts(m.id):receiptsOf(m,agents,reads,messages,groups);
+    const nread=rc?rc.filter(r=>r.read).length:0;
+    const receiptsHtml=rc&&rc.length?
       '<div class="receipts"><span class="lbl">receipts</span>'+
       rc.map(r=>'<span class="rcpt '+(r.read?'read':'unread')+'" title="'+(r.read?(r.at?'read '+rel(r.at):'seen (replied)'):'unread')+'">'+
         '<span class="rd">'+(r.read?'✓':'○')+'</span>'+esc(r.id)+'</span>').join('')+'</div>':'';
@@ -303,7 +403,7 @@ el("statusrail").addEventListener("click",e=>{
   el("filterlabel").textContent="";el("clearfilter").style.display="none";render(last);
 });
 let last={agents:[],messages:[],reads:[],channels:[]};
-function render(s){last=s;renderChannels(s.channels);renderAgents(s.agents);renderFeed(s);renderStatusRail(s);first=false;}
+function render(s){last=s;serverMode=!!s.serverMode;renderChannels(s.channels);renderAgents(s.agents);renderFeed(s);renderStatusRail(s);first=false;}
 function connect(){
   const es=new EventSource("/api/stream");
   es.onopen=()=>{el("conn").textContent="● live";el("conn").className="conn ok";};
@@ -316,20 +416,42 @@ connect();
 </script>
 </body></html>`;
 
-Bun.serve({
+const srv = Bun.serve({
   hostname: HOST, // N4: loopback default — direct-DB dashboard must not re-serve the LAN
   port: PORT,
   idleTimeout: 0,
-  fetch(req) {
+  async fetch(req) {
     const url = new URL(req.url);
-    if (url.pathname === "/api/state") return Response.json(state());
+    if (url.pathname === "/api/state") {
+      try { return Response.json(await state()); }
+      catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 502 }); }
+    }
+    // §8 M4: server mode takes receipts from the CORE (receipts RPC) — the JS
+    // receiptsOf duplicate is direct-DB-only (no core to call there). One
+    // proxy call per rendered message, cached client-side.
+    if (url.pathname === "/api/receipts") {
+      if (!SERVER_URL) return Response.json({ error: "receipts proxy is server-mode only" }, { status: 400 });
+      const id = url.searchParams.get("id") ?? "";
+      try { return Response.json(await rpc("receipts", { id })); }
+      catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 502 }); }
+    }
     if (url.pathname === "/api/stream") {
       const stream = new ReadableStream({
         start(controller) {
           const enc = new TextEncoder();
-          const push = () => { try { controller.enqueue(enc.encode(`data: ${JSON.stringify(state())}\n\n`)); } catch {} };
-          push();
-          const iv = setInterval(push, 1500);
+          let busy = false, again = false;
+          const push = async () => {
+            if (busy) { again = true; return; } // never interleave state builds
+            busy = true;
+            do {
+              again = false;
+              try { controller.enqueue(enc.encode(`data: ${JSON.stringify(await state())}\n\n`)); }
+              catch { } // client gone or state failed (server unreachable) — next tick retries
+            } while (again);
+            busy = false;
+          };
+          void push();
+          const iv = setInterval(() => void push(), 1500);
           req.signal.addEventListener("abort", () => { clearInterval(iv); try { controller.close(); } catch {} });
         },
       });
@@ -340,4 +462,4 @@ Bun.serve({
     return new Response(HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   },
 });
-console.log(`comms dashboard live → http://localhost:${PORT}  (COMMS_HOME=${HOME})`);
+console.log(`comms dashboard live → http://localhost:${srv.port}  (${SERVER_URL ? "server mode: " + SERVER_URL : "COMMS_HOME=" + HOME})`);

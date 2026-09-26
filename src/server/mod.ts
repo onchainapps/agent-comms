@@ -8,6 +8,7 @@
  */
 import { openBus, serverCtx, validChannelName, RPC_CODES, type BusErrorCode, type Scope, type Cred } from "../bus.ts";
 import { serverHandle, wrapSession, type BusHandle, type Session } from "../bus-iface.ts";
+import { UI_HTML } from "./ui.ts";
 import type { Seams } from "../seams.ts";
 import { join, sep } from "node:path";
 import { realpathSync } from "node:fs";
@@ -587,6 +588,12 @@ export function startServer(opts: ServerOpts): RunningServer {
       const url = new URL(req.url);
       const ip = clientIp(req, srv.requestIP(req)?.address ?? null);
       if (req.method === "GET" && url.pathname === "/health") return json(200, { ok: true, epoch: core.epoch() });
+      // §8 M4: the web UI is a single static page; all data rides /rpc + /stream
+      // on the session cookie. no-store: restart = logout, a cached shell must
+      // never outlive its session; X-Frame-Options: a foreign frame could not
+      // drive RPCs (CSRF) but should not sniff the login surface either.
+      if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html"))
+        return new Response(UI_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-frame-options": "DENY", "referrer-policy": "no-referrer" } });
       if (req.method === "POST" && url.pathname === "/rpc") return handleRpc(req, ip);
       if (req.method === "GET" && url.pathname === "/stream") return handleStream(req, ip);
       // §7 GET /raw/messages/<channel>/<file> — mirror bytes for remote agents.
