@@ -262,32 +262,32 @@ const TOOLS: Record<string, Tool> = {
   comms_rename: {
     desc: "Rename an agent id (default: the caller's own; agents:admin may rename others). Transactional across reads/tokens/cursors/idempotency/groups/channels; old id is retired forever.",
     schema: { type: "object", required: ["to"], properties: { to: { type: "string" }, agent: { type: "string", description: "target agent, default self (renaming others needs agents:admin)" } }, additionalProperties: false },
-    call: (a) => exec("rename", clean({ to: a.to, agent: a.agent })),
+    call: (a, s) => exec("rename", clean({ to: a.to, agent: a.agent }), s),
   },
   comms_token_create: {
-    desc: "Mint an API token for an agent (requires tokens:admin; the secret shows ONCE). kind:'human' defaults to read:all,read:dm. admin:true grants all scopes — refused without force if an admin token already exists (bootstrap guard).",
+    desc: "Mint an API token for an agent (requires tokens:admin; the secret shows ONCE — note: through MCP the plaintext secret lands in the model transcript, so rotate it if the transcript is shared). kind:'human' defaults to read:all,read:dm. admin:true grants all scopes — refused without force if an admin token already exists (bootstrap guard).",
     schema: { type: "object", required: ["agent"], properties: { agent: { type: "string" }, kind: { type: "string", enum: ["agent", "human"] }, label: { type: "string" }, scopes: { type: "array", items: { type: "string", enum: ["read:all", "read:dm", "post:as", "tokens:admin", "agents:admin"] } }, admin: { type: "boolean" }, force: { type: "boolean" } }, additionalProperties: false },
-    call: (a) => exec("token.create", clean(a)),
+    call: (a, s) => exec("token.create", clean(a), s),
   },
   comms_token_list: {
     desc: "List token rows (id, prefix, agent, scopes, label, revoked) — never the secrets. Requires tokens:admin.",
     schema: { type: "object", properties: {}, additionalProperties: false },
-    call: () => exec("token.list", {}),
+    call: (_a, s) => exec("token.list", {}, s),
   },
   comms_token_revoke: {
     desc: "Revoke a token by numeric id (from comms_token_list). Requires tokens:admin.",
-    schema: { type: "object", required: ["id"], properties: { id: { type: "number" } }, additionalProperties: false },
-    call: (a) => exec("token.revoke", { id: a.id }),
+    schema: { type: "object", required: ["id"], properties: { id: { type: "integer", minimum: 1 } }, additionalProperties: false },
+    call: (a, s) => exec("token.revoke", { id: a.id }, s),
   },
   comms_group_create: {
     desc: "Create a work-group (idempotent; join also creates). Optional agent attributes creation to someone else (agents:admin).",
     schema: { type: "object", required: ["name"], properties: { name: { type: "string" }, agent: { type: "string" } }, additionalProperties: false },
-    call: (a) => exec("group.create", clean(a)),
+    call: (a, s) => exec("group.create", clean(a), s),
   },
   comms_group_delete: {
     desc: "Delete a work-group (requires agents:admin). Same-second re-create returns contention; tombstone ≥1 s.",
     schema: { type: "object", required: ["name"], properties: { name: { type: "string" } }, additionalProperties: false },
-    call: (a) => exec("group.delete", { name: a.name }),
+    call: (a, s) => exec("group.delete", { name: a.name }, s),
   },
 };
 
