@@ -25,11 +25,24 @@ unit still starts). Check on the box with
 - `sqlite3` CLI (backup/restore), `flock` + `fuser` (util-linux / psmisc).
 - nginx ≥ 1.25.1 (`http2 on;`); see the conf header for 1.24.
 - `useradd --system --home-dir /var/lib/agent-comms --shell /usr/sbin/nologin comms`
-- Env file (0640 root:comms):
+  (no `--create-home` — skel files must not land in the data dir).
+- **Create the writable surfaces as root — `comms` cannot mkdir in `/var/lib`
+  or `/var/backups` (both 0755 root), and `StateDirectory` only runs at first
+  start, which is AFTER bootstrap needs the home (§2 takes the latch, so the
+  order cannot be flipped):**
+  ```bash
+  sudo install -d -m 700 -o comms -g comms /var/lib/agent-comms /var/backups/agent-comms
+  sudo install -d -m 755 /etc/agent-comms
   ```
+- Env file (0640 root:comms) — the unit's `EnvironmentFile=` has NO leading
+  dash, so `enable --now` fails if this file is missing. Write it now:
+  ```bash
+  sudo tee /etc/agent-comms/agent-comms.env >/dev/null <<'ENV'
   COMMS_HOME=/var/lib/agent-comms
   COMMS_PORT=8700
-  COMMS_ORIGIN=https://comms.example.internal   # CSRF pins EXACTLY this (§8)
+  COMMS_ORIGIN=https://comms.example.internal
+  ENV
+  sudo chown root:comms /etc/agent-comms/agent-comms.env && sudo chmod 640 /etc/agent-comms/agent-comms.env
   ```
   The unit pins `--host 127.0.0.1 --trust-proxy`; they are deliberately NOT
   in the env file (they form the trust boundary).
@@ -107,6 +120,9 @@ checked-in file.
 ```cron
 17 3 * * * BUN=/usr/local/bin/bun KEEP_DAYS=14 /opt/agent-comms/current/deploy/backup.sh /var/lib/agent-comms /var/backups/agent-comms >> /var/backups/agent-comms/backup.log 2>&1
 ```
+- **A non-zero exit means "no backup tonight"** (e.g. a writer held the db past
+  the 5 s `.timeout`, or a checkpoint collision persisted). Wire `backup.log`
+  into your monitoring/alerting; the script deliberately fails loud.
 - Out-of-process `sqlite3 .backup` (hot-safe), `umask 077`. The artifact is
   integrity-checked BEFORE it gets its final name. NEVER `cp` (WAL).
 - Ship `/var/backups/agent-comms` off-host (rsync/restic). Artifacts contain
@@ -128,10 +144,14 @@ no process holds the db). Then it:
    `rotateEpoch()` THROUGH THE CORE, all on the staged copy;
 3. swaps it in with a rename.
 
-Any failure leaves the old image untouched.
+Any failure before the swap leaves the old image untouched; the swap window
+itself moves the old -wal aside (not deletes) so even a kill there keeps the
+old main file + frames recoverable.
 
 What clients experience (by design, §3/§6):
-- every pre-restore cursor carries the dead epoch, so it gets one `resync`;
+- every cursor captured IN the backup carries the dead epoch ⇒ one `resync`;
+  a cursor created AFTER the backup is gone from the image ⇒ that consumer
+  restarts from `<new-epoch>.0` with full redelivery and no resync line;
 - the recovery commit goes to `<epoch>.0`;
 - consumers re-receive ALL retained history and **must dedupe by message
   id**;
@@ -141,8 +161,10 @@ Tell agent owners before you restore. Prove it:
 ```bash
 # 1) the epoch actually changed (rotation ran — the only mechanical proof):
 curl -s https://comms.example.internal/health | grep -o '"epoch":"[^"]*"'   # compare vs pre-restore
-# 2) a consumer WITH a pre-restore cursor resyncs then receives (fresh token
-#    proves nothing — no old cursor exists, so no resync line can appear):
+# 2) a consumer WITH a pre-restore cursor resyncs then receives. Use a
+#    consumer whose cursor predates the BACKUP — a cursor created after the
+#    backup is gone from the image, so that consumer restarts from <epoch>.0
+#    with full redelivery but NO resync line (not a skip — just no signal):
 COMMS_URL=https://… COMMS_TOKEN=<agent-token> bun bin/comms.ts watch --for <agent> --once
 # expect "watch: resync — recovery commit to …", then delivery — not silence.
 ```

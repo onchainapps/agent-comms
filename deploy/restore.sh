@@ -80,12 +80,17 @@ set -- $NEW; NEW_EPOCH=$1; CARRIED=$2
 [ -f "$STAGE/.comms/comms.db-wal" ] && die "stage did not checkpoint cleanly — refusing swap"
 sqlite3 "$STAGE/.comms/comms.db" "PRAGMA integrity_check" | head -1 | grep -qx ok || die "staged image fails integrity_check"
 
-# swap: rename is atomic on the same filesystem; stale -wal/-shm belong to the OLD image
-rm -f "$DB-wal" "$DB-shm"
+# swap: rename is atomic on the same filesystem; stale -wal/-shm belong to the
+# OLD image. Move them ASIDE (not rm) so a kill between the two steps still
+# leaves the old main file + its frames; delete only once the swap landed.
+[ -f "$DB-wal" ] && mv "$DB-wal" "$STAGE/old.db-wal"
+[ -f "$DB-shm" ] && mv "$DB-shm" "$STAGE/old.db-shm"
 mv "$STAGE/.comms/comms.db" "$DB"
+rm -f "$STAGE/old.db-wal" "$STAGE/old.db-shm"
 chmod 600 "$DB"
 echo "restored $BK → $HOME_DIR"
 echo "  epoch rotated to $NEW_EPOCH; revocations carried forward: $CARRIED; safety copy: ${PRE:-none}"
-echo "  every pre-restore cursor now resyncs (§6). Messages posted after the backup are GONE;"
-echo "  consumers re-receive retained history and MUST dedupe by message id."
-echo "  start the server."
+echo "  cursors captured IN THE BACKUP now resync (§6); cursors created after it"
+echo "  restart from <epoch>.0 with full redelivery, no resync line."
+echo "  Messages posted after the backup are GONE; consumers re-receive retained"
+echo "  history and MUST dedupe by message id. Start the server."

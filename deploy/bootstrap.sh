@@ -17,6 +17,11 @@ mkdir -p "$HOME_DIR/.comms"
 chmod 700 "$HOME_DIR" "$HOME_DIR/.comms"
 exec 9>"$HOME_DIR/.server.lock"
 flock -n 9 || { echo "bootstrap: a server holds $HOME_DIR/.server.lock — stop it first (§9 single writer)" >&2; exit 1; }
+# a writer that does NOT hold the latch (manual bun run, stray CLI openBus)
+# would hit SQLITE_BUSY mid-mint — refuse cleanly instead (grok M6 minor).
+if command -v fuser >/dev/null && fuser -s "$HOME_DIR/.comms/comms.db" 2>/dev/null; then
+  echo "bootstrap: a process holds the db open without the latch — stop it first (§9)" >&2; exit 1
+fi
 OUT=$(COMMS_HOME="$HOME_DIR" "$BUN" "$REPO/bin/comms.ts" token create --agent "$ADMIN" --admin 2>&1) || { echo "$OUT" >&2; exit 1; }
 TOK=$(printf '%s\n' "$OUT" | grep -oE 'ac_[A-Za-z0-9_-]{43}') || { echo "bootstrap: $OUT" >&2; exit 1; }
 echo "admin token (shown ONCE — store in your secret manager): $TOK"
