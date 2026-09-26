@@ -35,17 +35,20 @@ unit still starts). Check on the box with
   sudo install -d -m 755 /etc/agent-comms
   ```
 - Env file (0640 root:comms) — the unit's `EnvironmentFile=` has NO leading
-  dash, so `enable --now` fails if this file is missing. Write it now:
+  dash, so `enable --now` fails if this file is missing. Write it (printf, not
+  a heredoc — an indented heredoc terminator in this list fence never fires):
   ```bash
-  sudo tee /etc/agent-comms/agent-comms.env >/dev/null <<'ENV'
-  COMMS_HOME=/var/lib/agent-comms
-  COMMS_PORT=8700
-  COMMS_ORIGIN=https://comms.example.internal
-  ENV
-  sudo chown root:comms /etc/agent-comms/agent-comms.env && sudo chmod 640 /etc/agent-comms/agent-comms.env
+  sudo printf '%s\n' COMMS_HOME=/var/lib/agent-comms COMMS_PORT=8700 \
+    COMMS_ORIGIN=https://comms.example.internal \
+    | sudo tee /etc/agent-comms/agent-comms.env >/dev/null
+  sudo chown root:comms /etc/agent-comms/agent-comms.env
+  sudo chmod 640 /etc/agent-comms/agent-comms.env
   ```
-  The unit pins `--host 127.0.0.1 --trust-proxy`; they are deliberately NOT
-  in the env file (they form the trust boundary).
+  `COMMS_ORIGIN` is the EXACT origin CSRF pins (§8) — set it to the real
+  public origin, no trailing slash, no comment on the line (systemd takes the
+  whole remainder as the value). The unit pins `--host 127.0.0.1
+  --trust-proxy`; they are deliberately NOT in the env file (they form the
+  trust boundary).
 - Firewall: only 443 (plus 80 for the redirect) inbound, e.g.
   `ufw allow 443/tcp`. 8700 is loopback-bound; still add
   `ufw deny 8700` as a second fence.
@@ -144,9 +147,11 @@ no process holds the db). Then it:
    `rotateEpoch()` THROUGH THE CORE, all on the staged copy;
 3. swaps it in with a rename.
 
-Any failure before the swap leaves the old image untouched; the swap window
-itself moves the old -wal aside (not deletes) so even a kill there keeps the
-old main file + frames recoverable.
+Any failure before the swap leaves the old image untouched; in the swap window
+the old `-wal`/`-shm` are moved to `<db>-wal.aside`/`<db>-shm.aside` (OUTSIDE
+the stage, which an EXIT trap deletes on SIGTERM) and removed only after the
+rename lands — a kill mid-window leaves old main + frames side by side: rename
+`comms.db-wal.aside` back to `comms.db-wal` to recover them.
 
 What clients experience (by design, §3/§6):
 - every cursor captured IN the backup carries the dead epoch ⇒ one `resync`;

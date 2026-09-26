@@ -81,12 +81,15 @@ set -- $NEW; NEW_EPOCH=$1; CARRIED=$2
 sqlite3 "$STAGE/.comms/comms.db" "PRAGMA integrity_check" | head -1 | grep -qx ok || die "staged image fails integrity_check"
 
 # swap: rename is atomic on the same filesystem; stale -wal/-shm belong to the
-# OLD image. Move them ASIDE (not rm) so a kill between the two steps still
-# leaves the old main file + its frames; delete only once the swap landed.
-[ -f "$DB-wal" ] && mv "$DB-wal" "$STAGE/old.db-wal"
-[ -f "$DB-shm" ] && mv "$DB-shm" "$STAGE/old.db-shm"
+# OLD image. Move them OUTSIDE $STAGE (the EXIT trap rm -rf's the stage, so a
+# SIGTERM inside the window would delete the frames again) — beside the db,
+# deleted only after the rename lands. A kill mid-window then leaves old main
+# + frames side by side, both recoverable.
+WAL_ASIDE="$DB-wal.aside"; SHM_ASIDE="$DB-shm.aside"
+[ -f "$DB-wal" ] && mv "$DB-wal" "$WAL_ASIDE"
+[ -f "$DB-shm" ] && mv "$DB-shm" "$SHM_ASIDE"
 mv "$STAGE/.comms/comms.db" "$DB"
-rm -f "$STAGE/old.db-wal" "$STAGE/old.db-shm"
+rm -f "$WAL_ASIDE" "$SHM_ASIDE"
 chmod 600 "$DB"
 echo "restored $BK → $HOME_DIR"
 echo "  epoch rotated to $NEW_EPOCH; revocations carried forward: $CARRIED; safety copy: ${PRE:-none}"
