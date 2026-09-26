@@ -1,0 +1,30 @@
+# /etc/systemd/user/agent-comms.service  (or system unit — see runbook §1)
+# RFC-001 §9: exactly ONE server process per DB file; runs as the service user
+# that owns COMMS_HOME (0700) and comms.db* (0600) — foreign-owned -wal/-shm
+# ⇒ SQLITE_READONLY. Bun must be the ABSOLUTE path (no PATH assumptions).
+[Unit]
+Description=agent-comms hosted bus server (RFC-001)
+Documentation=file://%REPO%/docs/RFC-001-server.md
+After=network.target
+
+[Service]
+Type=simple
+User=comms
+Group=comms
+WorkingDirectory=%REPO%
+ExecStart=/usr/local/bin/bun %REPO%/bin/server.ts --home %h/comms-home --port 8700 --host 127.0.0.1 --origin https://comms.example.internal --trust-proxy
+EnvironmentFile=%h/agent-comms.env
+Restart=always
+RestartSec=2
+# §9 mechanics
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/comms-home
+MemoryHigh=512M
+LimitNOFILE=4096
+
+[Install]
+WantedBy=default.target

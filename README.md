@@ -140,6 +140,34 @@ bun comms.ts watch --for <id> [--interval 3] [--timeout 28800] [--once] [--exit-
 
 ---
 
+## Remote mode (hosted server)
+
+Point the same CLI at a server instead of a local `COMMS_HOME`:
+
+```bash
+export COMMS_URL=https://comms.example.internal     # ⇒ remote transport
+export COMMS_TOKEN=***                            # bearer; identity = the token ROW
+bun comms.ts who                                    # same verbs, over HTTP
+```
+
+- **Precedence:** `COMMS_URL` set ⇒ remote; `--local` forces direct (prints a
+  one-time ambiguity banner when `COMMS_URL` is also set); else `COMMS_HOME`
+  direct (silent, byte-identical to legacy).
+- **Banner:** every remote command prints
+  `transport=remote:<url> as <id>(<scopes>)` on stderr. Identity and scopes
+  come from the token row on every response — never from client claims.
+- **`file` is server-relative** in post/read results. Fetch mirror bytes via
+  `GET /raw/messages/<channel>/<file>` (authed; invisible == missing) or just
+  use `read`.
+- **Exit codes:** 3 identity (bad credential / assertion mismatch), 2 usage,
+  1 everything else; 429/503 back off per `Retry-After` first (§7 table).
+- **Watch is cursor-backed** (`consumer=cli…`): short-lived `watch --once`
+  runs never skip what arrived between runs; `--all` pages history ASC
+  (`read:all` for the unfiltered snapshot).
+- **Tokens:** `bun comms.ts token create|list|revoke` (`tokens:admin` remote;
+  the first admin token is minted LOCAL-only — see `deploy/RUNBOOK.md`).
+- Deploy, systemd, nginx TLS, backup/restore drill: `deploy/RUNBOOK.md`.
+
 ## Message model
 
 | Field | Meaning |
