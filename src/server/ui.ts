@@ -8,16 +8,20 @@
  * - Bus data is rendered with textContent/createElement ONLY — no innerHTML
  *   interpolation of untrusted strings (XSS via message body would otherwise
  *   run same-origin RPC with the session cookie).
- * - CSP default-src 'self'; 'unsafe-inline' for the single-file app.
+ * - CSP rides the response HEADER (UI_CSP below): script-src is the sha256
+ *   of the single inline script (no 'unsafe-inline' for scripts — an HTML
+ *   injection cannot add a runnable script); style-src keeps 'unsafe-inline'
+ *   for the style="" attributes; frame-ancestors 'none'; form-action 'none'.
  * - CSRF (§8) is enforced server-side on cookie requests; this page sends
  *   Content-Type: application/json, which forces a preflight a foreign origin
  *   can never pass.
  */
+import { createHash } from "node:crypto";
+
 export const UI_HTML = /* html */ `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'">
 <title>agent comms</title>
 <style>
   :root{--bg:#0f1115;--panel:#171a21;--line:#2a2f3a;--fg:#dfe3ea;--dim:#8b93a3;--acc:#5aa7ff;--ok:#3fbf7f;--warn:#e0a63f;--err:#e0605f;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
@@ -115,7 +119,7 @@ export const UI_HTML = /* html */ `<!doctype html>
 </div>
 <script>
 "use strict";
-const S = { me:null, scopes:[], chans:[], agents:[], active:new Set(), msgs:new Map(), sel:null, selKind:null, stream:null, seq:0, epoch:"", rpccache:new Map() };
+const S = { me:null, scopes:[], chans:[], agents:[], active:new Set(), msgs:new Map(), sel:null, selKind:null, stream:null, seq:0, epoch:"", rpccache:new Map(), minted:null, dmMembers:new Map() };
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; };
 
@@ -141,9 +145,13 @@ async function boot() {
   S.agents = ag; try { S.active = new Set((await rpc("who", {})).map((a) => a.id)); } catch {}
   await refreshChans();
   renderPres();
-  loadHistory();
-  openStream();
   if (S.scopes.includes("tokens:admin")) $("admintab").style.display = "";
+  // claude M4 M-b: §6 handoff — snapshot FIRST, then open the stream AT the
+  // snapshot cursor. Running them concurrently left a hole: rows committed
+  // after the snapshot txn but before the subscribe's high-water read were in
+  // neither (the stream starts at ITS high-water, not the snapshot's).
+  const cursor = await loadHistory();
+  openStream(cursor);
 }
 $("go").onclick = async () => {
   $("lerr").textContent = "";
@@ -156,7 +164,7 @@ $("go").onclick = async () => {
   } catch (e) { $("lerr").textContent = "login failed: " + e.message; }
 };
 $("tok").addEventListener("keydown", (ev) => { if (ev.key === "Enter") $("go").click(); });
-$("out").onclick = async () => { try { await rpc("logout", {}); } catch {} location.reload(); };
+$("out").onclick = async () => { if (S.stream) S.stream.close(); try { await rpc("logout", {}); } catch {} location.reload(); };
 
 /* ---------- channels / DMs ---------- */
 async function refreshChans() {
@@ -171,8 +179,16 @@ async function refreshChans() {
   }
   const dbox = $("dms"); dbox.textContent = "";
   for (const c of dm) {
-    let label = "#" + c.name;
-    try { label = "dm:" + (await rpc("dm.members", { channel: c.name })).members.join(" ↔ "); } catch {}
+    // DM membership is pair-keyed and immutable ⇒ resolve once per channel
+    // (was: one dm.members RPC per DM on EVERY refresh, i.e. every click).
+    if (!S.dmMembers.has(c.name)) {
+      // wire contract (contract.suite G7): dm.members RESULT is the raw
+      // members array, not {members} — .members here was undefined ⇒ peer
+      // null ⇒ DM composer stuck read-only (grok M4 B1 residual).
+      try { const r = await rpc("dm.members", { channel: c.name }); S.dmMembers.set(c.name, Array.isArray(r) ? r : null); } catch { S.dmMembers.set(c.name, null); }
+    }
+    const mem = S.dmMembers.get(c.name);
+    const label = mem ? "dm:" + mem.join(" ↔ ") : "#" + c.name;
     const b = el("button", "chan" + (S.sel === c.name ? " on" : ""), label);
     b.appendChild(el("span", "n", String(c.n)));
     b.onclick = () => select(c.name, "dm"); dbox.appendChild(b);
@@ -184,15 +200,25 @@ async function refreshChans() {
 /* ---------- message panes ---------- */
 function select(name, kind) {
   S.sel = name; S.selKind = kind;
-  document.querySelectorAll("#chans .chan,#dms .chan").forEach((n) => n.classList.remove("on"));
   refreshChans(); renderPane();
-  if (kind === "dm") { $("cto").disabled = true; $("cchan").value = ""; dmPeerHint(); }
-  else { $("cto").disabled = false; $("cchan").value = name === "general" ? "" : name; }
+  // ruling (c): channel-scoped history is ungated ⇒ fill THIS channel beyond
+  // the global newest-page (and give non-read:all tokens any history at all).
+  rpc("history", { channel: name, limit: 200 }).then((pg) => { for (const m of pg.rows) S.msgs.set(m.id, m); if (S.sel === name) renderPane(); }).catch(() => {});
+  if (kind === "dm") { $("cchan").value = ""; dmPeerHint(); }
+  else { $("cto").disabled = false; $("cpost").disabled = false; $("cchan").value = name === "general" ? "" : name; $("pd").textContent = ""; }
+}
+function dmPeer() {
+  const mem = S.dmMembers.get(S.sel);
+  if (!mem || !mem.includes(S.me)) return null; // omniview viewer of someone else's DM
+  return mem[0] === S.me ? mem[1] : mem[0];
 }
 function dmPeerHint() {
-  const m = S.sel.match(/^dm~([^~]+)~([^~]+)/);
-  const peer = m && (m[1] === S.me ? m[2] : m[1]);
-  $("pd").textContent = peer ? "DM → " + peer + " (posts use dm:" + peer + ")" : "";
+  const peer = dmPeer();
+  // claude M4 m-a: a read:dm human viewing a DM it is NOT party to used to
+  // get peer = first member, so "Post" silently opened a NEW dm~human~<x>
+  // instead of writing here. Non-party DM view is read-only.
+  $("cto").disabled = true; $("cpost").disabled = !peer;
+  $("pd").textContent = peer ? "DM → " + peer + " (posts use dm:" + peer + ")" : "read-only: you are not a party to this DM";
 }
 function msgNode(m) {
   const n = el("div", "msg"); n.dataset.id = m.id;
@@ -229,13 +255,31 @@ function note(id, patch) {
 function renderPane() {
   const pane = $("pane"); pane.textContent = "";
   const rows = [...S.msgs.values()].filter((m) => !S.sel || m.channel === S.sel).sort((a, b) => a.created_at < b.created_at ? -1 : 1).slice(-400);
-  for (const m of rows) { pane.appendChild(msgNode(m)); loadReceipts(m.id); }
+  for (const m of rows) pane.appendChild(msgNode(m));
   pane.scrollTop = pane.scrollHeight;
+  // claude M4 M-c: receipts are fetched ONLY for the newest RC_MAX rows, one
+  // at a time. Firing one RPC per rendered row (up to 400, all at once) drained
+  // the 120-token read bucket on every boot: 83/200 came back 429 in the
+  // probe, and so did the NEXT user action.
+  for (const m of rows.slice(-RC_MAX)) rcQueue.add(m.id);
+  pumpReceipts();
+}
+const RC_MAX = 40;
+const rcQueue = new Set(); let rcBusy = false;
+async function pumpReceipts() {
+  if (rcBusy) return; rcBusy = true;
+  try {
+    while (rcQueue.size) {
+      const id = rcQueue.values().next().value; rcQueue.delete(id);
+      await loadReceipts(id);
+    }
+  } finally { rcBusy = false; }
 }
 async function loadReceipts(id) {
   const slot = document.querySelector('.rc[data-rc="' + CSS.escape(id) + '"]');
   if (!slot) return;
-  if (!S.rpccache.has(id)) S.rpccache.set(id, rpc("receipts", { id }).catch(() => null));
+  // a failed fetch is NOT cached (a 429 must not freeze the slot blank forever)
+  if (!S.rpccache.has(id)) S.rpccache.set(id, rpc("receipts", { id }).catch(() => { S.rpccache.delete(id); return null; }));
   const r = await S.rpccache.get(id); if (!r) return;
   const cur = document.querySelector('.rc[data-rc="' + CSS.escape(id) + '"]'); if (!cur || cur !== slot) return;
   const rc = r.receipts || {};
@@ -245,43 +289,68 @@ async function loadReceipts(id) {
 }
 
 /* ---------- history + stream ---------- */
+// claude M4 M-a: the snapshot has NO backward paging. Without since it
+// returns the newest page and cursor = the events HIGH-WATER; feeding that
+// back as since= returns the rows AFTER the high-water, i.e. nothing (probe:
+// 450 seeded → 200 loaded, page 2 = 0 rows). The old "≤40 pages" loop was a
+// no-op second call. ONE snapshot at the core's cap (1000) is the honest
+// shape; older rows come from the per-channel view (select()). Returns the
+// snapshot cursor for the §6 stream handoff (null = no snapshot).
 async function loadHistory() {
-  let cursor, pages = 0;
-  for (;;) {
-    let page;
-    try { page = await rpc("history", cursor ? { since: cursor, limit: 200 } : { limit: 200 }); }
-    catch (e) {
-      if (e.bus === "resync" && e.data.epoch && !cursor) { cursor = e.data.epoch + "." + e.data.floor; continue; }
-      if (e.bus === "forbidden") { setS("history: " + e.message + " (showing live stream only)"); return; }
-      setS("history failed: " + e.message, 1); return;
-    }
-    for (const m of page.rows) S.msgs.set(m.id, m);
-    pages++;
-    if (!page.hasMore || pages > 40) break;
-    cursor = page.cursor;
+  let page;
+  try { page = await rpc("history", { limit: 1000 }); }
+  catch (e) {
+    if (e.bus === "forbidden") { setS("history: " + e.message + " (open a channel for its history; live stream below)"); return null; }
+    setS("history failed: " + e.message, 1); return null;
   }
+  for (const m of page.rows) S.msgs.set(m.id, m);
   renderPane();
+  return page.cursor;
 }
-function openStream() {
-  const scope = S.scopes.includes("read:all") && S.scopes.includes("read:dm") ? "all" : S.scopes.includes("read:all") ? "all" : "mine";
-  const es = new EventSource("/stream?scope=" + scope);
+function openStream(since) {
+  // design (a) kept: read:all ⇒ scope=all (DM frames are still canSee-filtered
+  // server-side, so read:all without read:dm never receives them).
+  const scope = S.scopes.includes("read:all") ? "all" : "mine";
+  const es = new EventSource("/stream?scope=" + scope + (since ? "&since=" + encodeURIComponent(since) : ""));
   S.stream = es;
   es.onopen = () => { $("conn").textContent = "stream: live"; $("conn").style.color = "var(--ok)"; };
-  es.onerror = () => { $("conn").textContent = "stream: reconnecting…"; $("conn").style.color = "var(--warn)"; };
+  es.onerror = () => {
+    const dead = es.readyState === EventSource.CLOSED; // non-200 (401 after restart/revoke) ⇒ EventSource gives up
+    $("conn").textContent = dead ? "stream: closed — reload to log in again" : "stream: reconnecting…";
+    $("conn").style.color = dead ? "var(--err)" : "var(--warn)";
+  };
   es.addEventListener("hello", (ev) => { const d = JSON.parse(ev.data); S.epoch = d.epoch; S.seq = d.seq; });
-  es.addEventListener("resync", () => { S.msgs.clear(); renderPane(); loadHistory(); });
+  // claude M4 M-f: the server closes the socket after "resync", and the resync
+  // frame carries no id ⇒ native reconnect resent the SAME dead-epoch
+  // Last-Event-ID forever (probe: 9 reconnects + 9 full reloads in 30 s,
+  // "reconnecting…" permanently). Close it ourselves and re-handoff.
+  es.addEventListener("resync", async () => {
+    es.close(); if (S.stream !== es) return;
+    S.msgs.clear(); S.rpccache.clear(); renderPane();
+    const c = await loadHistory();
+    if (S.stream === es) openStream(c);
+  });
+  es.addEventListener("revoked", () => { es.close(); $("conn").textContent = "stream: token revoked — reload"; $("conn").style.color = "var(--err)"; });
   es.addEventListener("msg", (ev) => { const d = JSON.parse(ev.data); hydrate(d); });
   es.addEventListener("status", (ev) => { const d = JSON.parse(ev.data); if (S.msgs.has(d.id)) note(d.id, { status: d.status }); else hydrate(d); });
   es.addEventListener("read", (ev) => { const d = JSON.parse(ev.data); S.rpccache.delete(d.msg); loadReceipts(d.msg); });
   es.addEventListener("presence", () => debPres());
-  es.addEventListener("token", () => { if (S.tab === "admin") renderAdmin(); });
+  es.addEventListener("token", () => { if (S.tab === "admin") renderTokenTable(); });
   es.addEventListener("group", () => { refreshChans(); });
 }
+// claude M4 B2: hydrate via receipts, NOT read. read(for=self) INSERTs a
+// reads row (§5 marking read) — rendering a frame is not reading it. With
+// read it marked EVERY message that arrived while the tab was open as read by
+// the human (probe: an unopened ask showed readers=[human] 2 s after post),
+// which lies to every sender's receipts and empties the human's --unread
+// inbox. receipts returns the same row (+receipts) under the same canSee gate
+// and writes nothing.
 async function hydrate(d) {
   const known = S.msgs.get(d.id);
-  if (known && d.body === undefined) { Object.assign(known, d); return; }
+  if (known && d.body === undefined) { Object.assign(known, d); if (d.status) note(d.id, { status: d.status }); return; }
   try {
-    const m = await rpc("read", { for: S.me, id: d.id });
+    const m = await rpc("receipts", { id: d.id });
+    S.rpccache.set(m.id, Promise.resolve(m));
     S.msgs.set(m.id, m); renderPane();
   } catch (e) { if (known) return; S.msgs.set(d.id, Object.assign({ body: "(no permission to read)" }, d)); renderPane(); }
 }
@@ -304,14 +373,24 @@ $("cpost").onclick = async () => {
   const body = $("cbody").value;
   if (!body.trim()) return setS("body is empty", 1);
   const p = { type: $("ctype").value, body };
-  if (S.selKind === "dm") { const m = S.sel.match(/^dm~([^~]+)~([^~]+)/); p.dm = m && (m[1] === S.me ? m[2] : m[1]); }
+  // claude M4 B1: core post() requires "to" BEFORE the dm branch runs ("post
+  // requires --from and --to"), and dm mode accepts to === peer. Every DM
+  // composed in the UI was rejected as usage without it.
+  if (S.selKind === "dm") {
+    const peer = dmPeer();
+    if (!peer) return setS("read-only: you are not a party to " + S.sel, 1);
+    p.dm = peer; p.to = peer;
+  }
   else {
     const to = $("cto").value.trim(); if (!to) return setS("to is required", 1);
     p.to = to;
     if ($("cchan").value.trim()) p.channel = $("cchan").value.trim();
   }
   if ($("csubj").value.trim()) p.subject = $("csubj").value.trim();
-  if (S.replyTo) p.re = S.replyTo;
+  // claude M4 M-d: a reply carries thread AND re (AGENTS.md "always carry
+  // --thread and --re"). re alone starts a NEW thread (thread = own id), so
+  // "thread --id parent" never showed UI replies.
+  if (S.replyTo) { p.re = S.replyTo; const par = S.msgs.get(S.replyTo); p.thread = (par && par.thread) || S.replyTo; }
   try {
     const r = await rpc("post", p);
     setS("posted " + r.id + " → #" + r.channel);
@@ -332,10 +411,32 @@ for (const b of document.querySelectorAll(".tab")) b.onclick = () => {
 };
 
 /* ---------- admin ---------- */
-async function renderAdmin() {
-  const box = $("admin"); box.textContent = "";
-  const h = el("h2", null, "Tokens"); box.appendChild(h);
-  let tk; try { tk = await rpc("token.list", {}); } catch (e) { box.appendChild(el("p", null, "token.list: " + e.message)); return; }
+// claude M4 B3: the old renderAdmin() wiped #admin (textContent = "") right
+// after token.create (and again on the tokens_ai event), so the "shown ONCE"
+// secret was shown ZERO times (probe: .once count 0 for 1.5 s while the row
+// was minted server-side): a live credential nobody holds. Now the form is
+// built ONCE, only the table re-renders (token events / revoke), and the
+// minted secret lives in S.minted until the admin dismisses it.
+let adminBuilt = false;
+function renderAdmin() {
+  if (!adminBuilt) { buildAdmin(); adminBuilt = true; }
+  renderMinted();
+  renderTokenTable();
+}
+function renderMinted() {
+  const box = $("minted"); if (!box) return; box.textContent = "";
+  if (!S.minted) return;
+  const d = el("div", "once");
+  d.appendChild(el("div", null, "new token for " + S.minted.agent + " (prefix " + S.minted.prefix + ") — copy it now, it is never shown again:"));
+  d.appendChild(el("div", "tok", S.minted.token));
+  const cb = el("button", "mini", "copy"); cb.onclick = () => navigator.clipboard && navigator.clipboard.writeText(S.minted.token).then(() => { cb.textContent = "copied"; });
+  const dx = el("button", "mini", "dismiss"); dx.onclick = () => { S.minted = null; renderMinted(); };
+  d.appendChild(cb); d.appendChild(document.createTextNode(" ")); d.appendChild(dx);
+  box.appendChild(d);
+}
+async function renderTokenTable() {
+  const box = $("tktable"); if (!box) return;
+  let tk; try { tk = await rpc("token.list", {}); } catch (e) { box.textContent = ""; box.appendChild(el("p", null, "token.list: " + e.message)); return; }
   const tbl = el("table");
   const trh = el("tr");
   for (const c of ["#", "agent", "kind", "prefix", "scopes", "last used", "state", ""]) trh.appendChild(el("th", null, c));
@@ -352,12 +453,21 @@ async function renderAdmin() {
     const td = el("td");
     if (!t.revoked_at) {
       const b = el("button", "mini", "revoke");
-      b.onclick = async () => { try { await rpc("token.revoke", { id: t.id }); renderAdmin(); } catch (e) { alert("revoke: " + e.message); } };
+      b.onclick = async () => {
+        if (!confirm("revoke token #" + t.id + " (" + t.agentId + ")?")) return;
+        try { await rpc("token.revoke", { id: t.id }); renderTokenTable(); } catch (e) { alert("revoke: " + e.message); }
+      };
       td.appendChild(b);
     }
     tr.appendChild(td); tbl.appendChild(tr);
   }
-  box.appendChild(tbl);
+  box.textContent = ""; box.appendChild(tbl);
+}
+function buildAdmin() {
+  const box = $("admin"); box.textContent = "";
+  const once = el("div"); once.id = "minted"; box.appendChild(once);
+  box.appendChild(el("h2", null, "Tokens"));
+  const tb = el("div"); tb.id = "tktable"; box.appendChild(tb);
   const f = el("div"); f.style.marginTop = "14px";
   f.appendChild(el("h2", null, "Mint token"));
   const row = el("div", "row");
@@ -371,21 +481,19 @@ async function renderAdmin() {
   const fc = el("label", "ck"); const fcb = el("input"); fcb.type = "checkbox"; fc.appendChild(fcb); fc.appendChild(document.createTextNode("force (bootstrap guard)")); row2.appendChild(fc);
   f.appendChild(row2);
   const go = el("button", null, "create"); go.style.marginTop = "8px"; f.appendChild(go);
-  const out = el("div"); f.appendChild(out);
+  const err = el("div", "rev"); f.appendChild(err);
   go.onclick = async () => {
-    out.textContent = "";
+    err.textContent = "";
     const p = { agent: ag.value.trim(), kind: kind.value };
     const sel = SC.filter((s) => cks[s].checked);
     if (sel.length) p.scopes = sel;
     if (fcb.checked) p.force = true;
     try {
       const r = await rpc("token.create", p);
-      const d = el("div", "once"); d.textContent = r.token + "   (prefix " + r.prefix + " — shown ONCE)";
-      out.appendChild(d);
-      const cb = el("button", "mini", "copy"); cb.onclick = () => navigator.clipboard && navigator.clipboard.writeText(r.token);
-      out.appendChild(cb);
-      renderAdmin();
-    } catch (e) { out.appendChild(el("div", "rev", "create failed: " + e.message)); }
+      S.minted = { token: r.token, prefix: r.prefix, agent: r.agentId };
+      ag.value = ""; for (const s of SC) cks[s].checked = false; fcb.checked = false;
+      renderMinted(); renderTokenTable();
+    } catch (e) { err.textContent = "create failed: " + e.message; }
   };
   box.appendChild(f);
 }
@@ -406,3 +514,17 @@ async function renderAdmin() {
 </script>
 </body></html>
 `;
+
+// CSP for the shell (served as a HEADER by mod.ts). The script hash is taken
+// from UI_HTML itself, so editing the script can never desync the policy.
+const INLINE_SCRIPT = /<script>([\s\S]*?)<\/script>/.exec(UI_HTML)![1];
+export const UI_CSP = [
+  "default-src 'none'",
+  `script-src 'sha256-${createHash("sha256").update(INLINE_SCRIPT, "utf8").digest("base64")}'`,
+  "style-src 'unsafe-inline'",
+  "connect-src 'self'",
+  "img-src 'self'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+].join("; ");

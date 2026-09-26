@@ -532,11 +532,16 @@ describe("M2 review pins (claude)", () => {
       const ep = (srv.handle as any).raw.epoch();
       const r = await fetch(`${srv.url}/stream?scope=all`, { headers: { authorization: `Bearer ${tok}`, "last-event-id": `${ep}.0` } });
       const got = await readFor(r.body!.getReader(), 600);
-      const hello = JSON.parse(/event: hello\ndata: (.*)\n/.exec(got.s)![1]);
+      // grok M4 B2: hello now carries an id line (native reconnect base).
+      const hello = JSON.parse(/event: hello\n(?:id: [^\n]+\ndata: |data: )(.*)\n/.exec(got.s)![1]);
       expect(hello.seq).toBe(0);
-      const seqs = [...got.s.matchAll(/id: [0-9a-f]+\.(\d+)/g)].map((m) => Number(m[1]));
+      const seqs = [...got.s.matchAll(/event: (?!hello)[a-z]+\nid: [0-9a-f]+\.(\d+)/g)].map((m) => Number(m[1]));
       expect(seqs.length).toBeGreaterThan(0);
       expect(seqs.every((s) => s > hello.seq)).toBe(true); // was: every replayed seq <= hello.seq
+      // the hello id itself = the resume cursor (quiet-bus reconnect base):
+      const helloId = /event: hello\nid: ([0-9a-f]+\.\d+)\ndata:/.exec(got.s);
+      expect(helloId).not.toBeNull();
+      expect(helloId![1]).toBe(`${ep}.0`);
       const fut = await fetch(`${srv.url}/stream?scope=all`, { headers: { authorization: `Bearer ${tok}`, "last-event-id": `${ep}.999999` } });
       expect((await readFor(fut.body!.getReader(), 500)).s).toContain("event: resync");
     } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }

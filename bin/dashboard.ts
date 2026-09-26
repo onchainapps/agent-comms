@@ -62,6 +62,8 @@ if (!SERVER_URL) {
   // serve DM bodies forever (probe: "dm body served after startup: true"). When
   // no DMs exist the filter is a no-op, so there is nothing to latch.
   if (!OMNIVIEW) console.error("dashboard: dm rows hidden (direct-DB pre-G binary); pass --omniview to show, or use the M4 web UI");
+} else if (!OMNIVIEW) {
+  console.error("dashboard: server mode — dm rows hidden (this port is unauthenticated); pass --omniview to show, or use the web UI at " + SERVER_URL);
 }
 const DB = () => {
   if (!db) throw new Error("dashboard: direct-DB path used in server mode");
@@ -112,19 +114,23 @@ async function rpc(method: string, params: Record<string, unknown> = {}): Promis
   }
   return body.result;
 }
-// history snapshot paging (since-mode would GC-truncate a young bus's feed;
-// snapshot pages the whole messages table, which is what the rail needs).
+// claude M4 M-a (dashboard half): the snapshot has no backward paging — the
+// old loop fed the HIGH-WATER cursor back as since= and got 0 rows (probe:
+// 1200 seeded → 500 shown). One snapshot at the core cap (1000) is honest.
+// claude M4 B4: server mode re-serves the TOKEN's view to anyone who can reach
+// this port (unauthenticated, loopback by default). With a read:dm token (the
+// human default) that was every DM body — the exact leak the direct-DB path
+// closes with --omniview. Same gate here: dm rows stripped unless --omniview.
 async function stateRpc(): Promise<any> {
   const [agents, chans] = await Promise.all([rpc("who", { all: true }), rpc("channels", {})]);
-  const messages: any[] = [];
-  let cursor: string | undefined;
-  for (let pages = 0; ; pages++) {
-    const page = await rpc("history", cursor ? { since: cursor, limit: 500 } : { limit: 500 });
-    messages.push(...page.rows);
-    if (!page.hasMore || pages > 80) break;
-    cursor = page.cursor;
+  const page = await rpc("history", { limit: 1000 });
+  let messages: any[] = page.rows.slice().sort((a: any, b: any) => (a.created_at < b.created_at ? -1 : 1));
+  let channels = chans.map((c: any) => ({ name: c.name, n: c.n }));
+  if (!OMNIVIEW) {
+    const isDm = (ch: unknown) => String(ch ?? "").startsWith("dm~");
+    messages = messages.filter((m) => !isDm(m.channel));
+    channels = channels.filter((c: any) => !isDm(c.name));
   }
-  messages.sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
   // groups: list + show per group (members needed by the JS receiptsOf below).
   const gmap: Record<string, { at: string; members: string[] }> = {};
   try {
@@ -140,7 +146,7 @@ async function stateRpc(): Promise<any> {
     agents,
     messages,
     reads: [], // server mode: receipts come from the CORE (see /api/receipts)
-    channels: chans.map((c: any) => ({ name: c.name, n: c.n })),
+    channels,
     groups: gmap,
     serverMode: true,
   };
@@ -296,21 +302,27 @@ function receiptsOf(m,agents,reads,messages,groups){
   return intended.map(id=>({id,read:rmap.has(id),at:rmap.get(id)}));
 }
 // §8 M4 server mode: receipts come from the CORE (receipts RPC via the proxy),
-// never from this JS duplicate. Cache per id; re-render when fresh data lands.
-let serverMode=false; const rcCache=new Map(); const rcPending=new Set();
-function coreReceipts(id){
-  if(!rcCache.has(id)&&!rcPending.has(id)){
-    rcPending.add(id);
-    fetch("/api/receipts?id="+encodeURIComponent(id)).then(r=>r.json()).then(j=>{
-      rcPending.delete(id);
-      if(j&&j.receipts){
-        rcCache.set(id,(j.receipts.intended||[]).map(x=>({id:x,read:false,at:null}))
-          .map(r2=>{const rd=(j.receipts.readers||[]).find(q=>q.id===r2.id);return rd?{id:r2.id,read:true,at:rd.at}:r2;}));
-        render(last);
-      } else rcCache.set(id,[]);
-    }).catch(()=>{rcPending.delete(id);rcCache.set(id,null);});
-  }
-  return rcCache.get(id); // undefined = loading, null = failed, [] = none
+// never from this JS duplicate. claude M4 B5: entries EXPIRE (15 s ok / 5 s
+// failed) — the old cache kept the first answer forever (reads after the
+// first fetch never showed) and cached a failure as null forever; and only
+// the newest RC_MAX feed cards fetch, one request at a time (a 1000-row feed
+// would otherwise fire 1000 proxy→RPC calls into a 120-token read bucket).
+let serverMode=false; const rcCache=new Map(); const rcPending=new Set(); const rcWant=[]; let rcBusy=false;
+const RC_MAX=40;
+function rcPump(){
+  if(rcBusy||!rcWant.length)return; rcBusy=true;
+  const id=rcWant.shift();
+  fetch("/api/receipts?id="+encodeURIComponent(id)).then(r=>r.json()).then(j=>{
+    if(j&&j.receipts){
+      rcCache.set(id,{t:Date.now(),ttl:15000,v:(j.receipts.intended||[]).map(x=>{const rd=(j.receipts.readers||[]).find(q=>q.id===x);return rd?{id:x,read:true,at:rd.at}:{id:x,read:false,at:null};})});
+    } else rcCache.set(id,{t:Date.now(),ttl:5000,v:null});
+  }).catch(()=>{rcCache.set(id,{t:Date.now(),ttl:5000,v:null});})
+    .finally(()=>{rcPending.delete(id);rcBusy=false;if(rcWant.length)rcPump();else render(last);});
+}
+function coreReceipts(id,want){
+  const c=rcCache.get(id);
+  if(want&&(!c||Date.now()-c.t>c.ttl)&&!rcPending.has(id)){rcPending.add(id);rcWant.push(id);rcPump();}
+  return c?c.v:undefined; // undefined = loading/not fetched, null = failed
 }
 function renderChannels(channels){
   const list=(channels||[]).slice();
@@ -328,13 +340,16 @@ function renderFeed(s){
   if(filterThread) msgs=msgs.filter(m=>m.thread===filterThread);
   msgs=[...msgs].reverse();   // newest first
   if(!msgs.length){el("feed").innerHTML='<div class="empty">no messages'+(filterThread?" in this thread":"")+'</div>';return;}
-  el("feed").innerHTML=msgs.map(m=>{
+  el("feed").innerHTML=msgs.map((m,idx)=>{
     const tcol=color(m.type,"--"); const scol=color(m.status,"--s-");
     const fresh=!seen.has(m.id)&&!first; if(!seen.has(m.id))seen.add(m.id);
     const opened=openIds.has(m.id);
-    const rc=serverMode?coreReceipts(m.id):receiptsOf(m,agents,reads,messages,groups);
-    const nread=rc?rc.filter(r=>r.read).length:0;
-    const receiptsHtml=rc&&rc.length?
+    // claude M4 B5: rc is undefined (loading) / null (failed) in server mode —
+    // the old rc.length in the header threw on the FIRST card, so the server-
+    // mode feed rendered ZERO messages (probe: 0 .msg nodes, state had 32).
+    const rc=(serverMode?coreReceipts(m.id,idx<RC_MAX||opened):receiptsOf(m,agents,reads,messages,groups))||[];
+    const nread=rc.filter(r=>r.read).length;
+    const receiptsHtml=rc.length?
       '<div class="receipts"><span class="lbl">receipts</span>'+
       rc.map(r=>'<span class="rcpt '+(r.read?'read':'unread')+'" title="'+(r.read?(r.at?'read '+rel(r.at):'seen (replied)'):'unread')+'">'+
         '<span class="rd">'+(r.read?'✓':'○')+'</span>'+esc(r.id)+'</span>').join('')+'</div>':'';
@@ -422,17 +437,31 @@ const srv = Bun.serve({
   idleTimeout: 0,
   async fetch(req) {
     const url = new URL(req.url);
+    // claude M4 m-d: loopback bind does not stop DNS rebinding — a page on
+    // attacker.example re-resolved to 127.0.0.1 is same-origin with this
+    // unauthenticated port and could read /api/state (probe: foreign Host ⇒
+    // 200). With the default loopback bind, only loopback Host names pass;
+    // --host (explicit LAN opt-in) skips the check.
+    if (!argHost) {
+      const h = (req.headers.get("host") ?? "").replace(/:\d+$/, "").toLowerCase();
+      if (!(h === "localhost" || h === "127.0.0.1" || h === "[::1]")) return new Response("forbidden host", { status: 403 });
+    }
     if (url.pathname === "/api/state") {
       try { return Response.json(await state()); }
       catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 502 }); }
     }
     // §8 M4: server mode takes receipts from the CORE (receipts RPC) — the JS
-    // receiptsOf duplicate is direct-DB-only (no core to call there). One
-    // proxy call per rendered message, cached client-side.
+    // receiptsOf duplicate is direct-DB-only (no core to call there). The page
+    // fetches these for the newest RC_MAX cards only, serially, with a TTL.
     if (url.pathname === "/api/receipts") {
       if (!SERVER_URL) return Response.json({ error: "receipts proxy is server-mode only" }, { status: 400 });
       const id = url.searchParams.get("id") ?? "";
-      try { return Response.json(await rpc("receipts", { id })); }
+      try {
+        const r = await rpc("receipts", { id });
+        // B4 twin: a dm row's receipts are DM metadata (who read what) ⇒ same gate.
+        if (!OMNIVIEW && String(r?.channel ?? "").startsWith("dm~")) return Response.json({ error: "not found" }, { status: 404 });
+        return Response.json(r);
+      }
       catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 502 }); }
     }
     if (url.pathname === "/api/stream") {

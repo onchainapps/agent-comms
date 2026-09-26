@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openBus, localCtx } from "../src/bus.ts";
 import { startServer } from "../src/server/mod.ts";
-import { UI_HTML } from "../src/server/ui.ts";
+import { UI_HTML, UI_CSP } from "../src/server/ui.ts";
 
 const REPO = import.meta.dir + "/..";
 
@@ -47,8 +47,17 @@ describe("M4 web UI (§8)", () => {
       expect(res.headers.get("cache-control")).toBe("no-store");
       expect(res.headers.get("x-frame-options")).toBe("DENY");
       const html = await res.text();
-      expect(html).toContain("Content-Security-Policy");
-      expect(html).toContain("default-src 'self'");
+      // claude M4 m-c: CSP is a HEADER, script-src is the inline script's hash
+      const csp = res.headers.get("content-security-policy") ?? "";
+      expect(csp).toBe(UI_CSP);
+      expect(csp).toContain("default-src 'none'");
+      expect(csp).toContain("frame-ancestors 'none'");
+      expect(csp).toMatch(/script-src 'sha256-[A-Za-z0-9+/=]{44}'/);
+      expect(/script-src[^;]*unsafe-inline/.test(csp)).toBe(false);
+      const script = /<script>([\s\S]*?)<\/script>/.exec(html)![1];
+      const h = new Bun.CryptoHasher("sha256").update(script).digest("base64");
+      expect(csp).toContain(`'sha256-${h}'`);
+      expect((html.match(/<script/g) ?? []).length).toBe(1); // one hashed script, nothing else runnable
       expect(html).toContain("agent comms");
       expect(html).toContain("/rpc");
       expect(html).toContain("EventSource(\"/stream");
@@ -187,5 +196,145 @@ describe("M4 web UI (§8)", () => {
       srv.stop();
       rmSync(home, { recursive: true, force: true });
     }
+  });
+
+  // ---------------- claude M4 review pins ----------------
+
+  test("claude M4 B1/B2 wire contract the shell relies on: DM post needs to=peer; receipts hydrate writes no reads row", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0 });
+    try {
+      const b = openBus({ home, mode: "local" });
+      b.joinAgent(localCtx("peer1"), { agent: "peer1", role: "peer" });
+      const h = (b.tokenCreate(localCtx("bootstrap"), { agent: "human-x", kind: "human" }) as any).value.token as string;
+      b.close();
+      const lg = await rpcCookie(srv.url, null, "login", { token: h });
+      const cookie = (lg.headers.get("set-cookie") ?? "").split(";")[0];
+      // B1: the pre-fix composer body ({type, body, dm}) is usage — the core
+      // requires to before the dm branch; the fixed body adds to = peer.
+      const bare = await rpcCookie(srv.url, cookie, "post", { type: "note", body: "x", dm: "peer1" });
+      expect(bare.body.error?.data?.busError).toBe("usage");
+      const fixed = await rpcCookie(srv.url, cookie, "post", { type: "note", body: "dm from ui", dm: "peer1", to: "peer1" });
+      expect(fixed.status).toBe(200);
+      expect(fixed.body.result.channel).toBe("dm~human-x~peer1");
+      expect(UI_HTML).toContain("p.dm = peer; p.to = peer;");
+      // B2: hydrate must use receipts (non-marking), never read (marking).
+      const b2 = openBus({ home, mode: "local" });
+      const ask = (b2.post(localCtx("peer1"), { from: "peer1", to: "human-x", type: "ask", body: "unopened" }) as any).value.id as string;
+      b2.close();
+      const rc = await rpcCookie(srv.url, cookie, "receipts", { id: ask });
+      expect(rc.body.result.body).toBe("unopened"); // same row the pane needs
+      const b3 = openBus({ home, mode: "local" });
+      const reads = (b3 as any).testDb.query("SELECT agent FROM reads WHERE msg=?").all(ask);
+      b3.close();
+      expect(reads).toEqual([]); // rendering is not reading
+      expect(UI_HTML.includes('rpc("read"')).toBe(false);
+      expect(UI_HTML).toContain('rpc("receipts", { id: d.id })');
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("claude M4 M-a: snapshot has no backward paging — the shell does ONE capped snapshot, not a since-loop", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    {
+      const b = openBus({ home, mode: "local" });
+      b.joinAgent(localCtx("p1"), { agent: "p1", role: "p" });
+      for (let i = 0; i < 12; i++) b.post(localCtx("p1"), { from: "p1", to: "root", type: "note", body: "r" + i });
+      b.close();
+    }
+    const srv = startServer({ home, port: 0 });
+    try {
+      const auth = { "content-type": "application/json", authorization: `Bearer ${tok}` };
+      const call = (p: any) => fetch(`${srv.url}/rpc`, { method: "POST", headers: auth, body: JSON.stringify({ jsonrpc: "2.0", method: "history", params: p, id: 1 }) }).then((r) => r.json() as any);
+      const p1 = await call({ limit: 5 });
+      expect(p1.result.rows.length).toBe(5);
+      expect(p1.result.hasMore).toBe(true);
+      const p2 = await call({ since: p1.result.cursor, limit: 5 }); // the old loop's second call
+      expect(p2.result.rows.length).toBe(0);                         // ⇒ it never paged anything
+      expect(UI_HTML).toContain('rpc("history", { limit: 1000 })');
+      expect(UI_HTML.includes("pages > 40")).toBe(false);
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("claude M4 M-e: logout closes the session's open /stream; re-login replaces; per-token cap; idle expiry", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0, limits: { maxSessionsPerToken: 3, sessionIdleMs: 400, tailerMs: 50 } as any });
+    try {
+      const login = async (prior?: string) => {
+        const r = await rpcCookie(srv.url, prior ?? null, "login", { token: tok });
+        return (r.headers.get("set-cookie") ?? "").split(";")[0];
+      };
+      const c1 = await login();
+      expect((await login(c1)) !== c1).toBe(true);
+      expect(srv.sessions.size).toBe(1); // re-login from the same browser replaced c1
+      for (let i = 0; i < 5; i++) await login();
+      expect(srv.sessions.size).toBe(3); // cap, oldest evicted
+      // stream on a fresh session, then logout ⇒ the stream ends
+      const ck = await login();
+      const res = await fetch(`${srv.url}/stream?scope=all`, { headers: { cookie: ck } });
+      expect(res.status).toBe(200);
+      const rd = res.body!.getReader();
+      let ended = false;
+      const pump = (async () => { try { for (;;) { const { done } = await rd.read(); if (done) { ended = true; break; } } } catch { ended = true; } })();
+      await Bun.sleep(100);
+      expect((await rpcCookie(srv.url, ck, "logout")).status).toBe(200);
+      await Promise.race([pump, Bun.sleep(1500)]);
+      expect(ended).toBe(true);
+      // idle expiry
+      const ck2 = await login();
+      expect((await rpcCookie(srv.url, ck2, "channels")).status).toBe(200);
+      await Bun.sleep(600);
+      const dead = await rpcCookie(srv.url, ck2, "channels");
+      expect(dead.status).toBe(401);
+      expect(dead.body.error.data.detail).toBe("session expired");
+      // cookie now carries Max-Age (browser drops it with the absolute expiry)
+      const r = await rpcCookie(srv.url, null, "login", { token: tok });
+      expect(r.headers.get("set-cookie") ?? "").toMatch(/Max-Age=\d+/);
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("claude M4 B4/m-d: dashboard server mode strips DM rows unless --omniview; foreign Host refused on loopback bind", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    let human = "";
+    {
+      const b = openBus({ home, mode: "local" });
+      b.joinAgent(localCtx("d1"), { agent: "d1", role: "d" });
+      b.joinAgent(localCtx("d2"), { agent: "d2", role: "d" });
+      human = (b.tokenCreate(localCtx("bootstrap"), { agent: "human-d", kind: "human" }) as any).value.token as string;
+      const r = b.post(localCtx("d1"), { from: "d1", to: "d2", type: "note", body: "SECRET-DM", dm: "d2" });
+      if (r.error) throw new Error(r.detail);
+      b.post(localCtx("d1"), { from: "d1", to: "d2", type: "note", body: "public-row" });
+      b.close();
+    }
+    const srv = startServer({ home, port: 0 });
+    const spawnDash = async (extra: string[]) => {
+      const p = Bun.spawn([process.execPath, join(REPO, "bin/dashboard.ts"), "--port", "0", "--url", srv.url, "--token", human, ...extra], { stdout: "pipe", stderr: "pipe" });
+      const rr = p.stdout.getReader(); const dec = new TextDecoder(); let url = "";
+      for (let i = 0; i < 50 && !url; i++) { const { value } = await rr.read(); if (!value) break; const m = /http:\/\/localhost:(\d+)/.exec(dec.decode(value)); if (m) url = `http://127.0.0.1:${m[1]}`; }
+      return { p, url };
+    };
+    const a = await spawnDash([]);
+    const b = await spawnDash(["--omniview"]);
+    try {
+      const sa = await (await fetch(`${a.url}/api/state`)).json() as any;
+      expect(JSON.stringify(sa.messages)).toContain("public-row");
+      expect(JSON.stringify(sa.messages).includes("SECRET-DM")).toBe(false);
+      expect(sa.channels.some((c: any) => c.name.startsWith("dm~"))).toBe(false);
+      const dmId = (await (await fetch(`${b.url}/api/state`)).json() as any).messages.find((m: any) => m.body === "SECRET-DM").id;
+      expect(dmId).toBeTruthy(); // --omniview opts in
+      expect((await fetch(`${a.url}/api/receipts?id=${dmId}`)).status).toBe(404); // DM receipts gated too
+      const reb = await fetch(`${a.url}/api/state`, { headers: { host: "attacker.example" } });
+      expect(reb.status).toBe(403);
+    } finally { a.p.kill(); b.p.kill(); srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("claude M4 B3/M-f/B5 shell pins: minted token survives the re-render; resync closes+re-hands-off; dashboard rc null-safe", () => {
+    // B3: the table re-render must not own the minted-secret node
+    expect(UI_HTML).toContain("S.minted = { token: r.token");
+    expect(/async function renderTokenTable\(\)[\s\S]*?\$\("tktable"\)/.test(UI_HTML)).toBe(true);
+    expect(UI_HTML.includes('$("admin"); box.textContent = "";\n  const h = el("h2"')).toBe(false);
+    // M-f: resync handler closes the EventSource before re-opening at the new cursor
+    expect(/addEventListener\("resync", async \(\) => \{\s*es\.close\(\)/.test(UI_HTML)).toBe(true);
+    // M-b: stream opens AT the snapshot cursor (§6 handoff)
+    expect(UI_HTML).toContain("const cursor = await loadHistory();\n  openStream(cursor);");
   });
 });

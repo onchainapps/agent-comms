@@ -8,7 +8,7 @@
  */
 import { openBus, serverCtx, validChannelName, RPC_CODES, type BusErrorCode, type Scope, type Cred } from "../bus.ts";
 import { serverHandle, wrapSession, type BusHandle, type Session } from "../bus-iface.ts";
-import { UI_HTML } from "./ui.ts";
+import { UI_HTML, UI_CSP } from "./ui.ts";
 import type { Seams } from "../seams.ts";
 import { join, sep } from "node:path";
 import { realpathSync } from "node:fs";
@@ -26,6 +26,12 @@ export const LIMITS = {
   pingMs: 20_000,
   ticketTtlMs: 60_000,
   gcMs: 3_600_000,            // §6/§9 idempotency+events GC: startup + hourly (0 disables — tests)
+  // claude M4 M-e: cookie sessions were immortal until logout/restart and
+  // unbounded (probe: 2000 logins ⇒ sessions.size 2000). Idle + absolute
+  // expiry, and a per-token cap (oldest evicted).
+  sessionIdleMs: 12 * 3_600_000,
+  sessionMaxMs: 7 * 24 * 3_600_000,
+  maxSessionsPerToken: 8,
 };
 
 const WRITE_METHODS = new Set(["join", "post", "status", "rename", "token.create", "token.revoke", "group.create", "group.join", "group.leave", "group.delete", "cursor.set", "login"]);
@@ -94,7 +100,7 @@ export type RunningServer = {
   stop(): void;
   /** test/admin hooks (same demotion rationale as core.testDb) */
   handle: BusHandle;
-  sessions: Map<string, { tokenId: number }>;
+  sessions: Map<string, { tokenId: number; created: number; seen: number }>;
   tailNow(): void;
   streamCount(tokenId: number): number;
 };
@@ -108,7 +114,9 @@ export function startServer(opts: ServerOpts): RunningServer {
   // §8 in-memory session store — restart = logout (documented). claude M2 B1:
   // stores ONLY the token id; the principal is re-read from the token row on
   // EVERY cookie request (§5), so revoke/rename/retire bite immediately.
-  const sessions = new Map<string, { tokenId: number }>();
+  const sessions = new Map<string, { tokenId: number; created: number; seen: number }>();
+  const sessionLive = (s: { created: number; seen: number }, now = Date.now()) =>
+    now - s.seen < LIM.sessionIdleMs && now - s.created < LIM.sessionMaxMs;
   // §6 non-cookie tickets: 60 s single-use; re-resolved from the row at open.
   const tickets = new Map<string, { tokenId: number; exp: number }>();
 
@@ -122,6 +130,7 @@ export function startServer(opts: ServerOpts): RunningServer {
     push(frame: string): void; close(): void; refresh(): void; resync(epoch: string, floor: number): void;
     scope: string; agentId: string; scopes: Scope[]; tokenId: number;
     seq: number; epoch: string; alive: boolean;
+    sid: string | null; // cookie-authed stream ⇒ dies with its session (logout/expiry)
   };
   const subs = new Set<Sub>();
   let tailTimer: ReturnType<typeof setInterval> | null = null;
@@ -264,8 +273,10 @@ export function startServer(opts: ServerOpts): RunningServer {
     if (sid !== null) {
       const s = sessions.get(sid);
       if (!s) return fail(UNAUTH("unknown session"));
+      if (!sessionLive(s)) { sessions.delete(sid); return fail(UNAUTH("session expired")); }
       const r = fromRow(s.tokenId, "cookie");
       if ("err" in r) { sessions.delete(sid); return fail(r); } // revoked/retired ⇒ session dies with the token
+      s.seen = Date.now();
       return r;
     }
     return UNAUTH("missing bearer or session cookie");
@@ -366,7 +377,13 @@ export function startServer(opts: ServerOpts): RunningServer {
     if (body.method === "login" || body.method === "logout") {
       if (body.method === "logout") {
         const sid = cookieSid(req);
-        if (sid) sessions.delete(sid);
+        if (sid) {
+          sessions.delete(sid);
+          // claude M4 M-e: logout also ends the session's open /stream (probe:
+          // after logout /rpc was 401 but the cookie EventSource kept
+          // receiving msg frames until restart).
+          for (const s of [...subs]) if (s.sid === sid) s.close();
+        }
         return json(200, { jsonrpc: "2.0", result: { loggedOut: true }, id }, { "set-cookie": "comms_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict; Secure" });
       }
       const bucket = ipBucket(ip);
@@ -376,9 +393,19 @@ export function startServer(opts: ServerOpts): RunningServer {
       const v = tokStr.length > LIM.maxAuth ? { error: "unauthorized" as const, detail: "token too long" } : core.tokenVerify(tokStr);
       if (v.error) { bucket.take(); return json(401, { jsonrpc: "2.0", error: busToRpc(v), id }); }
       const sid = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("hex");
-      sessions.set(sid, { tokenId: v.value.tokenId });
+      // a re-login from the same browser replaces its old session, and each
+      // token holds at most maxSessionsPerToken (oldest evicted, its stream too).
+      const prior = cookieSid(req);
+      if (prior && sessions.delete(prior)) for (const s of [...subs]) if (s.sid === prior) s.close();
+      const mine = [...sessions].filter(([, s]) => s.tokenId === v.value.tokenId).sort((a, b) => a[1].created - b[1].created);
+      for (const [k] of mine.slice(0, Math.max(0, mine.length - LIM.maxSessionsPerToken + 1))) {
+        sessions.delete(k);
+        for (const s of [...subs]) if (s.sid === k) s.close();
+      }
+      const now = Date.now();
+      sessions.set(sid, { tokenId: v.value.tokenId, created: now, seen: now });
       return json(200, { jsonrpc: "2.0", result: { agentId: v.value.agentId, scopes: v.value.scopes }, id },
-        { "set-cookie": `comms_session=${sid}; Path=/; HttpOnly; SameSite=Strict; Secure` });
+        { "set-cookie": `comms_session=${sid}; Path=/; Max-Age=${Math.floor(LIM.sessionMaxMs / 1000)}; HttpOnly; SameSite=Strict; Secure` });
     }
 
     const a = auth(req, ip);
@@ -478,6 +505,7 @@ export function startServer(opts: ServerOpts): RunningServer {
       who = a.ok;
     }
     const { tokenId, agentId, scopes } = who;
+    const streamSid = who.via === "cookie" ? cookieSid(req) : null;
 
     // validate EVERYTHING before taking a stream slot (claude M2: a 400 on a
     // bad Last-Event-ID used to leak the slot — two bad resumes = token
@@ -512,7 +540,7 @@ export function startServer(opts: ServerOpts): RunningServer {
     let ping: ReturnType<typeof setInterval> | null = null;
     let ctrl: ReadableStreamDefaultController | null = null;
     const sub: Sub = {
-      scope, agentId, scopes, tokenId, seq: from, epoch: ep, alive: true,
+      scope, agentId, scopes, tokenId, seq: from, epoch: ep, alive: true, sid: streamSid,
       push: (f) => {
         if (!ctrl || detached) return;
         // bounded server-side queue: a stalled reader must not grow memory
@@ -527,7 +555,9 @@ export function startServer(opts: ServerOpts): RunningServer {
         // only unsubscribed, leaving a silent zombie connection holding the
         // client (EventSource never reconnects, never learns it was revoked).
         const t = core.tokenById(tokenId);
-        if (!t || !t.live || (sub.scope === "all" && !t.scopes.includes("read:all"))) {
+        const sess = sub.sid !== null ? sessions.get(sub.sid) : null;
+        const sessionGone = sub.sid !== null && (!sess || !sessionLive(sess));
+        if (!t || !t.live || sessionGone || (sub.scope === "all" && !t.scopes.includes("read:all"))) {
           sub.push(`event: revoked\ndata: {}\n\n`);
           sub.close();
           return;
@@ -560,7 +590,13 @@ export function startServer(opts: ServerOpts): RunningServer {
         // hello.seq = the point deltas apply AFTER — the RESUME cursor on a
         // resume (claude M2: was the high-water, so a client deduping by
         // seq<=hello.seq dropped the entire replay).
-        sub.push(`event: hello\ndata: ${JSON.stringify({ epoch: ep, seq: from })}\n\n`);
+        // grok M4 B2: hello also sets the SSE id, so a native EventSource
+        // reconnect on a QUIET bus (no id'd frame ever arrived ⇒ browser has
+        // no Last-Event-ID) still resumes at the handoff point instead of
+        // re-subscribing at the high-water and silently dropping the gap.
+        // resync frames deliberately carry NO id (the client must drop the
+        // dead cursor; claude M4 M-f handles that side).
+        sub.push(`event: hello\nid: ${ep}.${from}\ndata: ${JSON.stringify({ epoch: ep, seq: from })}\n\n`);
         tick();
         ping = setInterval(() => sub.push(": ping\n\n"), LIM.pingMs);
       },
@@ -593,7 +629,13 @@ export function startServer(opts: ServerOpts): RunningServer {
       // never outlive its session; X-Frame-Options: a foreign frame could not
       // drive RPCs (CSRF) but should not sniff the login surface either.
       if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html"))
-        return new Response(UI_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-frame-options": "DENY", "referrer-policy": "no-referrer" } });
+        return new Response(UI_HTML, { headers: {
+          "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-frame-options": "DENY", "referrer-policy": "no-referrer",
+          // claude M4 m-c: the policy rides the HEADER (a meta CSP cannot
+          // carry frame-ancestors, and is applied only after parsing starts).
+          // script-src is the inline script's sha256, not 'unsafe-inline'.
+          "content-security-policy": UI_CSP, "x-content-type-options": "nosniff",
+        } });
       if (req.method === "POST" && url.pathname === "/rpc") return handleRpc(req, ip);
       if (req.method === "GET" && url.pathname === "/stream") return handleStream(req, ip);
       // §7 GET /raw/messages/<channel>/<file> — mirror bytes for remote agents.
@@ -650,6 +692,8 @@ export function startServer(opts: ServerOpts): RunningServer {
   const housekeeping = () => {
     try { core.gc(); } catch (e) { core.seams.warn?.(`agent-comms gc: ${String((e as any)?.message ?? e)}`); }
     for (const [k, b] of ipBuckets) if (b.full) ipBuckets.delete(k);
+    const now = Date.now();
+    for (const [k, s] of sessions) if (!sessionLive(s, now)) sessions.delete(k); // streams close on next refresh()
   };
   if (LIM.gcMs > 0) { housekeeping(); gcTimer = setInterval(housekeeping, LIM.gcMs); }
 
