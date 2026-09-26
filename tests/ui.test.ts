@@ -64,8 +64,15 @@ describe("M4 web UI (§8)", () => {
       // XSS hygiene: bus strings must never reach innerHTML in the UI module.
       expect(UI_HTML.includes("innerHTML")).toBe(false);
       expect(UI_HTML.includes("textContent")).toBe(true);
-      // token never persisted to storage (§8):
-      expect(UI_HTML.includes("localStorage")).toBe(false);
+      // token persistence is OPT-IN only (§8 amendment): the checkbox exists,
+      // the DEFAULT path never writes localStorage, and every exit path
+      // (logout / revoked / failed login) clears it.
+      expect(UI_HTML.includes('id="remember"')).toBe(true);
+      expect(UI_HTML.includes('localStorage.setItem("comms-token"')).toBe(true);
+      const setCalls = (UI_HTML.match(/localStorage\.setItem/g) ?? []).length;
+      expect(setCalls).toBe(1); // exactly one write site, behind the checkbox
+      expect(UI_HTML.includes('if ($("remember").checked) localStorage.setItem')).toBe(true);
+      expect((UI_HTML.match(/localStorage\.removeItem\("comms-token"\)/g) ?? []).length).toBeGreaterThanOrEqual(3); // logout, revoked, failed login, unchecked-login
     } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
   });
 

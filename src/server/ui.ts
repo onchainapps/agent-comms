@@ -1,8 +1,9 @@
 /**
  * src/server/ui.ts — M4 web UI (RFC-001 §8): the single static page served at
  * GET / by the server. Vanilla JS, same-origin only — every RPC goes through
- * POST /rpc on the HttpOnly session cookie (login mints it; the token is never
- * persisted to localStorage), live frames arrive on EventSource /stream.
+ * POST /rpc on the HttpOnly session cookie (login mints it; the token is
+ * persisted to localStorage ONLY by the opt-in "remember" checkbox — default
+ * stays never-store), live frames arrive on EventSource /stream.
  *
  * Security notes (pinned by tests/ui.test.ts):
  * - Bus data is rendered with textContent/createElement ONLY — no innerHTML
@@ -80,8 +81,9 @@ export const UI_HTML = /* html */ `<!doctype html>
 <body>
 <div id="login">
   <h1>agent comms</h1>
-  <p>Paste your token (<code>ac_…</code>). It becomes an HttpOnly session cookie — never stored by the page.</p>
+  <p>Paste your token (<code>ac_…</code>). It becomes an HttpOnly session cookie. Unless you check "remember" below, the page never stores it.</p>
   <input id="tok" type="password" placeholder="ac_…" autocomplete="off">
+  <label class="ck" style="display:block;margin:6px 0"><input type="checkbox" id="remember"> remember this token on this device (plain localStorage — shared browser profile can read it; fine for a human workstation, not for a shared kiosk)</label>
   <button id="go" style="width:100%">Login</button>
   <div id="lerr" style="color:var(--err);margin-top:10px;white-space:pre-wrap"></div>
 </div>
@@ -156,15 +158,20 @@ async function boot() {
 $("go").onclick = async () => {
   $("lerr").textContent = "";
   try {
-    const r = await rpc("login", { token: $("tok").value.trim() });
+    const t = $("tok").value.trim();
+    const r = await rpc("login", { token: t });
     S.me = r.agentId; S.scopes = r.scopes || [];
     $("me").textContent = S.me; $("myscopes").textContent = S.scopes.join(", ");
+    // opt-in remember (§8 amendment): default remains never-persist; the box
+    // stores plaintext localStorage — honest trade for a human workstation.
+    if ($("remember").checked) localStorage.setItem("comms-token", t);
+    else localStorage.removeItem("comms-token");
     $("tok").value = "";
     await boot();
-  } catch (e) { $("lerr").textContent = "login failed: " + e.message; }
+  } catch (e) { $("lerr").textContent = "login failed: " + e.message; localStorage.removeItem("comms-token"); } // bad/stale saved token ⇒ don't loop
 };
 $("tok").addEventListener("keydown", (ev) => { if (ev.key === "Enter") $("go").click(); });
-$("out").onclick = async () => { if (S.stream) S.stream.close(); try { await rpc("logout", {}); } catch {} location.reload(); };
+$("out").onclick = async () => { if (S.stream) S.stream.close(); try { await rpc("logout", {}); } catch {} localStorage.removeItem("comms-token"); location.reload(); };
 
 /* ---------- channels / DMs ---------- */
 async function refreshChans() {
@@ -330,7 +337,7 @@ function openStream(since) {
     const c = await loadHistory();
     if (S.stream === es) openStream(c);
   });
-  es.addEventListener("revoked", () => { es.close(); $("conn").textContent = "stream: token revoked — reload"; $("conn").style.color = "var(--err)"; });
+  es.addEventListener("revoked", () => { es.close(); $("conn").textContent = "stream: token revoked — reload"; $("conn").style.color = "var(--err)"; localStorage.removeItem("comms-token"); });
   es.addEventListener("msg", (ev) => { const d = JSON.parse(ev.data); hydrate(d); });
   es.addEventListener("status", (ev) => { const d = JSON.parse(ev.data); if (S.msgs.has(d.id)) note(d.id, { status: d.status }); else hydrate(d); });
   es.addEventListener("read", (ev) => { const d = JSON.parse(ev.data); S.rpccache.delete(d.msg); loadReceipts(d.msg); });
@@ -508,7 +515,13 @@ function buildAdmin() {
   // (§7: identity rides the first response's headers — zero extra RPC).
   try {
     const res = await fetch("/rpc", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", method: "channels", params: {}, id: ++rpcid }) });
-    if (!res.ok) return; // no session — login card stays
+    if (!res.ok) {
+      // no session — login card stays; a saved token (opt-in remember) is
+      // prefilled but NOT auto-submitted: the human clicks Login.
+      const saved = localStorage.getItem("comms-token");
+      if (saved) { $("tok").value = saved; $("remember").checked = true; }
+      return;
+    }
     S.me = res.headers.get("x-comms-agent") || "(unknown)";
     S.scopes = (res.headers.get("x-comms-scopes") || "").split(",").filter(Boolean);
     $("me").textContent = S.me; $("myscopes").textContent = S.scopes.join(", ");

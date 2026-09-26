@@ -367,7 +367,9 @@ rebaseline quirk through M1 (goldens hold); cursor-backed watch lands in M3.
 
 - Login: paste token → `login` RPC → HttpOnly session cookie
   (`SameSite=Strict; Secure; HttpOnly`); SSE rides the same cookie (§6). Token not persisted to
-  localStorage. **CSRF (applies to cookie-authed requests *and* unauthenticated `login`):**
+  localStorage by default — opt-in "remember this device" may store it plaintext
+  in localStorage (UI-level convenience; every exit path — logout, revoked,
+  failed login — clears it). **CSRF (applies to cookie-authed requests *and* unauthenticated `login`):**
   `Origin` must equal configured origin, and the parsed media type of `Content-Type` must be
   `application/json` (parse params — `application/json; charset=utf-8` passes; byte-exact
   compare would break clients that append charset). Media-type check forces a CORS preflight
