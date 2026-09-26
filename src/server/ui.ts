@@ -73,6 +73,7 @@ export const UI_HTML = /* html */ `<!doctype html>
   th,td{border:1px solid var(--line);padding:5px 8px;text-align:left;font-size:13px}
   th{background:var(--panel);font-size:11px;text-transform:uppercase;color:var(--dim)}
   td.mono{font-family:var(--mono);font-size:12px}
+  pre.mono{font-family:var(--mono);font-size:12px;white-space:pre;overflow-x:auto;margin:8px 0}
   .tok{color:var(--ok);font-family:var(--mono);word-break:break-all}
   .rev{color:var(--err)}
   .once{background:var(--panel);border:1px solid var(--ok);border-radius:8px;padding:10px;margin:10px 0;font-family:var(--mono);word-break:break-all}
@@ -430,6 +431,28 @@ function renderAdmin() {
   renderMinted();
   renderTokenTable();
 }
+// token.create returns scopes as normalized CSV; token.list returns an array.
+// Accept both so the invite block is right whichever path filled S.minted.
+function scopesCsv(m) { return Array.isArray(m.scopes) ? m.scopes.join(",") : String(m.scopes || ""); }
+function inviteText(m) {
+  // The bus has no invite RPC by design (§5: bootstrap local-only, tokens are
+  // minted) — an invite is this text block. Identity rides the token, so the
+  // block must say so (agents that self-claim an id get -32002).
+  return [
+    "── agent-comms invite ─────────────────────────",
+    "URL:    " + location.origin,
+    "TOKEN:  " + m.token,
+    "AGENT:  " + m.agent + "   (identity comes from the token — never claim it)",
+    "SCOPES: " + (scopesCsv(m) || "(none — plain sender)"),
+    "",
+    "auth:    header  Authorization: Bearer " + m.token,
+    "         content-type: application/json",
+    "first:   POST /rpc {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"join\",\"params\":{\"role\":\"…\"}}",
+    "docs:    README \"Remote mode\" · deploy/RUNBOOK.md · RFC-001 §5–§7",
+    "note:    token is shown ONCE — store it; revoke in Admin any time.",
+    "────────────────────────────────────────────────",
+  ].join("\n");
+}
 function renderMinted() {
   const box = $("minted"); if (!box) return; box.textContent = "";
   if (!S.minted) return;
@@ -437,8 +460,13 @@ function renderMinted() {
   d.appendChild(el("div", null, "new token for " + S.minted.agent + " (prefix " + S.minted.prefix + ") — copy it now, it is never shown again:"));
   d.appendChild(el("div", "tok", S.minted.token));
   const cb = el("button", "mini", "copy"); cb.onclick = () => navigator.clipboard && navigator.clipboard.writeText(S.minted.token).then(() => { cb.textContent = "copied"; });
+  const ci = el("button", "mini", "copy invite");
+  ci.onclick = () => navigator.clipboard && navigator.clipboard.writeText(inviteText(S.minted)).then(() => { ci.textContent = "invite copied"; });
   const dx = el("button", "mini", "dismiss"); dx.onclick = () => { S.minted = null; renderMinted(); };
-  d.appendChild(cb); d.appendChild(document.createTextNode(" ")); d.appendChild(dx);
+  d.appendChild(cb); d.appendChild(document.createTextNode(" ")); d.appendChild(ci); d.appendChild(document.createTextNode(" ")); d.appendChild(dx);
+  const det = el("details"); const sm = el("summary"); sm.textContent = "preview invite text"; det.appendChild(sm);
+  const pre = el("pre", "mono"); pre.textContent = inviteText(S.minted); det.appendChild(pre);
+  d.appendChild(det);
   box.appendChild(d);
 }
 async function renderTokenTable() {
@@ -501,7 +529,7 @@ function buildAdmin() {
     if (fcb.checked) p.force = true;
     try {
       const r = await rpc("token.create", p);
-      S.minted = { token: r.token, prefix: r.prefix, agent: r.agentId, label: p.label };
+      S.minted = { token: r.token, prefix: r.prefix, agent: r.agentId, label: p.label, scopes: r.scopes };
       ag.value = ""; lab.value = ""; for (const s of SC) cks[s].checked = false; fcb.checked = false;
       renderMinted(); renderTokenTable();
     } catch (e) { err.textContent = "create failed: " + e.message; }
