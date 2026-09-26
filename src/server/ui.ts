@@ -472,9 +472,9 @@ function buildAdmin() {
   const f = el("div"); f.style.marginTop = "14px";
   f.appendChild(el("h2", null, "Mint token"));
   const row = el("div", "row");
-  const ag = el("input"); ag.placeholder = "agent id"; row.appendChild(ag);
+  const ag = el("input"); ag.placeholder = "agent id — a-z0-9, -, _ (lowercase)"; ag.style.flex = "1"; ag.style.minWidth = "140px"; ag.pattern = "[a-z0-9][a-z0-9_-]{0,31}"; row.appendChild(ag);
   const kind = el("select"); for (const k of ["agent", "human"]) kind.appendChild(el("option", null, k)); row.appendChild(kind);
-  const lab = el("input"); lab.placeholder = "label (optional)"; lab.style.maxWidth = "220px"; row.appendChild(lab);
+  const lab = el("input"); lab.placeholder = "label (optional)"; lab.style.flex = "1"; lab.style.minWidth = "140px"; row.appendChild(lab);
   f.appendChild(row);
   const row2 = el("div", "row"); row2.style.marginTop = "8px";
   const SC = ["read:all", "read:dm", "post:as", "tokens:admin", "agents:admin"];
@@ -487,6 +487,7 @@ function buildAdmin() {
   go.onclick = async () => {
     err.textContent = "";
     const p = { agent: ag.value.trim(), kind: kind.value };
+    if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(p.agent)) { err.textContent = "agent id must be lowercase a-z 0-9 - _ (start alnum, ≤32)"; return; }
     if (lab.value.trim()) p.label = lab.value.trim();
     const sel = SC.filter((s) => cks[s].checked);
     if (sel.length) p.scopes = sel;
