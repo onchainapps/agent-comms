@@ -16,6 +16,8 @@ KEEP_DAYS="${KEEP_DAYS:-14}"
 DB="$HOME_DIR/.comms/comms.db"
 [ -f "$DB" ] || { echo "no db at $DB" >&2; exit 1; }
 umask 077
+cd / # sudo -u comms keeps the caller's cwd; find -delete restores it at exit
+     # and dies (false "no backup") when that dir is 0750 someone-else.
 mkdir -p "$DEST"
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 OUT="$DEST/comms-$STAMP.db"
