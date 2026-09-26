@@ -41,6 +41,12 @@ done
 if command -v fuser >/dev/null && fuser -s "$DB" "$DB-wal" "$DB-shm" 2>/dev/null; then
   die "a process still holds $DB (server, dashboard, local CLI) — stop it first"
 fi
+# an aside left by a swap that was killed mid-window holds the OLD image's
+# committed frames; a second restore would mv over it and its new prerestore
+# .backup would not see them. Recover first (grok 96a4).
+if [ -e "$DB-wal.aside" ] || [ -e "$DB-shm.aside" ]; then
+  die "unrecovered swap-aside exists ($DB-wal.aside / $DB-shm.aside) — a previous restore was killed mid-swap: mv $DB-wal.aside $DB-wal (SQLite rebuilds -shm), verify, then re-run"
+fi
 
 umask 077
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
