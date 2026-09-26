@@ -439,7 +439,7 @@ async function renderTokenTable() {
   let tk; try { tk = await rpc("token.list", {}); } catch (e) { box.textContent = ""; box.appendChild(el("p", null, "token.list: " + e.message)); return; }
   const tbl = el("table");
   const trh = el("tr");
-  for (const c of ["#", "agent", "kind", "prefix", "scopes", "last used", "state", ""]) trh.appendChild(el("th", null, c));
+  for (const c of ["#", "agent", "kind", "prefix", "label", "scopes", "last used", "state", ""]) trh.appendChild(el("th", null, c));
   tbl.appendChild(trh);
   for (const t of tk.tokens) {
     const tr = el("tr");
@@ -447,6 +447,7 @@ async function renderTokenTable() {
     tr.appendChild(el("td", null, t.agentId));
     tr.appendChild(el("td", null, t.kind));
     tr.appendChild(el("td", "mono", t.prefix));
+    tr.appendChild(el("td", null, t.label || "—"));
     tr.appendChild(el("td", "mono", (t.scopes || []).join(",")));
     tr.appendChild(el("td", "mono", t.last_used || "—"));
     tr.appendChild(el("td", t.revoked_at ? "rev" : "", t.revoked_at ? "revoked" : "live"));
@@ -473,6 +474,7 @@ function buildAdmin() {
   const row = el("div", "row");
   const ag = el("input"); ag.placeholder = "agent id"; row.appendChild(ag);
   const kind = el("select"); for (const k of ["agent", "human"]) kind.appendChild(el("option", null, k)); row.appendChild(kind);
+  const lab = el("input"); lab.placeholder = "label (optional)"; lab.style.maxWidth = "220px"; row.appendChild(lab);
   f.appendChild(row);
   const row2 = el("div", "row"); row2.style.marginTop = "8px";
   const SC = ["read:all", "read:dm", "post:as", "tokens:admin", "agents:admin"];
@@ -485,13 +487,14 @@ function buildAdmin() {
   go.onclick = async () => {
     err.textContent = "";
     const p = { agent: ag.value.trim(), kind: kind.value };
+    if (lab.value.trim()) p.label = lab.value.trim();
     const sel = SC.filter((s) => cks[s].checked);
     if (sel.length) p.scopes = sel;
     if (fcb.checked) p.force = true;
     try {
       const r = await rpc("token.create", p);
-      S.minted = { token: r.token, prefix: r.prefix, agent: r.agentId };
-      ag.value = ""; for (const s of SC) cks[s].checked = false; fcb.checked = false;
+      S.minted = { token: r.token, prefix: r.prefix, agent: r.agentId, label: p.label };
+      ag.value = ""; lab.value = ""; for (const s of SC) cks[s].checked = false; fcb.checked = false;
       renderMinted(); renderTokenTable();
     } catch (e) { err.textContent = "create failed: " + e.message; }
   };
