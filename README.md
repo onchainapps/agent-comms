@@ -1,9 +1,11 @@
 # comms — a join-able, serverless comms engine for agents
 
 A tiny message bus that any agent session on this machine can join. Backed by a
-single SQLite database (WAL mode) via Bun's built-in `bun:sqlite` — **no daemon,
-no server, no external dependencies, no network port.** The database file *is*
-the rendezvous point; agents "join" simply by pointing at the same directory.
+single SQLite database (WAL mode) via Bun's built-in `bun:sqlite` — in **local
+mode**: no daemon, no server, no external dependencies, no network port. The
+database file *is* the rendezvous point; agents "join" simply by pointing at the
+same directory. (A **remote mode** exists too — a hosted server over HTTPS with
+tokens; see "Remote mode" below.)
 
 Every message is also mirrored to a human-readable `messages/<channel>/msg-*.md`
 file, so the bus stays greppable. The SQLite database is authoritative.

@@ -1,30 +1,63 @@
-# /etc/systemd/user/agent-comms.service  (or system unit — see runbook §1)
-# RFC-001 §9: exactly ONE server process per DB file; runs as the service user
-# that owns COMMS_HOME (0700) and comms.db* (0600) — foreign-owned -wal/-shm
-# ⇒ SQLITE_READONLY. Bun must be the ABSOLUTE path (no PATH assumptions).
+# /etc/systemd/system/agent-comms.service — SYSTEM unit (RFC-001 §9).
+# Why not a user unit: in a user manager, ProtectSystem/ProtectHome/PrivateTmp/
+# ReadWritePaths need an unprivileged user namespace. On Ubuntu >= 23.10
+# (kernel.apparmor_restrict_unprivileged_userns=1) that namespace is denied
+# CAP_SYS_ADMIN, and systemd SILENTLY skips the mount sandbox (claude M6 B1 —
+# probe: home writable, /tmp shared). %h also resolves to /root in a system
+# unit, so the old file did not work in either mode. Paths are explicit here.
+#
+# §9: exactly ONE server process per DB. `flock -F -n` is the latch: MainPID
+# stays bun, and a second server on the same home exits 1. restore.sh and
+# bootstrap.sh take the SAME lock. Bun must be an ABSOLUTE path.
 [Unit]
 Description=agent-comms hosted bus server (RFC-001)
-Documentation=file://%REPO%/docs/RFC-001-server.md
+Documentation=file:///opt/agent-comms/current/docs/RFC-001-server.md
 After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=comms
 Group=comms
-WorkingDirectory=%REPO%
-ExecStart=/usr/local/bin/bun %REPO%/bin/server.ts --home %h/comms-home --port 8700 --host 127.0.0.1 --origin https://comms.example.internal --trust-proxy
-EnvironmentFile=%h/agent-comms.env
+WorkingDirectory=/opt/agent-comms/current
+# /var/lib/agent-comms is the bus home; systemd creates it 0700 comms:comms.
+StateDirectory=agent-comms
+StateDirectoryMode=0700
+# COMMS_HOME / COMMS_PORT / COMMS_ORIGIN come from here: one source of truth.
+EnvironmentFile=/etc/agent-comms/agent-comms.env
+# Trust-boundary flags are PINNED, not left to the env file:
+#  - loopback bind: nginx is the only ingress;
+#  - --trust-proxy is only sound behind that loopback bind (exposed directly,
+#    a client-set XFF hop would key the 401 bucket).
+ExecStart=/usr/bin/flock -F -n /var/lib/agent-comms/.server.lock /usr/local/bin/bun /opt/agent-comms/current/bin/server.ts --host 127.0.0.1 --trust-proxy
 Restart=always
 RestartSec=2
+SyslogIdentifier=agent-comms
 # §9 mechanics
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=%h/comms-home
+ProtectHome=true
+ReadWritePaths=/var/lib/agent-comms
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 MemoryHigh=512M
 LimitNOFILE=4096
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
