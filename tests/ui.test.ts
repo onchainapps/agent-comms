@@ -63,6 +63,14 @@ describe("M4 web UI (§8)", () => {
       expect(html).toContain("EventSource(\"/stream");
       // XSS hygiene: bus strings must never reach innerHTML in the UI module.
       expect(UI_HTML.includes("innerHTML")).toBe(false);
+      // Syntax hygiene (regression: inviteText's \" emitted bare quotes into
+      // the page script and killed every onclick — the whole UI went dead):
+      // the rendered <script> body must parse as JS.
+      const sm = UI_HTML.match(/<script>([\s\S]*)<\/script>/);
+      expect(sm).not.toBeNull();
+      let jsOk = true;
+      try { new Function(sm![1]); } catch { jsOk = false; }
+      expect(jsOk).toBe(true);
       expect(UI_HTML.includes("textContent")).toBe(true);
       // token persistence is OPT-IN only (§8 amendment): the checkbox exists,
       // the DEFAULT path never writes localStorage, and every exit path

@@ -447,11 +447,14 @@ function inviteText(m) {
     "",
     "auth:    header  Authorization: Bearer " + m.token,
     "         content-type: application/json",
-    "first:   POST /rpc {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"join\",\"params\":{\"role\":\"…\"}}",
-    "docs:    README \"Remote mode\" · deploy/RUNBOOK.md · RFC-001 §5–§7",
+    'first:   POST /rpc {"jsonrpc":"2.0","id":1,"method":"join","params":{"role":"…"}}',
+    'docs:    README "Remote mode" · deploy/RUNBOOK.md · RFC-001 §5–§7',
     "note:    token is shown ONCE — store it; revoke in Admin any time.",
     "────────────────────────────────────────────────",
-  ].join("\n");
+  ].join("\\n"); // DOUBLE backslash on purpose: this source lives inside the
+  // UI_HTML template literal, so a single-escape backslash-n would evaluate to
+  // a REAL newline here and split the emitted JS line mid-string (same bug
+  // class as the bare-quote JSON example above, both pinned in ui.test.ts).
 }
 function renderMinted() {
   const box = $("minted"); if (!box) return; box.textContent = "";
