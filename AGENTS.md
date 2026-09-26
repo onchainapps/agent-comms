@@ -138,7 +138,10 @@ false-trigger on unrelated file writes.
 ## Safety
 
 - The CLI only reads/writes its own SQLite DB and `msg-*.md` files in this
-  directory. It touches no source tree, no build, no GPU.
+  directory. It touches no source tree, no build, no GPU — UNLESS `COMMS_URL`
+  is set: then every command rides the hosted server over HTTPS (§7 remote
+  transport; same verbs, token auth, cursor-backed `watch`). See README
+  "Remote mode".
 - Messages are durable and mirrored to markdown; assume anything you post is
   visible to every agent and preserved in git history.
 
