@@ -25,15 +25,18 @@ function bootstrap(home: string) {
   return tok;
 }
 
-/** a line-delimited MCP client over a spawned bin/mcp.ts */
-function mcpClient(url: string, token: string) {
-  const proc = Bun.spawn([process.execPath, join(REPO, "bin/mcp.ts")], {
+/** a line-delimited MCP client over a spawned bin/mcp.ts. Responses are
+ *  matched BY ID (concurrent calls finish out of order); id-less / unmatched
+ *  messages go to the FIFO used by raw(). */
+function mcpClient(url: string, token: string, extraEnv: Record<string, string> = {}, args: string[] = []) {
+  const proc = Bun.spawn([process.execPath, join(REPO, "bin/mcp.ts"), ...args], {
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
-    env: { ...process.env, COMMS_URL: url, COMMS_TOKEN: token },
+    env: { ...process.env, COMMS_URL: url, COMMS_TOKEN: token, ...extraEnv },
   });
   let buf = "";
   const queue: ((m: any) => void)[] = [];
-  const msgs: any[] = []; void msgs;
+  const byId = new Map<number, (m: any) => void>();
+  const seen: any[] = [];
   (async () => {
     const dec = new TextDecoder();
     const rr = proc.stdout.getReader();
@@ -46,24 +49,29 @@ function mcpClient(url: string, token: string) {
         const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
         if (!line) continue;
         let m: any; try { m = JSON.parse(line); } catch { continue; }
-        const w = queue.shift();
-        if (w) w(m); else msgs.push(m);
+        seen.push(m);
+        const w = byId.get(m.id);
+        if (w) { byId.delete(m.id); w(m); continue; }
+        const q = queue.shift();
+        if (q) q(m);
       }
     }
   })();
   let id = 0;
-  async function rpc(method: string, params?: object, notify = false): Promise<any> {
+  function send(method: string, params?: object, notify = false): { id: number; done: Promise<any> } {
     const rid = ++id;
     const line = JSON.stringify({ jsonrpc: "2.0", method, ...(params ? { params } : {}), ...(notify ? {} : { id: rid }) });
-    if (notify) { proc.stdin.write(line + "\n"); return undefined; } // NO resolver — a notification never gets a response, and a queued resolver would steal the NEXT message
-    const pend = new Promise<any>((res) => queue.push(res));
+    const done = notify ? Promise.resolve(undefined) : new Promise<any>((res) => byId.set(rid, res));
     proc.stdin.write(line + "\n");
-    return pend;
+    return { id: rid, done };
   }
+  const rpc = (method: string, params?: object, notify = false): Promise<any> => send(method, params, notify).done;
   return {
     rpc,
+    send,
     proc,
-    /** send one raw line, resolve with the next message that arrives. */
+    seen,
+    /** send one raw line, resolve with the next unmatched message that arrives. */
     raw(line: string): Promise<any> {
       let settled = false;
       const pend = new Promise<any>((res) => queue.push((m) => { settled = true; res(m); }));
@@ -72,6 +80,11 @@ function mcpClient(url: string, token: string) {
         pend,
         new Promise<any>((r) => setTimeout(() => { if (!settled) queue.shift(); r({ __timeout: true }); }, 2000)),
       ]);
+    },
+    async init(protocolVersion = "2024-11-05") {
+      const r = await rpc("initialize", { protocolVersion, capabilities: {}, clientInfo: { name: "t", version: "0" } });
+      await rpc("notifications/initialized", {}, true);
+      return r;
     },
     async callTool(name: string, args: object = {}) {
       const r = await rpc("tools/call", { name, arguments: args });
@@ -174,17 +187,23 @@ describe("M5 MCP adapter (§10-M5)", () => {
       const nf = await c.callTool("comms_read", { id: "20200101T000000-zzz-0000" });
       expect(nf.isError).toBe(true);
       expect(nf.text).toContain("error(not_found)");
-      // schema validation server-side (adapter): missing required + enum + pattern
-      const bad1 = await c.callTool("comms_post", { to: "x" });
-      expect(bad1.err?.code).toBe(-32602);
-      const bad2 = await c.callTool("comms_post", { to: "x", type: "nope", body: "b" });
-      expect(bad2.err?.code).toBe(-32602);
+      // schema validation at the edge (adapter): missing required + enum +
+      // pattern + unknown prop ⇒ isError `usage` content the MODEL can see
+      // and self-correct from; unknown TOOL stays a protocol error.
+      for (const args of [{ to: "x" }, { to: "x", type: "nope", body: "b" }, { to: "x", type: "note", body: "b", bogus: 1 }, { to: "x", type: "note", body: "b", toString: "p" }]) {
+        const bad = await c.callTool("comms_post", args);
+        expect(bad.err).toBeUndefined();
+        expect(bad.isError).toBe(true);
+        expect(bad.text).toStartWith("error(usage): ");
+      }
       const bad3 = await c.callTool("comms_cursor_set", { cursor: "not-a-cursor" });
-      expect(bad3.err?.code).toBe(-32602);
-      const bad4 = await c.callTool("comms_post", { to: "x", type: "note", body: "b", bogus: 1 });
-      expect(bad4.err?.code).toBe(-32602);
+      expect(bad3.isError).toBe(true);
+      const bad5 = await c.callTool("comms_history", { channel: "general", limit: 1.5 }); // was SQLite "datatype mismatch" ⇒ internal
+      expect(bad5.text).toStartWith("error(usage): ");
       const badTool = await c.callTool("no_such_tool", {});
       expect(badTool.err?.code).toBe(-32602);
+      const protoTool = await c.callTool("toString", {});
+      expect(protoTool.err?.code).toBe(-32602);
     } finally {
       c.kill(); srv.stop(); rmSync(home, { recursive: true, force: true });
     }
@@ -229,5 +248,192 @@ describe("M5 MCP adapter (§10-M5)", () => {
     } finally {
       c.kill(); srv.stop(); rmSync(home, { recursive: true, force: true });
     }
+  }, 30_000);
+});
+
+/** claude M5 review pins — each fails on 8ebabde. */
+describe("M5 review fold (claude)", () => {
+  const FAST = { COMMS_MCP_POLL_MS: "100" };
+  function seed(home: string) {
+    const b = openBus({ home, mode: "local" });
+    b.joinAgent(localCtx("ag1"), { agent: "ag1", role: "worker" });
+    const ag1 = (b.tokenCreate(localCtx("root"), { agent: "ag1" }) as any).value.token as string;
+    b.joinAgent(localCtx("noise"), { agent: "noise", role: "noise" });
+    b.close();
+    return ag1;
+  }
+  const postLocal = (home: string, from: string, to: string, body: string, n = 1) => {
+    const b = openBus({ home, mode: "local" });
+    for (let i = 0; i < n; i++) b.post(localCtx(from), { from, to, type: "note", body } as any);
+    b.close();
+  };
+
+  test("B1 comms_wait actually blocks (server inbox.wait is one non-blocking step) and wakes on arrival", async () => {
+    const home = tmp(); bootstrap(home); const ag1 = seed(home);
+    const srv = startServer({ home, port: 0 });
+    const c = mcpClient(srv.url, ag1, FAST);
+    try {
+      await c.init();
+      // nothing pending: must hold for ~timeout, not return in 7 ms
+      let t0 = Date.now();
+      const idle = await c.callTool("comms_wait", { timeout: 1 });
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(900);
+      expect(JSON.parse(idle.text).messages).toEqual([]);
+      // arrival mid-wait wakes it well before the deadline
+      t0 = Date.now();
+      setTimeout(() => postLocal(home, "noise", "ag1", "wake"), 600);
+      const w = await c.callTool("comms_wait", { timeout: 20 });
+      const el = Date.now() - t0;
+      expect(el).toBeGreaterThanOrEqual(500);
+      expect(el).toBeLessThan(5000);
+      expect(JSON.parse(w.text).messages.map((m: any) => m.body)).toEqual(["wake"]);
+    } finally { c.kill(); srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test("B1 a message behind >500 irrelevant events is delivered by ONE comms_wait (drain, no false-empty)", async () => {
+    const home = tmp(); bootstrap(home); const ag1 = seed(home);
+    postLocal(home, "noise", "root", "n", 600); // > one 500-event scan page
+    postLocal(home, "root", "ag1", "for-ag1");
+    const srv = startServer({ home, port: 0 });
+    const c = mcpClient(srv.url, ag1, FAST);
+    try {
+      await c.init();
+      const w = await c.callTool("comms_wait", { timeout: 5 });
+      expect(JSON.parse(w.text).messages.map((m: any) => m.body)).toEqual(["for-ag1"]);
+    } finally { c.kill(); srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test("B2 non-request JSON lines (null / 3 / {}) are -32600, never a crash", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0 });
+    const c = mcpClient(srv.url, tok);
+    try {
+      await c.init();
+      for (const line of ["null", "3", "{}", '"x"', '{"jsonrpc":"2.0","id":{"o":1},"method":"ping"}']) {
+        const r = await c.raw(line);
+        expect(r.error?.code).toBe(-32600);
+      }
+      expect((await c.rpc("ping")).result).toEqual({});
+      expect(c.proc.exitCode).toBeNull();
+    } finally { c.kill(); srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test("B3 post survives an ambiguous transport timeout exactly once (auto idempotency key + replay-safe retry)", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0 });
+    let delayed = false;
+    // proxy: the FIRST post commits upstream but its response is held past
+    // the adapter's per-RPC timeout ⇒ RpcBus sees `unavailable/timeout`.
+    const proxy = Bun.serve({
+      port: 0, hostname: "127.0.0.1",
+      async fetch(req) {
+        const body = await req.text();
+        const up = await fetch(`${srv.url}/rpc`, { method: "POST", headers: { "content-type": "application/json", authorization: req.headers.get("authorization") ?? "" }, body });
+        const txt = await up.text();
+        if (!delayed && body.includes('"method":"post"')) { delayed = true; await Bun.sleep(900); }
+        return new Response(txt, { status: up.status, headers: { "content-type": "application/json", "x-comms-agent": up.headers.get("x-comms-agent") ?? "" } });
+      },
+    });
+    const c = mcpClient(`http://127.0.0.1:${proxy.port}`, tok, {}, ["--timeout-ms", "300"]);
+    try {
+      await c.init();
+      const r = await c.callTool("comms_post", { to: "root", type: "note", body: "idem-probe", channel: "idem" });
+      expect(r.isError).toBe(false);
+      const h = await c.callTool("comms_history", { channel: "idem" });
+      expect(JSON.parse(h.text).rows.filter((x: any) => x.body === "idem-probe").length).toBe(1);
+      expect(JSON.parse(h.text).rows[0].id).toBe(JSON.parse(r.text).id);
+    } finally { c.kill(); proxy.stop(true); srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test("M1 send-then-close: a large response to a slow pipe reader is delivered whole (no process.exit truncation)", async () => {
+    const home = tmp(); bootstrap(home); const ag1 = seed(home);
+    const b = openBus({ home, mode: "local" });
+    for (let i = 0; i < 300; i++) b.post(localCtx("root"), { from: "root", to: "ag1", type: "note", body: "x".repeat(900) } as any);
+    b.close();
+    const srv = startServer({ home, port: 0 });
+    const proc = Bun.spawn([process.execPath, join(REPO, "bin/mcp.ts")], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: { ...process.env, COMMS_URL: srv.url, COMMS_TOKEN: ag1 } });
+    try {
+      proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "p", version: "0" } } }) + "\n");
+      proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "comms_inbox", arguments: { limit: 500 } } }) + "\n");
+      proc.stdin.end();
+      await Bun.sleep(1500); // reader stalls: the child's stdout backs up past the 64 KB pipe buffer
+      const out = await new Response(proc.stdout).text();
+      const lines = out.trim().split("\n").map((l) => JSON.parse(l));
+      const inbox = JSON.parse(lines.find((m) => m.id === 2).result.content[0].text);
+      expect(inbox.rows.length).toBe(300);
+      expect(await proc.exited).toBe(0);
+    } finally { proc.kill(); srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test("M2 inbox is bounded by default (newest 50 + total/truncated); mark:true is never truncated", async () => {
+    const home = tmp(); bootstrap(home); const ag1 = seed(home);
+    postLocal(home, "root", "ag1", "row", 80);
+    const srv = startServer({ home, port: 0 });
+    const c = mcpClient(srv.url, ag1);
+    try {
+      await c.init();
+      const v = JSON.parse((await c.callTool("comms_inbox", {})).text);
+      expect(v.rows.length).toBe(50);
+      expect(v.total).toBe(80);
+      expect(v.truncated).toBe(30);
+      const m = JSON.parse((await c.callTool("comms_inbox", { mark: true, limit: 5 })).text);
+      expect(m.rows.length).toBe(80);
+      expect(m.truncated).toBe(0);
+    } finally { c.kill(); srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test("M3 lifecycle: version negotiation, pre-initialize gate, cancellation, EOF aborts a pending wait", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0 });
+    const c = mcpClient(srv.url, tok, FAST);
+    try {
+      expect((await c.rpc("ping")).result).toEqual({}); // ping is allowed pre-init
+      expect((await c.rpc("tools/list")).error?.code).toBe(-32002);
+      expect((await c.init("2025-06-18")).result.protocolVersion).toBe("2025-06-18");
+      // cancellation: the cancelled wait never gets a response, and the loop stops
+      const w = c.send("tools/call", { name: "comms_wait", arguments: { timeout: 20 } });
+      await Bun.sleep(300);
+      await c.rpc("notifications/cancelled", { requestId: w.id, reason: "test" }, true);
+      expect((await c.rpc("ping")).result).toEqual({});
+      await Bun.sleep(400);
+      expect(c.seen.some((m) => m.id === w.id)).toBe(false);
+      // EOF with a wait in flight: it returns promptly and the process exits 0
+      const w2 = c.send("tools/call", { name: "comms_wait", arguments: { timeout: 20 } });
+      await Bun.sleep(300);
+      const t0 = Date.now();
+      c.proc.stdin.end();
+      const r2 = await w2.done;
+      expect(r2.result.isError).toBeUndefined();
+      expect(await c.proc.exited).toBe(0);
+      expect(Date.now() - t0).toBeLessThan(3000);
+    } finally { c.kill(); srv.stop(); rmSync(home, { recursive: true, force: true }); }
+    const c2 = mcpClient(srv.url, tok);
+    try { expect((await c2.init("1999-01-01")).result.protocolVersion).toBe("2024-11-05"); } finally { c2.kill(); }
+  }, 30_000);
+
+  test("M4 stale durable cursor after epoch rotation ⇒ comms_wait performs the §6 recovery commit (agent tokens cannot re-baseline via unfiltered history)", async () => {
+    const home = tmp(); bootstrap(home); const ag1 = seed(home);
+    let srv = startServer({ home, port: 0 });
+    let c = mcpClient(srv.url, ag1, FAST);
+    try {
+      await c.init();
+      postLocal(home, "root", "ag1", "before");
+      const w = JSON.parse((await c.callTool("comms_wait", { timeout: 2 })).text);
+      expect((await c.callTool("comms_cursor_set", { cursor: w.cursor })).isError).toBe(false);
+      c.kill(); srv.stop();
+      const b = openBus({ home, mode: "local" }); b.rotateEpoch(); b.close();
+      srv = startServer({ home, port: 0 });
+      c = mcpClient(srv.url, ag1, FAST);
+      await c.init();
+      expect((await c.callTool("comms_cursor_get", {})).text).toStartWith("error(resync)");
+      const r = JSON.parse((await c.callTool("comms_wait", { timeout: 1 })).text);
+      expect(r.resynced).toBe(true);
+      expect((await c.callTool("comms_cursor_get", {})).isError).toBe(false);
+      postLocal(home, "root", "ag1", "after");
+      const w2 = JSON.parse((await c.callTool("comms_wait", { timeout: 5 })).text);
+      // at-least-once: the recovery commit is <epoch>.<floor>, so RETAINED
+      // pre-rotation events may be redelivered — never lost.
+      expect(w2.messages.map((m: any) => m.body)).toContain("after");
+    } finally { c.kill(); srv.stop(); rmSync(home, { recursive: true, force: true }); }
   }, 30_000);
 });
