@@ -505,13 +505,61 @@ export function contractSuite(name: string, make: Factory) {
 
     test("consumer grammar cap (claude M3 m2): bad/long consumer ⇒ usage, never a new row", async () => {
       await withBus(async (h, root) => {
-        expect((await root.cursorSet({ consumer: "x".repeat(65), cursor: `${(h as any).raw.epoch()}.0` })).error).toBe("usage");
-        expect((await root.cursorSet({ consumer: "bad name!", cursor: `${(h as any).raw.epoch()}.0` })).error).toBe("usage");
+        const c0 = `${(h as any).raw.epoch()}.0`;
+        expect((await root.cursorSet({ consumer: "x".repeat(129), cursor: c0 })).error).toBe("usage");
+        expect((await root.cursorSet({ consumer: "bad name!", cursor: c0 })).error).toBe("usage");
         expect((await root.cursorGet({ consumer: "UPPER" })).error).toBe("usage");
+        // M3-fold: the third entry point enforces the same grammar
+        expect((await root.waitStep({ consumer: "x".repeat(129) })).error).toBe("usage");
         // namespaced CLI consumers stay legal
-        expect((await root.cursorSet({ consumer: "cli#g7-chan", cursor: `${(h as any).raw.epoch()}.0` })).error).toBeUndefined();
-        expect((await root.cursorSet({ consumer: "cli.all", cursor: `${(h as any).raw.epoch()}.0` })).error).toBeUndefined();
-        expect((await root.cursorSet({ consumer: "cli@peer1", cursor: `${(h as any).raw.epoch()}.0` })).error).toBeUndefined();
+        expect((await root.cursorSet({ consumer: "cli#g7-chan", cursor: c0 })).error).toBeUndefined();
+        expect((await root.cursorSet({ consumer: "cli.all", cursor: c0 })).error).toBeUndefined();
+        expect((await root.cursorSet({ consumer: "cli@peer1", cursor: c0 })).error).toBeUndefined();
+        // M3-fold: the LONGEST key the CLI itself generates must be legal —
+        // cli@<id32>.all#dm~<id32>~<id32>~NNNN = 114 B (a 64 cap exited 2 here)
+        const id32 = (c: string) => c.repeat(32);
+        const longest = `cli@${id32("t")}.all#dm~${id32("a")}~${id32("b")}~9999`;
+        expect(longest.length).toBe(114);
+        expect((await root.cursorSet({ consumer: longest, cursor: c0 })).error).toBeUndefined();
+        expect((await root.cursorGet({ consumer: longest })).error).toBeUndefined();
+        expect((await root.waitStep({ consumer: longest })).error).toBeUndefined();
+        expect((await root.cursorSet({ consumer: "x".repeat(128), cursor: c0 })).error).toBeUndefined();
+      });
+    });
+
+    test("history gate (M3 ruling c): plain token — unfiltered snapshot forbidden; channel/since views ungated, dm~ rows still canSee-filtered", async () => {
+      await withBus(async (h, root) => {
+        const { alice } = await dmPair(h, root);
+        const pub = await root.post({ from: "root", to: "x1", type: "note", body: "public", channel: "hg-pub" });
+        const pubId = (pub as any).value.id;
+        const dm = await alice.post({ from: "dm-alice", to: "dm-bob", type: "note", body: "private", dm: "dm-bob" });
+        const dmId = (dm as any).value.id; const dmChan = (dm as any).value.channel;
+        const plain = ((await seedAgent(h, root, "hg-plain", "p")) as any).value.session as Session;
+        const cur0 = `${(h as any).raw.epoch()}.0`;
+        expect((await plain.history({})).error).toBe("forbidden");
+        // grok 3433 M-a: every "no channel" spelling is the unfiltered snapshot
+        // (forbidden); wrong types are usage — never the snapshot.
+        expect((await plain.history({ channel: null })).error).toBe("forbidden");
+        expect((await plain.history({ channel: "" })).error).toBe("forbidden");
+        expect((await plain.history({ channel: false as any })).error).toBe("usage");
+        expect((await plain.history({ channel: 0 as any })).error).toBe("usage");
+        expect((await plain.history({ channel: true as any })).error).toBe("usage");
+        const byChan = (await plain.history({ channel: "hg-pub" })) as any;
+        expect(byChan.error).toBeUndefined();
+        expect(byChan.value.rows.map((r: any) => r.id)).toContain(pubId);
+        const since = (await plain.history({ since: cur0, limit: 1000 })) as any;
+        expect(since.error).toBeUndefined();
+        expect(since.value.rows.map((r: any) => r.id)).toContain(pubId);
+        expect(since.value.rows.map((r: any) => r.id)).not.toContain(dmId);
+        // naming the dm channel directly must not bypass canSee (snapshot AND since)
+        const dmSnap = (await plain.history({ channel: dmChan })) as any;
+        expect(dmSnap.error).toBeUndefined();
+        expect(dmSnap.value.rows.length).toBe(0);
+        const dmSince = (await plain.history({ channel: dmChan, since: cur0 })) as any;
+        expect(dmSince.value.rows.length).toBe(0);
+        // the party still sees its own dm through the ungated channel view
+        const party = (await alice.history({ channel: dmChan })) as any;
+        expect(party.value.rows.map((r: any) => r.id)).toContain(dmId);
       });
     });
 

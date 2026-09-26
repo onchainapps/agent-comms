@@ -1627,10 +1627,14 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   // into waitStep(since) and skip GC'd unconsumed events, and let cursor.set stamp
   // them caught up. Missing row stays {epoch, seq: 0}. Row is never rewritten here.
   // claude M3 m2: consumer is caller-supplied (--consumer / cursor.set) —
-  // grammar + 64 B cap, else one token can mint unbounded long cursor rows.
-  const CONSUMER_RE = /^[a-z0-9._#@~-]{1,64}$/;
+  // grammar + byte cap, else one token can mint unbounded long cursor rows.
+  // Cap is 128, not the 64 first proposed: the CLI's own namespaced keys reach
+  // cli@<id32>.all#<dm~id32~id32~NNNN> = 114 B, and a 64 cap made
+  // `watch --channel <long dm>` exit 2 on its own generated consumer.
+  const CONSUMER_RE = /^[a-z0-9._#@~-]{1,128}$/;
+  const CONSUMER_BAD: Res<never> = { error: "usage", detail: "consumer must match [a-z0-9._#@~-]{1,128}" };
   function cursorGet(agentId: string, consumer: string): Res<{ epoch: string; seq: number }> {
-    if (!CONSUMER_RE.test(consumer)) return { error: "usage", detail: "consumer must match [a-z0-9._#@~-]{1,64}" };
+    if (!CONSUMER_RE.test(consumer)) return CONSUMER_BAD;
     const e = epochSafe();
     if (e === null) return { error: "internal", detail: "meta.epoch missing (corrupt DB)" };
     const row = cursorRaw(agentId, consumer);
@@ -1643,7 +1647,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   }
 
   function cursorSet(agentId: string, consumer: string, ep: string, seq: number, force = false): Res<null> {
-    if (!CONSUMER_RE.test(consumer)) return { error: "usage", detail: "consumer must match [a-z0-9._#@~-]{1,64}" };
+    if (!CONSUMER_RE.test(consumer)) return CONSUMER_BAD;
     if (!Number.isFinite(seq) || !/^[0-9a-f]{8,64}$/.test(ep))
       return { error: "usage", detail: "cursor must be <hex-epoch>.<int-seq>" };
     const e = epochSafe();
@@ -1683,7 +1687,14 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     // canSee row predicate allows — public rows are readable by every token
     // (§5), dm~ rows need membership or read:dm. This makes history{channel}
     // consistent with stream scope=channel: (both ungated). No 6th scope.
-    const unfiltered = (p.channel === undefined || p.channel === null) && !p.since;
+    // grok 3433 M-a: ONE normalization feeds BOTH the gate and the query. A
+    // wrong-typed channel (false / 0 / true from a bare --channel) is a usage
+    // error (post param-type precedent); "" names no channel ⇒ it IS the
+    // unfiltered snapshot. The gate and the SQL must never disagree on it.
+    if (p.channel !== undefined && p.channel !== null && typeof p.channel !== "string")
+      return { error: "usage", detail: "history channel must be a string" };
+    const chan = p.channel ? p.channel : null;
+    const unfiltered = chan === null && !p.since;
     if (!isRootCtx(ctx) && unfiltered && !ctx.principal.scopes.includes("read:all"))
       return { error: "forbidden", detail: "unfiltered history snapshot requires read:all" };
     const limit = Math.min(Math.max(p.limit ?? 200, 1), 1000);
@@ -1716,10 +1727,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
         // read:all alone does NOT satisfy canSee; DM omniview = read:all AND
         // read:dm. Predicate in WHERE, never a post-LIMIT filter.
         const visSql = `(m.channel NOT GLOB 'dm~*' OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel = m.channel AND cm.agent_id = ?) OR ? = 1)`;
-        const q = p.channel
+        const q = chan
           ? d.query(`SELECT m.* FROM messages m WHERE m.channel=? AND ${visSql} ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?`)
           : d.query(`SELECT m.* FROM messages m WHERE ${visSql} ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?`);
-        const got = (p.channel ? q.all(p.channel, ctx.principal.agentId, dm, limit + 1) : q.all(ctx.principal.agentId, dm, limit + 1)) as MsgRow[];
+        const got = (chan ? q.all(chan, ctx.principal.agentId, dm, limit + 1) : q.all(ctx.principal.agentId, dm, limit + 1)) as MsgRow[];
         const hw = Math.max((d.query("SELECT coalesce(max(seq),0) m FROM events").get() as any).m as number, gcFloor());
         d.exec("COMMIT");
         const rows = got.slice(0, limit).reverse();
@@ -1728,10 +1739,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       const dir = ascending ? "ASC" : "DESC";
       // G2 m-d: same predicate in the WHERE BEFORE LIMIT — a post-LIMIT JS
       // filter livelocks when a whole page is hidden (cursor never advances).
-      const evs = (p.channel
+      const evs = (chan
         ? d.query(`SELECT e.seq,e.msg_id FROM events e JOIN messages m ON m.id=e.msg_id WHERE e.kind='msg' AND e.seq>? AND m.channel=? AND (m.channel NOT GLOB 'dm~*' OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel=m.channel AND cm.agent_id=?) OR ?=1) ORDER BY e.seq ${dir} LIMIT ?`)
         : d.query(`SELECT e.seq,e.msg_id FROM events e JOIN messages m ON m.id=e.msg_id WHERE e.kind='msg' AND e.seq>? AND (m.channel NOT GLOB 'dm~*' OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel=m.channel AND cm.agent_id=?) OR ?=1) ORDER BY e.seq ${dir} LIMIT ?`)) as any;
-      const got = (p.channel ? evs.all(seqFrom, p.channel, ctx.principal.agentId, dm, limit + 1) : evs.all(seqFrom, ctx.principal.agentId, dm, limit + 1)) as { seq: number; msg_id: string }[];
+      const got = (chan ? evs.all(seqFrom, chan, ctx.principal.agentId, dm, limit + 1) : evs.all(seqFrom, ctx.principal.agentId, dm, limit + 1)) as { seq: number; msg_id: string }[];
       const hasMore = got.length > limit;
       const page = ascending ? got.slice(0, limit) : got.slice(0, limit).reverse();
       const rows = page.map((e) => d.query("SELECT * FROM messages WHERE id=?").get(e.msg_id) as MsgRow).filter(Boolean);
@@ -1758,6 +1769,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     if (target !== ctx.principal.agentId && !hasScope(ctx, "read:all"))
       return { error: "forbidden", detail: "inbox.wait for another agent requires read:all" };
     const consumer = p.consumer ?? "default";
+    // claude M3-fold: same grammar on the third consumer entry point (the RFC
+    // row says `consumer` matches it — inbox.wait must not accept what
+    // cursor.set would then reject, stranding the at-least-once commit).
+    if (!CONSUMER_RE.test(consumer)) return CONSUMER_BAD;
     const ep0 = epochSafe();
     if (ep0 === null) return { error: "internal", detail: "meta.epoch missing (corrupt DB)" };
     let ep = ep0; let seq: number;

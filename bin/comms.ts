@@ -22,6 +22,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { openBus, localCtx, EXIT_CODES, type Bus, type MsgRow, type Res } from "../src/bus.ts";
 import { testSeams, type Seams } from "../src/seams.ts";
 import { RpcBus } from "../src/rpc-bus.ts";
+import { REMOTE_METHODS } from "../src/cli-wire.ts";
 
 function findRoot(start: string): string {
   let d = start;
@@ -90,37 +91,8 @@ const CURSOR_RE = /^([0-9a-f]{8,64})\.(\d+)$/;
 const epOf = (c: string) => { const m = CURSOR_RE.exec(String(c)); return m ? m[1] : String(c); };
 const seqOf = (c: string) => { const m = CURSOR_RE.exec(String(c)); return m ? Number(m[2]) : NaN; };
 
-// Remote wire map mirrors src/rpc-bus.ts makeSession (same server dispatch).
-// Exported for the m1 no-32601 pin (claude M3): the map must never drift from
-// the server's rpcCall surface.
-export const REMOTE_METHODS: Record<string, (p: any) => [string, Record<string, unknown>]> = {
-  joinAgent: (p) => ["join", p],
-  listAgents: (p) => ["who", { all: !p.activeOnly }],
-  post: (p) => ["post", { ...p, to: csvSplit(p.to) }],
-  inbox: (p) => ["inbox", p],
-  read: (p) => ["read", p],
-  threadOf: (p) => ["thread", { id: p.id }],
-  receipts: (p) => ["receipts", { id: p.id }],
-  setStatus: (p) => ["status", p],
-  channels: () => ["channels", {}],
-  rename: (p) => ["rename", p],
-  history: (p) => ["history", p],
-  waitStep: (p) => ["inbox.wait", p],
-  cursorGet: (p) => ["cursor.get", p],
-  cursorSet: (p) => ["cursor.set", p],
-  tokenCreate: (p) => ["token.create", p],
-  tokenList: () => ["token.list", {}],
-  tokenRevoke: (p) => ["token.revoke", p],
-  groupCreate: (p) => ["group.create", p],
-  groupJoin: (p) => ["group.join", p],
-  groupLeave: (p) => ["group.leave", p],
-  groupDelete: (p) => ["group.delete", p],
-  groupList: () => ["group.list", {}],
-  groupShow: (p) => ["group.show", p],
-  dmMembers: (p) => ["dm.members", { channel: p.channel }],
-};
-
-const csvSplit = (to: string) => (to ? String(to).split(",").map((s) => s.trim()).filter(Boolean) : []);
+// Remote wire map: src/cli-wire.ts (side-effect-free so the m1 no-32601 pin
+// can import it; this file must keep an unconditional main()).
 
 /** §7 exit contract: -32004/-32006 ⇒ backoff per Retry-After, then 1. The
  *  backoff loop lives HERE (transport policy), not in RpcBus (mechanism);
@@ -642,6 +614,8 @@ async function main() {
       process.exit(a.cmd ? 2 : 0);
   }
 }
-// import.meta.main guard: tests/cli-remote imports REMOTE_METHODS for the
-// wire-map pin without executing the CLI.
-if (import.meta.main) await main();
+// UNCONDITIONAL on purpose: the root ./comms.ts shim does `import "./bin/comms.ts"`,
+// where import.meta.main is false — a guard here silently no-ops every shim
+// command with exit 0 (AGENTS.md usage). Tests import the wire map from
+// src/cli-wire.ts instead, never this file.
+await main();

@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openBus, localCtx } from "../src/bus.ts";
-import { REMOTE_METHODS } from "../bin/comms.ts"; // m1 pin: CLI wire map vs live server
+import { REMOTE_METHODS } from "../src/cli-wire.ts"; // m1 pin: CLI wire map vs live server (never import bin/comms.ts — it runs main())
 
 const REPO = import.meta.dir + "/..";
 const CLI = join(REPO, "bin/comms.ts");
@@ -245,6 +245,40 @@ describe("M3 remote CLI", () => {
     } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
   });
 
+  test("grok 3433 M-b pin: long legal ids/channels ⇒ generated consumer commits (exit 0, cursor row, no reprint)", async () => {
+    const home = tmp();
+    const tok = bootstrap(home);
+    const srv = await spawnServer(home);
+    const env = { COMMS_URL: srv.url, COMMS_TOKEN: tok };
+    try {
+      const tgt = "t".repeat(30), ch = "c".repeat(30);
+      const tRes = cli(["token", "create", "--agent", tgt, "--scopes", "post:as"], env);
+      expect(tRes.code).toBe(0);
+      const p = cli(["post", "--from", "root", "--to", tgt, "--type", "note", "--body", "x", "--channel", ch], env);
+      expect(p.code).toBe(0);
+      const id = /posted (\S+)\s/.exec(p.out)![1];
+      const w1 = cli(["watch", "--for", tgt, "--channel", ch, "--once", "--interval", "1"], env);
+      expect(w1.code).toBe(0);
+      expect(w1.out).toContain(id);
+      const w2 = cli(["watch", "--for", tgt, "--channel", ch, "--once", "--interval", "1"], env);
+      expect(w2.code).toBe(0);
+      expect(w2.out).not.toContain(id);
+      // a 64-char dm channel name (dm~<30>~<30>) as --channel with --for: 100 B consumer
+      const dmName = `dm~${"a".repeat(30)}~${"b".repeat(30)}`;
+      expect(dmName.length).toBe(64);
+      const w3 = cli(["watch", "--for", tgt, "--channel", dmName, "--once", "--interval", "1"], env);
+      expect(w3.code).toBe(0);
+      const raw = openBus({ home, mode: "local" });
+      const rows = (raw as any).cursorGet("root", `cli@${tgt}#${ch}`);
+      const rows2 = (raw as any).cursorGet("root", `cli@${tgt}#${dmName}`);
+      raw.close();
+      expect(rows.error).toBeUndefined();
+      expect(rows.value.seq).toBeGreaterThan(0);
+      expect(rows2.error).toBeUndefined();
+      expect(rows2.value.seq).toBeGreaterThan(0);
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
   test("§6 resync recovery: rotated epoch ⇒ watch resyncs, force-commits <epoch>.<floor>, resumes", async () => {
     const home = tmp();
     const tok = bootstrap(home);
@@ -275,6 +309,34 @@ describe("M3 remote CLI", () => {
       const w3 = cli(["watch", "--for", "root", "--once", "--interval", "1"], env);
       expect(w3.out).toContain(id2);
     } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("M3-fold blocker pin: root ./comms.ts shim actually RUNS the CLI (import.meta.main guard regression)", () => {
+    const home = tmp();
+    try {
+      const run = (args: string[]) => {
+        const p = Bun.spawnSync([process.execPath, join(REPO, "comms.ts"), ...args], {
+          cwd: tmp(), env: { ...process.env, COMMS_HOME: home, COMMS_URL: "" }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+        });
+        return { code: p.exitCode, out: p.stdout.toString() };
+      };
+      const j = run(["join", "--agent", "shimprobe", "--role", "r"]);
+      expect(j.code).toBe(0);
+      expect(j.out).toContain("joined: shimprobe"); // exit 0 with EMPTY stdout was the bug
+      expect(run(["who"]).out).toContain("shimprobe");
+      expect(run(["nonsense-verb"]).code).toBe(2); // HELP path reached ⇒ main() ran
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("m5 pin: COMMS_URL + --local WITHOUT COMMS_HOME ⇒ ambiguity line still printed", () => {
+    // COMMS_HOME truly UNSET (not ""), and an unknown verb so core() is never
+    // opened — findRoot would otherwise create a .comms DB in the repo root.
+    const env: Record<string, string | undefined> = { ...process.env, COMMS_URL: "http://127.0.0.1:1", COMMS_TOKEN: "x" };
+    delete env.COMMS_HOME;
+    const p = Bun.spawnSync([process.execPath, CLI, "nonsense-verb", "--local"], { cwd: tmp(), env: env as any, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    const err = p.stderr.toString();
+    expect(err).toContain("ignored by --local");
+    expect(err).not.toContain("transport=remote:");
   });
 
   test("m1 pin: every REMOTE_METHODS wire target exists on the live server (never -32601)", async () => {

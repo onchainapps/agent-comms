@@ -222,7 +222,7 @@ Three orthogonal axes:
   with AGENTS.md "assume everything is visible" — **M6 updates AGENTS.md to read** (claude
   m2: the file is unchanged today): DMs are private from other agents, NOT from operators
   holding `read:all`+`read:dm`); `read:all` gates
-  `history`, stream `scope=all`, `for≠self` peek; `read:dm` gates DM visibility (G2/G3).
+  the unfiltered `history` snapshot (channel/since views are ungated — §6 row, M3 ruling c), stream `scope=all`, `for≠self` peek; `read:dm` gates DM visibility (G2/G3).
   **dm-shaped channels are the one confidentiality boundary — `canSee` per Appendix G;
   everything else stays cost/UX control.** SSE delivery is
   server-side filtered per subscriber: `scope=mine | channel:<x> | all`, plus canSee on
@@ -287,7 +287,7 @@ Three orthogonal axes:
 | `thread` / `receipts` | `{id}` | ungated on public channels; dm-shaped channels filtered by canSee (G2) — invisible ⇒ byte-identical `not_found` |
 | `status` | `{id, state}` | permission per §5 |
 | `channels` | `{}` | unions channels table (empty channels included); dm-shaped rows hidden unless member or `read:dm` (G2) |
-| `history` | `{channel?, since?, limit?}` | **gate (claude M3 ruling c/m3):** the UNFILTERED global snapshot needs `read:all`; a `channel`-filtered or `since`-paged view is ungated — public rows are readable by every token (§5), consistent with stream `scope=channel:`. SQL-filtered, indexed; dm-shaped rows additionally row-filtered by canSee in BOTH modes (G2 — `read:all` alone does not satisfy canSee). **Snapshot mode (no `since`):** rows are MESSAGES (`created_at DESC, rowid DESC`, newest page, returned oldest-first) — messages stay visible even when their events are gc'd or predate events; cursor = `max(max(events.seq), gc_floor)` read **in the same txn** (floor-clamped so the handoff cursor is never below retention ⇒ never instant-resyncs/livelocks), returned as `<epoch>.<seq>`. **Since mode:** pages EVENTS ASC (oldest unseen first), cursor = last delivered event, paging to `hasMore=false` delivers every row exactly once. Snapshot↔stream dedupe is **by msg_id** (history returns messages, not events). `cursor.get` on a stored foreign-epoch row is a **resync** (never a silent seq-0 collapse); a missing row is `{epoch, seq: 0}`; an explicit current-epoch `cursor.set` is the recovery commit and is not blocked by the foreign row's monotonic check. `consumer` matches `[a-z0-9._#@~-]{1,64}` (grammar cap — caller-supplied keys must not grow unbounded). |
+| `history` | `{channel?, since?, limit?}` | **gate (claude M3 ruling c/m3):** the UNFILTERED global snapshot needs `read:all`; a `channel`-filtered or `since`-paged view is ungated — public rows are readable by every token (§5), consistent with stream `scope=channel:`. SQL-filtered, indexed; dm-shaped rows additionally row-filtered by canSee in BOTH modes (G2 — `read:all` alone does not satisfy canSee). **Snapshot mode (no `since`):** rows are MESSAGES (`created_at DESC, rowid DESC`, newest page, returned oldest-first) — messages stay visible even when their events are gc'd or predate events; cursor = `max(max(events.seq), gc_floor)` read **in the same txn** (floor-clamped so the handoff cursor is never below retention ⇒ never instant-resyncs/livelocks), returned as `<epoch>.<seq>`. **Since mode:** pages EVENTS ASC (oldest unseen first), cursor = last delivered event, paging to `hasMore=false` delivers every row exactly once. Snapshot↔stream dedupe is **by msg_id** (history returns messages, not events). `cursor.get` on a stored foreign-epoch row is a **resync** (never a silent seq-0 collapse); a missing row is `{epoch, seq: 0}`; an explicit current-epoch `cursor.set` is the recovery commit and is not blocked by the foreign row's monotonic check. `consumer` matches `[a-z0-9._#@~-]{1,128}` on `cursor.get`, `cursor.set` AND `inbox.wait` (grammar cap — caller-supplied keys must not grow unbounded; 128 covers the CLI's longest namespaced key `cli@<id>.all#<dm-name>` = 114 B). |
 | `login` / `logout` | `{token}` / `{}` | web UI only; sets/clears HttpOnly session cookie; store **in-memory — restart = logout**; **unauthenticated `login` is also CSRF-guarded per §8** |
 | `stream.ticket` | `{}` | → `{ticket}` 60 s single-use — **non-cookie clients only** (§6-stream) |
 | `inbox.wait` | `{for?, consumer?, since?, timeout?, epoch?}` | long-poll ≤60 s → `{messages[], cursor}`; `since` defaults from stored cursor for `(principal, consumer)`; **never auto-advances** — client commits via `cursor.set` (at-least-once); **does not write `reads` rows** (peek semantics; acking is explicit); the primitive for scripts/MCP |
@@ -744,7 +744,8 @@ dm ⇒ `not_found`, not `forbidden`), `post --re` (parent lookup applies canSee 
 closed), `joinAgent`'s `unresolved` count (claude n6: computed under canSee — a non-party's
 DM traffic count must not leak existence/volume), `/raw` (file → message → canSee),
 `channels()` (dm-shaped rows hidden unless
-member or `read:dm`; local mode lists all), `history` (method gate stays `read:all`;
+member or `read:dm`; local mode lists all), `history` (method gate: `read:all` for the
+unfiltered snapshot only — channel/since views ungated per M3 ruling c;
 **canSee is the row predicate in both modes** — snapshot over messages and since over
 events. `read:all` alone does not satisfy canSee. DM omniview of history = `read:all`
 AND `read:dm`. There is NO "not row-filtered" exception — the loss IS what read:dm is for).
@@ -831,7 +832,7 @@ channels unchanged; dm-shaped channels filtered by canSee. Scope enum becomes FI
 `read:all, read:dm, post:as, tokens:admin, agents:admin`. `kind:'human'` defaults
 `read:all,read:dm` (⇒ user/admin sees every DM and every channel — requirement met);
 `admin:true` = all five; `read:dm` alone = DM rows on ungated paths only (`read`, `threadOf`, `receipts`,
-`channels`, `/raw`, own inbox) — it does not unlock `history` or stream `scope=all`;
+`channels`, `/raw`, own inbox, and channel/since-scoped `history`) — it does not unlock the unfiltered `history` snapshot or stream `scope=all`;
 `read:all` alone = channels only, no DM peek. Local mode keeps legacy see-all (host filesystem =
 root of trust; byte-parity quirk pin).
 
