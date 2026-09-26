@@ -95,6 +95,11 @@ describe("M5 MCP adapter (§10-M5)", () => {
       const names = tl.result.tools.map((t: any) => t.name);
       for (const n of ["comms_join", "comms_post", "comms_inbox", "comms_read", "comms_wait", "comms_cursor_set", "comms_history", "comms_receipts", "comms_dm_members", "comms_group_join"])
         expect(names).toContain(n);
+      // grok M5 #2: parity with the server's dispatch set (§10-M5 "same RPC
+      // methods") — every remotely-callable method except the web-cookie/SSE
+      // ones (login/logout/stream.ticket) must have a tool.
+      for (const n of ["comms_rename", "comms_token_create", "comms_token_list", "comms_token_revoke", "comms_group_create", "comms_group_delete", "comms_group_leave", "comms_cursor_get", "comms_who", "comms_channels", "comms_thread", "comms_status", "comms_history"])
+        expect(names).toContain(n);
       for (const t of tl.result.tools) expect(typeof t.description).toBe("string");
 
       // join (identity from the token row = root)
@@ -140,6 +145,30 @@ describe("M5 MCP adapter (§10-M5)", () => {
         const w2 = await c2.callTool("comms_wait", { timeout: 2 });
         const w2v = w2.isError ? { messages: [] } : JSON.parse(w2.text);
         expect((w2v.messages ?? []).map((m: any) => m.id)).not.toContain(mid2);
+
+        // grok M5 #1: the wait must actually HOLD. Start a 5 s wait, post
+        // ~900 ms AFTER the call began, assert the same call returns it and
+        // elapsed ≥ the post delay (pre-fix this returned in ~1 ms empty).
+        const t0 = Date.now();
+        const waitP = c2.callTool("comms_wait", { timeout: 5 });
+        await Bun.sleep(900);
+        const posted3 = await c.callTool("comms_post", { to: "peer1", type: "note", body: "during-wait" });
+        const mid3 = JSON.parse(posted3.text).id;
+        const w3 = await waitP;
+        const el3 = Date.now() - t0;
+        expect(w3.isError).toBe(false);
+        expect(JSON.parse(w3.text).messages.map((m: any) => m.id)).toContain(mid3);
+        expect(el3).toBeGreaterThanOrEqual(900);
+        const cs3 = await c2.callTool("comms_cursor_set", { cursor: JSON.parse(w3.text).cursor });
+        expect(cs3.isError).toBe(false);
+
+        // grok M5 #1: an empty wait runs the CLOCK, not a ~0 ms scan.
+        const t1 = Date.now();
+        const w4 = await c2.callTool("comms_wait", { timeout: 2 });
+        const el4 = Date.now() - t1;
+        const w4v = w4.isError ? { messages: [] } : JSON.parse(w4.text);
+        expect((w4v.messages ?? []).length).toBe(0);
+        expect(el4).toBeGreaterThanOrEqual(1800);
       } finally { c2.kill(); }
       // typed error → isError content, variant named
       const nf = await c.callTool("comms_read", { id: "20200101T000000-zzz-0000" });

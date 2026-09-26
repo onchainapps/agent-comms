@@ -25,7 +25,10 @@ import { RpcBus } from "../src/rpc-bus.ts";
 const URL_ = process.env.COMMS_URL ?? "";
 const TOKEN = process.env["COMMS" + "_TOKEN"] ?? "";
 const argTimeout = process.argv.includes("--timeout-ms") ? Number(process.argv[process.argv.indexOf("--timeout-ms") + 1]) : undefined;
-const TIMEOUT = Number.isFinite(argTimeout) && argTimeout! > 0 ? argTimeout! : 65_000; // > server 60 s long-poll
+// grok M5 fold: comms_wait long-polls CLIENT-side up to 60 s per call, so the
+// per-request fetch timeout must exceed the longest single HTTP hold (server
+// long-poll ≤60 s) plus the longest adapter hold — 90 s, not 65 s.
+const TIMEOUT = Number.isFinite(argTimeout) && argTimeout! > 0 ? argTimeout! : 90_000;
 
 if (!URL_ || !TOKEN) {
   console.error("error: COMMS_URL and COMMS_TOKEN are required (agent-comms MCP adapter)");
@@ -64,6 +67,7 @@ const TOOLS: Record<string, Tool> = {
         to: { type: "string" }, type: { type: "string", enum: ["ack", "announce", "ask", "handoff", "note", "reply", "result", "rfc", "status"] },
         body: { type: "string" }, subject: { type: "string" }, channel: { type: "string" },
         thread: { type: "string" }, re: { type: "string" }, tags: { type: "string" }, dm: { type: "string" },
+        as: { type: "string", description: "post as another sender (§5, requires post:as; sender = as, meta.as records the principal)" },
         idempotencyKey: { type: "string", description: "optional; retries with the same key + params return the original result" },
       },
       additionalProperties: false,
@@ -117,9 +121,24 @@ const TOOLS: Record<string, Tool> = {
   comms_wait: {
     desc: "Long-poll ≤60 s for new messages addressed to this agent: {messages, cursor}. At-least-once: NOTHING is committed — after processing, call comms_cursor_set(cursor). since defaults from the stored cursor for (this agent, consumer). resync error ⇒ re-baseline via comms_history then commit epoch.floor.",
     schema: { type: "object", properties: { consumer: { type: "string", description: "durable-cursor lane, default 'mcp'" }, since: { type: "string" }, timeout: { type: "number", minimum: 1, maximum: 60, description: "long-poll seconds, default 30" } }, additionalProperties: false },
+    // grok M5 #1: server inbox.wait is waitStep — ONE scan, transport-side
+    // long-poll is THIS adapter's job (§6: inbox.wait is the MCP watch
+    // primitive). Loop steps (client-side since advance, never committed)
+    // until messages, deadline, or stdin close; 500 ms park between steps —
+    // the server is the single writer, no busy-spinning it.
     call: async (a) => {
-      const p = clean({ consumer: a.consumer ?? "mcp", since: a.since, timeout: a.timeout });
-      return exec("inbox.wait", p);
+      const consumer = a.consumer ?? "mcp";
+      const timeout = typeof a.timeout === "number" ? a.timeout : 30; // documented default, not 0
+      const deadline = Date.now() + timeout * 1000;
+      let since = a.since;
+      for (;;) {
+        const r = await exec("inbox.wait", clean({ consumer, since }));
+        if (r.isError) return r; // resync/usage propagate immediately — never swallowed by the loop
+        const v = JSON.parse(r.text);
+        if ((v.messages?.length ?? 0) > 0 || Date.now() >= deadline || stdinEnded) return r;
+        since = v.cursor; // advance the SCAN position only; commit stays the caller's comms_cursor_set
+        await Bun.sleep(Math.max(0, Math.min(500, deadline - Date.now())));
+      }
     },
   },
   comms_cursor_get: {
@@ -143,19 +162,51 @@ const TOOLS: Record<string, Tool> = {
     call: (a) => exec("group.show", { name: a.name }),
   },
   comms_group_join: {
-    desc: "Join a work-group (creates it if absent — self-organizing; groups are delivery, not ACL).",
-    schema: { type: "object", required: ["name"], properties: { name: { type: "string" } }, additionalProperties: false },
-    call: (a) => exec("group.join", { name: a.name }),
+    desc: "Join a work-group (creates it if absent — self-organizing; groups are delivery, not ACL). Optional agent joins on behalf of another (agents:admin).",
+    schema: { type: "object", required: ["name"], properties: { name: { type: "string" }, agent: { type: "string" } }, additionalProperties: false },
+    call: (a) => exec("group.join", clean({ name: a.name, agent: a.agent })),
   },
   comms_group_leave: {
-    desc: "Leave a work-group.",
-    schema: { type: "object", required: ["name"], properties: { name: { type: "string" } }, additionalProperties: false },
-    call: (a) => exec("group.leave", { name: a.name }),
+    desc: "Leave a work-group. Optional agent leaves on behalf of another (agents:admin).",
+    schema: { type: "object", required: ["name"], properties: { name: { type: "string" }, agent: { type: "string" } }, additionalProperties: false },
+    call: (a) => exec("group.leave", clean({ name: a.name, agent: a.agent })),
   },
   comms_dm_members: {
     desc: "Members of a dm~ channel (members array; non-party ⇒ not_found like a missing channel).",
     schema: { type: "object", required: ["channel"], properties: { channel: { type: "string" } }, additionalProperties: false },
     call: (a) => exec("dm.members", { channel: a.channel }),
+  },
+  // grok M5 #2: tools/list ↔ RPC method parity (§10-M5 "same RPC methods").
+  // These dispatch live in src/server/mod.ts but were never exposed here.
+  comms_rename: {
+    desc: "Rename an agent id (default: the caller's own; agents:admin may rename others). Transactional across reads/tokens/cursors/idempotency/groups/channels; old id is retired forever.",
+    schema: { type: "object", required: ["to"], properties: { to: { type: "string" }, agent: { type: "string", description: "target agent, default self (renaming others needs agents:admin)" } }, additionalProperties: false },
+    call: (a) => exec("rename", clean({ to: a.to, agent: a.agent })),
+  },
+  comms_token_create: {
+    desc: "Mint an API token for an agent (requires tokens:admin; the secret shows ONCE). kind:'human' defaults to read:all,read:dm. admin:true grants all scopes — refused without force if an admin token already exists (bootstrap guard).",
+    schema: { type: "object", required: ["agent"], properties: { agent: { type: "string" }, kind: { type: "string", enum: ["agent", "human"] }, label: { type: "string" }, scopes: { type: "array", items: { type: "string", enum: ["read:all", "read:dm", "post:as", "tokens:admin", "agents:admin"] } }, admin: { type: "boolean" }, force: { type: "boolean" } }, additionalProperties: false },
+    call: (a) => exec("token.create", clean(a)),
+  },
+  comms_token_list: {
+    desc: "List token rows (id, prefix, agent, scopes, label, revoked) — never the secrets. Requires tokens:admin.",
+    schema: { type: "object", properties: {}, additionalProperties: false },
+    call: () => exec("token.list", {}),
+  },
+  comms_token_revoke: {
+    desc: "Revoke a token by numeric id (from comms_token_list). Requires tokens:admin.",
+    schema: { type: "object", required: ["id"], properties: { id: { type: "number" } }, additionalProperties: false },
+    call: (a) => exec("token.revoke", { id: a.id }),
+  },
+  comms_group_create: {
+    desc: "Create a work-group (idempotent; join also creates). Optional agent attributes creation to someone else (agents:admin).",
+    schema: { type: "object", required: ["name"], properties: { name: { type: "string" }, agent: { type: "string" } }, additionalProperties: false },
+    call: (a) => exec("group.create", clean(a)),
+  },
+  comms_group_delete: {
+    desc: "Delete a work-group (requires agents:admin). Same-second re-create returns contention; tombstone ≥1 s.",
+    schema: { type: "object", required: ["name"], properties: { name: { type: "string" } }, additionalProperties: false },
+    call: (a) => exec("group.delete", { name: a.name }),
   },
 };
 
@@ -250,6 +301,7 @@ function validate(name: string, tool: Tool, args: any): string | null {
 let buf = "";
 process.stdin.setEncoding("utf8");
 let pending = new Set<Promise<void>>();
+// (declared early: comms_wait's poll loop bails when stdin closes)
 let stdinEnded = false;
 function maybeExit() { if (stdinEnded && pending.size === 0) process.exit(0); }
 process.stdin.on("data", (chunk: string) => {
