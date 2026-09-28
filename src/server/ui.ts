@@ -250,6 +250,7 @@ function msgNode(m) {
   th.onclick = () => {
     $("cbody").value = "";
     S.replyTo = m.id;
+    $("ctype").value = "reply"; // answering a message IS a reply unless you say otherwise
     // Auto-populate "to": you answer the SENDER; when replying to your own
     // message you address its original recipients (minus you). DM channels
     // self-fill the peer at post time (claude M4 B1) — leave that mode alone.
