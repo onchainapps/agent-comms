@@ -23,6 +23,9 @@ const home = arg("--home") ?? process.env.COMMS_HOME ?? join(homedir(), ".comms-
 const port = Number(arg("--port") ?? process.env.COMMS_PORT ?? 8700);
 const host = arg("--host") ?? process.env.COMMS_HOST ?? "127.0.0.1";
 const origin = arg("--origin") ?? process.env.COMMS_ORIGIN;
+// §8 cookie Secure flag: default ON (TLS/proxy). COMMS_INSECURE_COOKIE=1 only
+// for a trusted-LAN plain-HTTP bind — browsers drop Secure cookies over http.
+const insecureCookie = process.env.COMMS_INSECURE_COOKIE === "1";
 // §9 per-IP 401 bucket key: behind nginx the socket peer is ALWAYS nginx, so
 // without this every client shares one bucket (one sprayer throttles all
 // logins). --trust-proxy ⇒ key on the RIGHTMOST X-Forwarded-For hop (the one
@@ -34,7 +37,7 @@ if (!Number.isInteger(port) || port < 0 || port > 65535) {
   process.exit(2);
 }
 
-const srv = startServer({ home, port, hostname: host, origin, trustProxy });
+const srv = startServer({ home, port, hostname: host, origin, trustProxy, secureCookie: !insecureCookie });
 console.error(`agent-comms server: ${srv.url}  home=${home}`);
 console.error(`bootstrap (local, one-time): bun -e 'const {openBus,localCtx}=await import("${join(REPO, "src/bus.ts")}");const b=openBus({home:${JSON.stringify(home)},mode:"local"});console.log(b.tokenCreate(localCtx("bootstrap"),{agent:"root",admin:true}).value?.token??"(admin exists)");b.close()'`);
 console.error(`(the comms token CLI verb ships with the remote CLI, M3)`);

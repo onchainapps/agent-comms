@@ -86,6 +86,10 @@ export type ServerOpts = {
   port?: number;              // 0 ⇒ ephemeral (tests)
   hostname?: string;          // default 127.0.0.1 (single-writer host; nginx terminates)
   origin?: string;            // §8 CSRF exact-origin pin; unset ⇒ must equal request Host
+  /** §8: cookie Secure attribute. Default true (TLS). Set false ONLY for a
+   *  trusted-LAN plain-HTTP bind — browsers DROP Secure cookies over http://,
+   *  which would break login silently. Reverse-proxied TLS keeps the default. */
+  secureCookie?: boolean;
   /** claude M2: per-IP 401 bucket key. false (default) ⇒ the socket peer
    *  (server.requestIP) — X-Forwarded-For is client-controlled and would let a
    *  sprayer mint a fresh bucket per request. true ⇒ the RIGHTMOST XFF entry
@@ -109,6 +113,7 @@ export function startServer(opts: ServerOpts): RunningServer {
   const core = openBus({ home: opts.home, mode: "server", seams: opts.seams });
   const handle = serverHandle(core);
   const hostname = opts.hostname ?? "127.0.0.1";
+  const cookieFlags = `HttpOnly; SameSite=Strict${opts.secureCookie === false ? "" : "; Secure"}`;
   const LIM = { ...LIMITS, ...(opts.limits ?? {}) };
 
   // §8 in-memory session store — restart = logout (documented). claude M2 B1:
@@ -384,7 +389,7 @@ export function startServer(opts: ServerOpts): RunningServer {
           // receiving msg frames until restart).
           for (const s of [...subs]) if (s.sid === sid) s.close();
         }
-        return json(200, { jsonrpc: "2.0", result: { loggedOut: true }, id }, { "set-cookie": "comms_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict; Secure" });
+        return json(200, { jsonrpc: "2.0", result: { loggedOut: true }, id }, { "set-cookie": `comms_session=; Path=/; Max-Age=0; ${cookieFlags}` });
       }
       const bucket = ipBucket(ip);
       const gate = bucket.peek(); // §9: checked BEFORE the HMAC
@@ -405,7 +410,7 @@ export function startServer(opts: ServerOpts): RunningServer {
       const now = Date.now();
       sessions.set(sid, { tokenId: v.value.tokenId, created: now, seen: now });
       return json(200, { jsonrpc: "2.0", result: { agentId: v.value.agentId, scopes: v.value.scopes }, id },
-        { "set-cookie": `comms_session=${sid}; Path=/; Max-Age=${Math.floor(LIM.sessionMaxMs / 1000)}; HttpOnly; SameSite=Strict; Secure` });
+        { "set-cookie": `comms_session=${sid}; Path=/; Max-Age=${Math.floor(LIM.sessionMaxMs / 1000)}; ${cookieFlags}` });
     }
 
     const a = auth(req, ip);

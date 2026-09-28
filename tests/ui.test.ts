@@ -215,6 +215,22 @@ describe("M4 web UI (§8)", () => {
 
   // ---------------- claude M4 review pins ----------------
 
+  test("secureCookie:false (trusted-LAN plain HTTP) drops the Secure flag; default keeps it (§8)", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0, secureCookie: false });
+    try {
+      const login = await rpcCookie(srv.url, null, "login", { token: tok });
+      expect(login.status).toBe(200);
+      const sc = login.headers.get("set-cookie") ?? "";
+      expect(sc).toContain("HttpOnly");
+      expect(sc).toContain("SameSite=Strict");
+      expect(sc).not.toContain("Secure"); // browsers DROP Secure cookies over http:// — login would be dead
+      const cookie = sc.split(";")[0];
+      const post = await rpcCookie(srv.url, cookie, "channels");
+      expect(post.status).toBe(200); // cookie still authenticates without the flag
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
   test("claude M4 B1/B2 wire contract the shell relies on: DM post needs to=peer; receipts hydrate writes no reads row", async () => {
     const home = tmp(); const tok = bootstrap(home);
     const srv = startServer({ home, port: 0 });
