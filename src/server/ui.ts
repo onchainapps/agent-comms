@@ -247,7 +247,22 @@ function msgNode(m) {
     ops.appendChild(b);
   }
   const th = el("button", "mini", "reply");
-  th.onclick = () => { $("cbody").value = ""; $("cbody").placeholder = "reply to " + m.id + " (posts with re:" + m.id.slice(0, 22) + "…)"; S.replyTo = m.id; ops2focus(); };
+  th.onclick = () => {
+    $("cbody").value = "";
+    S.replyTo = m.id;
+    // Auto-populate "to": you answer the SENDER; when replying to your own
+    // message you address its original recipients (minus you). DM channels
+    // self-fill the peer at post time (claude M4 B1) — leave that mode alone.
+    // Hydrated rows carry recipients (receipts = SELECT *); SSE-frame stubs
+    // don't, so recipients may be undefined — sender always exists.
+    if (S.selKind !== "dm") {
+      const others = String(m.recipients || "").split(",").map((s) => s.trim()).filter((r) => r && r !== S.me);
+      const to = m.sender !== S.me ? m.sender : others.join(",");
+      if (to) $("cto").value = to;
+    }
+    $("cbody").placeholder = "reply to " + m.id + " (posts with re:" + m.id.slice(0, 22) + "…)";
+    ops2focus();
+  };
   ops.appendChild(th);
   n.appendChild(ops);
   return n;
