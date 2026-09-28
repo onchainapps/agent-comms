@@ -94,6 +94,13 @@ it, so never point them at `/var/lib/agent-comms` while the server runs
 (use the server-mode dashboard: `--url`).
 
 ## 4. nginx TLS
+
+> **Trusted-LAN plain-HTTP variant (current .173 deployment):** nginx may serve
+> port 80 directly (no TLS, no redirect) with the same location blocks. Then set
+> `COMMS_ORIGIN=http://<host>` and `COMMS_INSECURE_COOKIE=1` in the env file —
+> browsers DROP `Secure` cookies over http://, so without the flag login fails
+> silently. Tokens then ride the LAN in cleartext: acceptable on a trusted
+> network, not beyond it.
 ```bash
 sudo install -m 644 /opt/agent-comms/current/deploy/nginx/agent-comms.conf /etc/nginx/sites-available/agent-comms
 sudo ln -s ../sites-available/agent-comms /etc/nginx/sites-enabled/
