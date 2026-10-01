@@ -1,0 +1,31 @@
+# agent-comms — docker deployment (RFC-001 §9).
+# ONE service, ONE volume, replica count 1 — the single-writer rule is a
+# correctness invariant, not a preference. `docker compose up` a second
+# container on the same volume and the flock latch refuses it (that is the
+# safety net, not a bug).
+#
+# LAN plain-HTTP behind host nginx (current .173 pattern):
+#   COMMS_ORIGIN=http://<host-ip>  COMMS_INSECURE_COOKIE=1  COMMS_TRUST_PROXY=1
+#   ports: "127.0.0.1:8700:8700"   (nginx on the host proxies 80 ⇒ 8700)
+# Direct exposure (no proxy): drop the insecure-cookie line, bind 0.0.0.0:8700,
+#   and put TLS somewhere.
+services:
+  agent-comms:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: agent-comms:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8700:8700"   # host nginx terminates; use "8700:8700" for direct
+    environment:
+      COMMS_ORIGIN: ${COMMS_ORIGIN:-http://192.168.1.173}
+      COMMS_INSECURE_COOKIE: ${COMMS_INSECURE_COOKIE:-1}   # LAN http only
+      COMMS_TRUST_PROXY: ${COMMS_TRUST_PROXY:-1}           # nginx ⇒ rightmost XFF for §9 buckets
+    volumes:
+      - comms-data:/data
+    # backups: docker compose exec agent-comms /app/deploy/backup.sh /data /backup
+    # (mount a second volume for /backup, or `docker cp` the artifact off-host)
+
+volumes:
+  comms-data:

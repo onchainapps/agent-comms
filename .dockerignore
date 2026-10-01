@@ -1,0 +1,12 @@
+# build context = repo root; ship source only.
+.git
+.review-bus
+**/node_modules
+*.db
+*.db-wal
+*.db-shm
+tmp/
+tests/
+*.log
+.dockerignore
+Dockerfile
