@@ -29,3 +29,4 @@ services:
 
 volumes:
   comms-data:
+    name: comms-data   # fixed name: survives project renames; migrate by tar into it
