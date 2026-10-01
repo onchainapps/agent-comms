@@ -93,6 +93,30 @@ take the same latch. Local-mode CLI and the direct-DB dashboard do NOT take
 it, so never point them at `/var/lib/agent-comms` while the server runs
 (use the server-mode dashboard: `--url`).
 
+## 3b. Docker (current .173 deployment — preferred)
+
+`deploy/docker/` is the container story; §3 systemd is the bare-metal variant.
+The container reproduces the same discipline internally: `entrypoint.sh`
+auto-bootstraps an EMPTY volume (admin token printed ONCE into
+`docker compose logs`), then runs the server under `flock -n -E 75` on the same
+`.server.lock` — a second container on one volume exits 75 LOUD (drilled).
+
+    cd /opt/agent-comms/docker/deploy/docker
+    docker compose up -d --build          # build context = repo root
+    docker compose logs agent-comms       # first-run admin token lands here
+
+- ONE replica, ever (§9). `restart: unless-stopped` — survives reboot (the
+  lesson from the first .173 outage).
+- LAN HTTP behind host nginx: ports bind `127.0.0.1:8700` only; env
+  `COMMS_ORIGIN=http://<host>`, `COMMS_INSECURE_COOKIE=1`, `COMMS_TRUST_PROXY=1`.
+- Volume `comms-data` (fixed name) mounts at `/data` = COMMS_HOME; uid 10001.
+- Backup: `docker compose exec agent-comms /app/deploy/backup.sh /data /backup`
+  (mount a second volume at /backup; artifact contains token digests — 077).
+- Migrate systemd→docker: final `backup.sh`, stop unit, tar the home dir into
+  the volume (chown 10001), compose up. Epoch must match after cutover.
+- Upgrade = new release dir + `docker compose up -d --build`; rollback =
+  previous dir, same command. Sessions die with the container (by design §8).
+
 ## 4. nginx TLS
 
 > **Trusted-LAN plain-HTTP variant (current .173 deployment):** nginx may serve
