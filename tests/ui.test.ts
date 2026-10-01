@@ -60,7 +60,7 @@ describe("M4 web UI (§8)", () => {
       expect((html.match(/<script/g) ?? []).length).toBe(1); // one hashed script, nothing else runnable
       expect(html).toContain("agent comms");
       expect(html).toContain("/rpc");
-      expect(html).toContain("EventSource(\"/stream");
+      expect(html).toContain('"/stream?scope='); // streams from /stream (URL now built in a var for ticket fallback)
       // XSS hygiene: bus strings must never reach innerHTML in the UI module.
       expect(UI_HTML.includes("innerHTML")).toBe(false);
       // Syntax hygiene (regression: inviteText's \" emitted bare quotes into

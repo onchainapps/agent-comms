@@ -123,14 +123,14 @@ export const UI_HTML = /* html */ `<!doctype html>
 </div>
 <script>
 "use strict";
-const S = { me:null, scopes:[], chans:[], agents:[], active:new Set(), msgs:new Map(), sel:null, selKind:null, stream:null, seq:0, epoch:"", rpccache:new Map(), minted:null, dmMembers:new Map() };
+const S = { me:null, scopes:[], chans:[], agents:[], active:new Set(), msgs:new Map(), sel:null, selKind:null, stream:null, seq:0, epoch:"", rpccache:new Map(), minted:null, dmMembers:new Map(), bearer:null };
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; };
 
 let rpcid = 0;
 async function rpc(method, params) {
   const res = await fetch("/rpc", { method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(S.bearer ? { authorization: "Bearer " + S.bearer } : {}) },
     body: JSON.stringify({ jsonrpc: "2.0", method, params: params || {}, id: ++rpcid }) });
   let body = null; try { body = await res.json(); } catch {}
   if (!res.ok || (body && body.error)) {
@@ -164,6 +164,13 @@ $("go").onclick = async () => {
     const r = await rpc("login", { token: t });
     S.me = r.agentId; S.scopes = r.scopes || [];
     $("me").textContent = S.me; $("myscopes").textContent = S.scopes.join(", ");
+    // Cookie-less browsers (Chrome phases out cookies over plain-HTTP) still
+    // work: probe the session we just minted; if the browser dropped the
+    // cookie, fall back to bearer on every RPC + §6 tickets on the stream.
+    try {
+      const pr = await fetch("/rpc", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", method: "channels", params: {}, id: ++rpcid }) });
+      S.bearer = pr.ok ? null : t;
+    } catch { S.bearer = t; }
     // opt-in remember (§8 amendment): default remains never-persist; the box
     // stores plaintext localStorage — honest trade for a human workstation.
     if ($("remember").checked) localStorage.setItem("comms-token", t);
@@ -336,32 +343,48 @@ function openStream(since) {
   // design (a) kept: read:all ⇒ scope=all (DM frames are still canSee-filtered
   // server-side, so read:all without read:dm never receives them).
   const scope = S.scopes.includes("read:all") ? "all" : "mine";
-  const es = new EventSource("/stream?scope=" + scope + (since ? "&since=" + encodeURIComponent(since) : ""));
-  S.stream = es;
-  es.onopen = () => { $("conn").textContent = "stream: live"; $("conn").style.color = "var(--ok)"; };
-  es.onerror = () => {
-    const dead = es.readyState === EventSource.CLOSED; // non-200 (401 after restart/revoke) ⇒ EventSource gives up
-    $("conn").textContent = dead ? "stream: closed — reload to log in again" : "stream: reconnecting…";
-    $("conn").style.color = dead ? "var(--err)" : "var(--warn)";
+  const mk = async () => {
+    let url = "/stream?scope=" + scope + (since ? "&since=" + encodeURIComponent(since) : "");
+    if (S.bearer) {
+      // EventSource cannot set headers ⇒ a cookie-less client streams on a
+      // §6 single-use ticket minted with the bearer. Consumed on open, so a
+      // reconnect must re-mint (see onerror) — native retry would resend the
+      // dead ticket and 401.
+      try {
+        const tr = await fetch("/stream.ticket", { method: "POST", headers: { authorization: "***" + S.bearer } });
+        if (!tr.ok) { $("conn").textContent = "stream: closed — reload to log in again"; $("conn").style.color = "var(--err)"; return; }
+        url += "&ticket=" + encodeURIComponent((await tr.json()).result.ticket);
+      } catch { return; }
+    }
+    const es = new EventSource(url);
+    S.stream = es;
+    es.onopen = () => { $("conn").textContent = "stream: live"; $("conn").style.color = "var(--ok)"; };
+    es.onerror = () => {
+      const dead = es.readyState === EventSource.CLOSED; // non-200 (401 after restart/revoke) ⇒ EventSource gives up
+      if (dead && S.bearer) { mk(); return; } // consumed ticket ⇒ re-mint, don't reload-loop
+      $("conn").textContent = dead ? "stream: closed — reload to log in again" : "stream: reconnecting…";
+      $("conn").style.color = dead ? "var(--err)" : "var(--warn)";
+    };
+    es.addEventListener("hello", (ev) => { const d = JSON.parse(ev.data); S.epoch = d.epoch; S.seq = d.seq; since = d.epoch + "." + d.seq; });
+    // claude M4 M-f: the server closes the socket after "resync", and the resync
+    // frame carries no id ⇒ native reconnect resent the SAME dead-epoch
+    // Last-Event-ID forever (probe: 9 reconnects + 9 full reloads in 30 s,
+    // "reconnecting…" permanently). Close it ourselves and re-handoff.
+    es.addEventListener("resync", async () => {
+      es.close(); if (S.stream !== es) return;
+      S.msgs.clear(); S.rpccache.clear(); renderPane();
+      const c = await loadHistory();
+      if (S.stream === es) openStream(c);
+    });
+    es.addEventListener("revoked", () => { es.close(); $("conn").textContent = "stream: token revoked — reload"; $("conn").style.color = "var(--err)"; localStorage.removeItem("comms-token"); });
+    es.addEventListener("msg", (ev) => { const d = JSON.parse(ev.data); hydrate(d); });
+    es.addEventListener("status", (ev) => { const d = JSON.parse(ev.data); if (S.msgs.has(d.id)) note(d.id, { status: d.status }); else hydrate(d); });
+    es.addEventListener("read", (ev) => { const d = JSON.parse(ev.data); S.rpccache.delete(d.msg); loadReceipts(d.msg); });
+    es.addEventListener("presence", () => debPres());
+    es.addEventListener("token", () => { if (S.tab === "admin") renderTokenTable(); });
+    es.addEventListener("group", () => { refreshChans(); });
   };
-  es.addEventListener("hello", (ev) => { const d = JSON.parse(ev.data); S.epoch = d.epoch; S.seq = d.seq; });
-  // claude M4 M-f: the server closes the socket after "resync", and the resync
-  // frame carries no id ⇒ native reconnect resent the SAME dead-epoch
-  // Last-Event-ID forever (probe: 9 reconnects + 9 full reloads in 30 s,
-  // "reconnecting…" permanently). Close it ourselves and re-handoff.
-  es.addEventListener("resync", async () => {
-    es.close(); if (S.stream !== es) return;
-    S.msgs.clear(); S.rpccache.clear(); renderPane();
-    const c = await loadHistory();
-    if (S.stream === es) openStream(c);
-  });
-  es.addEventListener("revoked", () => { es.close(); $("conn").textContent = "stream: token revoked — reload"; $("conn").style.color = "var(--err)"; localStorage.removeItem("comms-token"); });
-  es.addEventListener("msg", (ev) => { const d = JSON.parse(ev.data); hydrate(d); });
-  es.addEventListener("status", (ev) => { const d = JSON.parse(ev.data); if (S.msgs.has(d.id)) note(d.id, { status: d.status }); else hydrate(d); });
-  es.addEventListener("read", (ev) => { const d = JSON.parse(ev.data); S.rpccache.delete(d.msg); loadReceipts(d.msg); });
-  es.addEventListener("presence", () => debPres());
-  es.addEventListener("token", () => { if (S.tab === "admin") renderTokenTable(); });
-  es.addEventListener("group", () => { refreshChans(); });
+  mk();
 }
 // claude M4 B2: hydrate via receipts, NOT read. read(for=self) INSERTs a
 // reads row (§5 marking read) — rendering a frame is not reading it. With
@@ -564,10 +587,24 @@ function buildAdmin() {
   try {
     const res = await fetch("/rpc", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", method: "channels", params: {}, id: ++rpcid }) });
     if (!res.ok) {
-      // no session — login card stays; a saved token (opt-in remember) is
-      // prefilled but NOT auto-submitted: the human clicks Login.
+      // no session — a saved token (opt-in remember) is prefilled. Cookie-less
+      // browsers (Chrome over plain HTTP) can still boot: probe the saved
+      // token as bearer; if it authenticates, boot in bearer mode silently.
       const saved = localStorage.getItem("comms-token");
-      if (saved) { $("tok").value = saved; $("remember").checked = true; }
+      if (saved) {
+        $("tok").value = saved; $("remember").checked = true;
+        try {
+          const br = await fetch("/rpc", { method: "POST", headers: { "content-type": "application/json", authorization: "***" + saved }, body: JSON.stringify({ jsonrpc: "2.0", method: "channels", params: {}, id: ++rpcid }) });
+          if (br.ok) {
+            S.bearer = saved;
+            S.me = br.headers.get("x-comms-agent") || "(unknown)";
+            S.scopes = (br.headers.get("x-comms-scopes") || "").split(",").filter(Boolean);
+            $("me").textContent = S.me; $("myscopes").textContent = S.scopes.join(", ");
+            await boot();
+            return;
+          }
+        } catch {}
+      }
       return;
     }
     S.me = res.headers.get("x-comms-agent") || "(unknown)";
