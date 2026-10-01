@@ -259,8 +259,13 @@ describe("M4 web UI (§8)", () => {
       const reads = (b3 as any).testDb.query("SELECT agent FROM reads WHERE msg=?").all(ask);
       b3.close();
       expect(reads).toEqual([]); // rendering is not reading
-      expect(UI_HTML.includes('rpc("read"')).toBe(false);
+      // Rendering must never read (claude M4 B2) — but OPENING a collapsed
+      // thread is a deliberate user action and MAY read. Pin the shape:
+      // hydrate() uses receipts, and rpc("read") exists ONLY in the toggle.
       expect(UI_HTML).toContain('rpc("receipts", { id: d.id })');
+      const readCalls = (UI_HTML.match(/rpc\("read"/g) ?? []).length;
+      expect(readCalls).toBe(1);
+      expect(/S\.openT\.add[\s\S]{0,400}rpc\("read"/.test(UI_HTML)).toBe(true); // and ONLY in the thread-toggle path
     } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
   });
 

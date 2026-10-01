@@ -45,6 +45,7 @@ export const UI_HTML = /* html */ `<!doctype html>
   header b{color:var(--acc)}
   header .scopes{color:var(--dim);font-family:var(--mono);font-size:12px}
   header .sp{flex:1}
+  .msg .hd .sphdr{flex:1}
   nav{border-right:1px solid var(--line);background:var(--panel);overflow-y:auto;padding:10px}
   nav h3{font-size:11px;text-transform:uppercase;color:var(--dim);margin:12px 0 6px}
   nav .tab,nav .chan{display:block;width:100%;text-align:left;margin:2px 0;padding:5px 8px;border:0;border-radius:6px;background:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -63,6 +64,12 @@ export const UI_HTML = /* html */ `<!doctype html>
   .msg .body{margin-top:4px;white-space:pre-wrap;word-break:break-word}
   .msg .rc{margin-top:6px;color:var(--dim);font-size:12px}
   .msg .ops{margin-top:6px;display:flex;gap:6px}
+  .msg.nested{margin-left:20px;border-left:3px solid var(--line)}
+  .repstog{color:var(--dim);font-size:12px;cursor:pointer;margin:0 0 8px 14px;user-select:none}
+  .repstog:hover{color:var(--acc)}
+  .repstog.mine{color:var(--ok);font-weight:600}
+  .newchip{color:var(--ok);font-size:11px;font-family:var(--mono);display:none}
+  .newchip.on{display:inline}
   .pres .ag{display:block;padding:3px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .pres .on{color:var(--ok)}
   #composer{border-top:1px solid var(--line);padding-top:10px;margin-top:10px;display:grid;gap:8px;grid-template-columns:1fr 1fr;align-items:start}
@@ -123,7 +130,7 @@ export const UI_HTML = /* html */ `<!doctype html>
 </div>
 <script>
 "use strict";
-const S = { me:null, scopes:[], chans:[], agents:[], active:new Set(), msgs:new Map(), sel:null, selKind:null, stream:null, seq:0, epoch:"", rpccache:new Map(), minted:null, dmMembers:new Map(), bearer:null };
+const S = { me:null, scopes:[], chans:[], agents:[], active:new Set(), msgs:new Map(), sel:null, selKind:null, stream:null, seq:0, epoch:"", rpccache:new Map(), minted:null, dmMembers:new Map(), bearer:null, openT:new Set(), read:new Set() };
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; };
 
@@ -236,14 +243,25 @@ function dmPeerHint() {
   $("cto").disabled = true; $("cpost").disabled = !peer;
   $("pd").textContent = peer ? "DM → " + peer + " (posts use dm:" + peer + ")" : "read-only: you are not a party to this DM";
 }
-function msgNode(m) {
-  const n = el("div", "msg"); n.dataset.id = m.id;
+function isMine(m) {
+  // "new for you" = addressed to me (or @all), still open, not sent by me,
+  // and I have not read it. This is the inbox predicate, same data the CLI
+  // inbox uses — a reply lights ONLY its addressee.
+  if (!m || m.sender === S.me || m.status !== "open" || S.read.has(m.id)) return false;
+  const rs = String(m.recipients || "").split(",").map((s) => s.trim());
+  return rs.includes(S.me) || rs.includes("@all");
+}
+function msgNode(m, nested) {
+  const n = el("div", "msg" + (nested ? " nested" : "")); n.dataset.id = m.id;
   const hd = el("div", "hd");
   hd.appendChild(el("span", "who", m.sender));
   hd.appendChild(el("span", "ty", m.type));
   if (m.subject) hd.appendChild(el("span", null, m.subject));
   hd.appendChild(el("span", "st " + m.status, m.status));
-  hd.appendChild(el("span", "sp", "")).className = "sp";
+  const chip = el("span", "newchip" + (isMine(m) ? " on" : ""), "● new for you"); chip.dataset.chip = m.id; hd.appendChild(chip);
+  // flex spacer — its OWN class: the old className-reassignment chain overwrote
+  // whatever class the node was built with (that's how "sp" vanished once).
+  hd.appendChild(el("span", "sphdr"));
   hd.appendChild(el("span", "ts", m.created_at));
   n.appendChild(hd);
   n.appendChild(el("div", "body", m.body));
@@ -286,14 +304,44 @@ function note(id, patch) {
 }
 function renderPane() {
   const pane = $("pane"); pane.textContent = "";
-  const rows = [...S.msgs.values()].filter((m) => !S.sel || m.channel === S.sel).sort((a, b) => a.created_at < b.created_at ? -1 : 1).slice(-400);
-  for (const m of rows) pane.appendChild(msgNode(m));
+  const all = [...S.msgs.values()].filter((m) => !S.sel || m.channel === S.sel).sort((a, b) => a.created_at < b.created_at ? -1 : 1).slice(-400);
+  const byId = new Map(all.map((m) => [m.id, m]));
+  // Replies nest under their parent. A reply whose parent is NOT in this view
+  // (cross-channel thread, parent outside the newest-400 window) stays a root
+  // — never hide a message the user could not otherwise reach.
+  const roots = []; const kids = new Map();
+  for (const m of all) {
+    const par = m.re && m.re !== m.id && byId.has(m.re) ? m.re : null;
+    if (par) { if (!kids.has(par)) kids.set(par, []); kids.get(par).push(m); }
+    else roots.push(m);
+  }
+  const shown = [];
+  for (const m of roots) {
+    pane.appendChild(msgNode(m)); shown.push(m);
+    const ks = kids.get(m.id) || [];
+    if (!ks.length) continue;
+    const open = S.openT.has(m.id);
+    const mine = ks.some(isMine);
+    const tg = el("div", "repstog" + (mine ? " mine" : ""),
+      (open ? "▾ " : "▸ ") + ks.length + " repl" + (ks.length > 1 ? "ies" : "y") + (mine ? " — new for you" : ""));
+    tg.onclick = () => {
+      if (open) S.openT.delete(m.id);
+      else {
+        S.openT.add(m.id);
+        // Opening a thread = reading it (server-side, honest: clears the CLI
+        // inbox '*' too). Only rows that are "new for me" cost an RPC.
+        for (const k of ks) if (isMine(k)) rpc("read", { id: k.id }).then(() => { S.read.add(k.id); renderPane(); }).catch(() => {});
+      }
+      renderPane();
+    };
+    pane.appendChild(tg);
+    if (open) for (const k of ks) { pane.appendChild(msgNode(k, true)); shown.push(k); }
+  }
   pane.scrollTop = pane.scrollHeight;
-  // claude M4 M-c: receipts are fetched ONLY for the newest RC_MAX rows, one
-  // at a time. Firing one RPC per rendered row (up to 400, all at once) drained
-  // the 120-token read bucket on every boot: 83/200 came back 429 in the
-  // probe, and so did the NEXT user action.
-  for (const m of rows.slice(-RC_MAX)) rcQueue.add(m.id);
+  // claude M4 M-c: receipts are fetched ONLY for the newest RC_MAX RENDERED
+  // rows (collapsed replies have no slot — fetching them drained the read
+  // bucket for nothing), one at a time.
+  for (const m of shown.slice(-RC_MAX)) rcQueue.add(m.id);
   pumpReceipts();
 }
 const RC_MAX = 40;
