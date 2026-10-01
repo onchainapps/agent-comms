@@ -24,6 +24,7 @@ export const UI_HTML = /* html */ `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agent comms</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%2322c55e'/></svg>">
 <style>
   :root{--bg:#0f1115;--panel:#171a21;--line:#2a2f3a;--fg:#dfe3ea;--dim:#8b93a3;--acc:#5aa7ff;--ok:#3fbf7f;--warn:#e0a63f;--err:#e0605f;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
   *{box-sizing:border-box}
@@ -587,7 +588,7 @@ export const UI_CSP = [
   `script-src 'sha256-${createHash("sha256").update(INLINE_SCRIPT, "utf8").digest("base64")}'`,
   "style-src 'unsafe-inline'",
   "connect-src 'self'",
-  "img-src 'self'",
+  "img-src 'self' data:", // data: for the inline-SVG favicon (static, page-embedded)
   "base-uri 'none'",
   "form-action 'none'",
   "frame-ancestors 'none'",
