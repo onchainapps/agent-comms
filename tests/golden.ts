@@ -123,7 +123,10 @@ function runScript(home: string): { transcript: any[]; files: Record<string, str
     const args = step.args.map((a) => (a === "@LAST" ? lastId : a === "@FIRST" ? firstId : a));
     const proc = Bun.spawnSync(["bun", CLI, ...args], {
       cwd: home,
-      env: { ...process.env, COMMS_HOME: home, COMMS_TEST_SEAMS: SEAMS },
+      // HERMETIC: strip remote-mode env — a shell-sourced COMMS_URL/COMMS_TOKEN
+      // must not silently repoint golden at a live server (E3-era incident:
+      // golden hit http://192.168.1.173 from an exported env and failed 3/3).
+      env: (() => { const e: Record<string, string | undefined> = { ...process.env, COMMS_HOME: home, COMMS_TEST_SEAMS: SEAMS }; delete e.COMMS_URL; delete e.COMMS_TOKEN; return e; })(),
       stdin: "ignore",
     });
     const stdout = proc.stdout.toString();

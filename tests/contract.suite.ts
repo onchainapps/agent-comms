@@ -59,16 +59,23 @@ export function contractSuite(name: string, make: Factory) {
       });
     });
 
-    test("reply inherits channel; thread joins only via explicit thread (quirk pinned)", async () => {
+    test("reply inherits channel; re alone joins the thread (E3 — was the re≠thread quirk)", async () => {
       await withBus(async (h, root) => {
         const p = await root.post({ from: "root", to: "t-b", type: "ask", body: "q", channel: "gen-x" });
         const id = (p as any).value.id;
         const r = await root.post({ from: "root", to: "t-a", type: "reply", body: "a", re: id });
         expect((r as any).value.channel).toBe("gen-x");
-        expect((r as any).value.thread).not.toBe(id); // reply's thread = its own id
-        expect(((await root.threadOf(id)) as any).value.rows.length).toBe(1); // QUIRK: re alone ≠ thread join
-        await root.post({ from: "root", to: "t-a", type: "reply", body: "a2", re: id, thread: id });
-        expect(((await root.threadOf(id)) as any).value.rows.length).toBe(2); // explicit thread joins
+        // E3 (server mode): re alone anchors thread = replied row's root.
+        // The legacy own-id quirk survives ONLY in local mode (golden pins it).
+        expect((r as any).value.thread).toBe(id);
+        expect(((await root.threadOf(id)) as any).value.rows.length).toBe(2); // re alone JOINED the thread
+        // explicit thread still wins and can anchor elsewhere:
+        const r2 = await root.post({ from: "root", to: "t-a", type: "reply", body: "a2", re: id, thread: id });
+        expect((r2 as any).value.thread).toBe(id);
+        expect(((await root.threadOf(id)) as any).value.rows.length).toBe(3);
+        // re to a reply lands on the SAME root (derivation is transitive):
+        const r3 = await root.post({ from: "root", to: "t-a", type: "reply", body: "a3", re: (r as any).value.id });
+        expect((r3 as any).value.thread).toBe(id);
       });
     });
 

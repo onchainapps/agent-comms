@@ -1082,6 +1082,16 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       if (mode === "server" && (!reRow || !canSeeChannel(ctx, reRow.channel)))
         return { error: "not_found", detail: `error: re -> unknown message id '${p.re}'` };
     }
+    // E3 (grok field report #3): in SERVER mode `re` alone anchors the thread
+    // to the replied row's thread root — a reply silently starting its own
+    // thread was scattering threads across channels. Local keeps the legacy
+    // own-id quirk (golden parity, §10). The reRow doubles as threadRoot so the
+    // dm cross-channel attach rule below applies to derived threads too.
+    let derivedThread: string | null = null;
+    if (mode === "server" && !p.thread && reRow) {
+      derivedThread = reRow.thread || reRow.id;
+      threadRoot = reRow;
+    }
 
     let channel: string | null = p.channel ?? null;
     // Channel inheritance: server = the ANCHOR ROW's channel column (never the
@@ -1191,7 +1201,9 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const mid = newId(sender.split("-")[0]);
     // M5 (round 2): thread is DERIVED from the final id — recomputed on every
     // collision retry; an explicit p.thread always wins and never retargets.
-    let thread = p.thread || mid;
+    // E3: server-mode derivedThread (from re) also outranks the own-id default
+    // and survives id-collision retries unchanged.
+    let thread = p.thread || derivedThread || mid;
     let fname = `msg-${stamp()}-${sender}-${p.type}-${mid.split("-").pop()}.md`;
     const m: MsgRow = {
       id: mid, thread, re: p.re ?? null, sender, recipients: p.to,
@@ -1250,7 +1262,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
             if (!String(e?.message ?? e).includes("UNIQUE") || ++tries >= 8) throw e;
             id = newId(sender.split("-")[0]);
             fname = `msg-${stamp()}-${sender}-${p.type}-${id.split("-").pop()}.md`; // finding 13: fname follows id
-            if (!p.thread) thread = id; // M5 (round 2): derived thread follows the new id
+            if (!p.thread && !derivedThread) thread = id; // M5 (round 2): derived thread follows the new id (E3 derivedThread excepted)
           }
         }
         if (idem) {
