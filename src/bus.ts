@@ -200,7 +200,7 @@ type Core = ReturnType<typeof openBusCore>;
  *  in (probe-verified with tsc). */
 export type Bus<M extends Mode = Mode> = M extends "server" ? Omit<Core,
   "joinAgent" | "post" | "inbox" | "read" | "threadOf" | "receipts" | "setStatus" | "channels" | "rename" | "history" | "waitStep" | "tokenCreate" | "tokenList" | "tokenRevoke" | "mode" |
-  "groupCreate" | "groupJoin" | "groupLeave" | "groupDelete" | "groupList" | "groupShow"
+  "groupCreate" | "groupJoin" | "groupLeave" | "groupDelete" | "groupList" | "groupShow" | "channelCreate"
 > & ServerOnly : Omit<Core, "mode"> & { readonly mode: "local" };
 interface ServerOnly {
   // discriminant so Bus<"local"> is NOT structurally assignable to Bus<"server">
@@ -225,6 +225,7 @@ interface ServerOnly {
   tokenList: (ctx: Ctx<"server">) => Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; created_at: string; last_used: string; revoked_at: string | null }[] }>;
   tokenRevoke: (ctx: Ctx<"server">, p: { id: number }) => Res<{ revoked: boolean }>;
   groupCreate: (ctx: Ctx<"server">, p: { name: string; agent?: string }) => Res<{ name: string; created: boolean }>;
+  channelCreate: (ctx: Ctx<"server">, p: { name: string; purpose?: string }) => Res<{ name: string; created: boolean }>;
   groupJoin: (ctx: Ctx<"server">, p: { name: string; agent?: string }) => Res<{ name: string; members: string[] }>;
   groupLeave: (ctx: Ctx<"server">, p: { name: string; agent?: string }) => Res<{ name: string; left: boolean }>;
   groupDelete: (ctx: Ctx<"server">, p: { name: string }) => Res<{ name: string; deleted: boolean }>;
@@ -498,6 +499,30 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
 
   function ensureChannel(name: string, by: string) {
     d.run("INSERT OR IGNORE INTO channels(name,purpose,created_at,created_by) VALUES(?,?,?,?)", [name, "", nowIso(), by]);
+  }
+
+  // E2 (t_52610023, wildw_client lesson): canonical channel identity stays
+  // EXACT (no silent [-_] rewrite — that would retroactively change identity),
+  // but a NEW name must not collide with an existing one modulo case/[-_].
+  // The guard is a tiny scan (channels are few); dm-shaped rows are excluded
+  // (system-managed pair names, not human-typed lanes).
+  const chanNorm = (n: string) => n.toLowerCase().replace(/[-_]/g, "");
+  function channelDup(name: string): string | null {
+    const norm = chanNorm(name);
+    for (const r of d.query("SELECT name FROM channels").all() as any[])
+      if (r.name !== name && !DM_SHAPED_RE.test(r.name) && chanNorm(r.name) === norm) return r.name;
+    return null;
+  }
+
+  function channelCreate(ctx: Ctx<M>, p: { name: string; purpose?: string }): Res<{ name: string; created: boolean }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    if (!ID_RE.test(p.name)) return { error: "usage", detail: `invalid channel name: ${p.name} (ID_RE; ':' and '~' excluded)` };
+    if (d.query("SELECT 1 FROM channels WHERE name=?").get(p.name)) return { value: { name: p.name, created: false } };
+    const dup = channelDup(p.name);
+    if (dup) return { error: "usage", detail: `channel '${p.name}' already exists as '${dup}' (near-duplicate — post to the existing name, or choose a distinct one)` };
+    d.run("INSERT INTO channels(name,purpose,created_at,created_by) VALUES(?,?,?,?)",
+      [p.name, p.purpose ?? "", nowIso(), ctx.principal.agentId]);
+    return { value: { name: p.name, created: true } };
   }
 
   const roleOf = (agent: string): string | null =>
@@ -1202,6 +1227,13 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       }
     } else {
       channel = channel || "general";
+      // E2: implicit create (post to an unknown channel) goes THROUGH the
+      // near-duplicate guard — a typo'd lane costs the poster 1 s, not the
+      // fleet a week (wildw_client lesson). Exact-name creates are untouched.
+      if (channel !== "general" && !d.query("SELECT 1 FROM channels WHERE name=?").get(channel)) {
+        const dup = channelDup(channel);
+        if (dup) return { error: "usage", detail: `channel '${channel}' already exists as '${dup}' (near-duplicate — post to the existing name, or channel create a distinct one)` };
+      }
       ensureChannel(channel, sender); // policy-free for public channels (G1)
     }
     const mid = newId(sender.split("-")[0]);
@@ -1922,7 +1954,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     tokenCreate, tokenVerify, tokenById, tokenList, tokenRevoke, tokenTouch,
     cursorGet, cursorSet, history, waitStep, tailEvents, eventsHighWater, epoch, gcFloor, rotateEpoch, gc, preflight,
     allMessages, allMessageIds, messageById, messageByFile, ensureChannel,
-    groupCreate, groupJoin, groupLeave, groupDelete, groupList, groupShow,
+    groupCreate, groupJoin, groupLeave, groupDelete, groupList, groupShow, channelCreate,
     canSeeChannel, membershipsOf, deliveredMsgIds, dmMembers, dmMembersFor, dmChannelForPair,
     isActive, recipientsMatch, roleOf, receiptsForMsg, renderMd, touch, close,
   };

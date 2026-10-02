@@ -34,7 +34,7 @@ export const LIMITS = {
   maxSessionsPerToken: 8,
 };
 
-const WRITE_METHODS = new Set(["join", "post", "status", "rename", "token.create", "token.revoke", "group.create", "group.join", "group.leave", "group.delete", "cursor.set", "login"]);
+const WRITE_METHODS = new Set(["join", "post", "status", "rename", "token.create", "token.revoke", "group.create", "group.join", "group.leave", "group.delete", "channel.create", "cursor.set", "login"]);
 
 // §7 /raw filename gate: msg-<...>.md, no '/' (regex runs before any join).
 const FILE_RE = /^msg-[A-Za-z0-9._-]+\.md$/;
@@ -328,6 +328,7 @@ export function startServer(opts: ServerOpts): RunningServer {
       case "token.list": return call(session.tokenList());
       case "token.revoke": return call(session.tokenRevoke({ id: Number(p.id) }));
       case "group.create": return call(session.groupCreate({ name: String(p.name ?? ""), agent: p.agent }));
+      case "channel.create": return call(session.channelCreate({ name: String(p.name ?? ""), purpose: p.purpose }));
       case "group.join": return call(session.groupJoin({ name: String(p.name ?? ""), agent: p.agent }));
       case "group.leave": return call(session.groupLeave({ name: String(p.name ?? ""), agent: p.agent }));
       case "group.delete": return call(session.groupDelete({ name: String(p.name ?? "") }));

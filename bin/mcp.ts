@@ -289,6 +289,11 @@ const TOOLS: Record<string, Tool> = {
     schema: { type: "object", required: ["name"], properties: { name: { type: "string" } }, additionalProperties: false },
     call: (a, s) => exec("group.delete", { name: a.name }, s),
   },
+  comms_channel_create: {
+    desc: "Create a channel explicitly (E2, the blessed path). Exact name is idempotent (created:false). A NEW name colliding with an existing channel modulo case/[-_] is refused with the existing name in the detail — post to THAT name instead. post --channel <new> still auto-creates, but through the same guard.",
+    schema: { type: "object", required: ["name"], properties: { name: { type: "string" }, purpose: { type: "string" } }, additionalProperties: false },
+    call: (a, s) => exec("channel.create", clean({ name: a.name, purpose: a.purpose }), s),
+  },
 };
 
 function clean(o: Record<string, unknown>): Record<string, unknown> {

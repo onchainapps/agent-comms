@@ -80,6 +80,7 @@ const LOCAL_CALLS: Record<string, (b: Bus<"local">, actor: string, p: any) => Re
   tokenList: (b, actor) => b.tokenList(localCtx(actor)),
   tokenRevoke: (b, actor, p) => b.tokenRevoke(localCtx(actor), p),
   groupCreate: (b, actor, p) => b.groupCreate(localCtx(actor), p),
+  channelCreate: (b, actor, p) => b.channelCreate(localCtx(actor), p),
   groupJoin: (b, actor, p) => b.groupJoin(localCtx(actor), p),
   groupLeave: (b, actor, p) => b.groupLeave(localCtx(actor), p),
   groupDelete: (b, actor, p) => b.groupDelete(localCtx(actor), p),
@@ -348,6 +349,23 @@ async function cmdReceipts(a: Args) {
   console.log(`  (✓ = opened via read · ⤷ = inferred from a reply)`);
 }
 
+// E2: explicit channel create (the blessed path — post to an unknown channel
+// still creates, but THROUGH the near-duplicate guard).
+async function cmdChannel(a: Args) {
+  const sub = a._pos?.[0];
+  const name = a.channel ?? a._pos?.[1];
+  switch (sub) {
+    case "create": {
+      const v = unwrap(await CALL("channelCreate", "", { name, ...(a.purpose ? { purpose: String(a.purpose) } : {}) }));
+      console.log(v.created ? `channel created: #${v.name}` : `channel already exists: #${v.name}`);
+      return;
+    }
+    default:
+      console.error("usage: channel create <name> [--purpose text]");
+      process.exit(2);
+  }
+}
+
 async function cmdChannels() {
   const list = unwrap(await CALL("channels", "", {}));
   console.log("channels:");
@@ -578,6 +596,7 @@ const HELP = `comms — join-able agent comms (local sqlite or hosted server)
 commands: join | rename | who | post | dm | dms | inbox | read | thread | receipts | channels | group | token | ack | done | status | watch
 transport: COMMS_URL+COMMS_TOKEN ⇒ remote · --local forces direct · else COMMS_HOME direct (§7)
 group: group create|join|leave|list|show|delete <name> [--agent who] · post --to group:<name>
+channel: channel create <name> [--purpose text] — blessed lane creation; post --channel <new> still creates but a near-duplicate (case/-/_) is refused.
 token: token create --agent <id> [--kind human] [--scopes a,b] [--admin] [--force] | token list | token revoke --id N
 watch --all (remote) pages history since-cursors: public rows are visible to every token; dm~ rows need membership or read:dm (ruling c).
 watch --no-all (E1) drops the @all broadcast arm: only id/role/group-addressed mail prints (auditor watch; consumer-namespaced cursor).
@@ -604,6 +623,7 @@ async function main() {
     case "thread": return await cmdThread(a);
     case "receipts": return await cmdReceipts(a);
     case "channels": return await cmdChannels();
+    case "channel": return await cmdChannel(a);
     case "ack": return await setStatus(a.agent, a.id, "acked");
     case "done": return await setStatus(a.agent, a.id, "done");
     case "status": return await setStatus(a.agent, a.id, a.state);

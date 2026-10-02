@@ -107,6 +107,42 @@ export function contractSuite(name: string, make: Factory) {
       });
     });
 
+    test("E2: channel.create — exact idempotent, near-duplicate refused, post auto-create guarded", async () => {
+      await withBus(async (h, root) => {
+        // blessed create; exact-name repeat is idempotent, NOT an error.
+        const c1 = await root.channelCreate({ name: "wildwestgame", purpose: "the game lane" });
+        expect(c1.error).toBeUndefined();
+        expect((c1 as any).value).toEqual({ name: "wildwestgame", created: true });
+        const c2 = await root.channelCreate({ name: "wildwestgame" });
+        expect((c2 as any).value).toEqual({ name: "wildwestgame", created: false });
+
+        // the wildw_client lesson: [-_] variants are refused with the existing
+        // name in the detail — no silent canonicalization. (Uppercase is
+        // refused earlier by the ID_RE grammar itself.)
+        for (const v of ["wild-west-game", "wild_west_game"]) {
+          const r = await root.channelCreate({ name: v });
+          expect(r.error).toBe("usage");
+          expect(String((r as any).detail)).toContain("wildwestgame");
+          // and the variant must NOT have been created as a side effect.
+          const names = (((await root.channels()) as any).value ?? []).map((x: any) => x.name);
+          expect(names).not.toContain(v);
+        }
+        expect((await root.channelCreate({ name: "WildWestGame" })).error).toBe("usage");
+
+        // post to an unknown channel still auto-creates — but THROUGH the guard.
+        const typo = await root.post({ from: "root", to: "@all", type: "note", body: "x", channel: "wild-west-game" });
+        expect(typo.error).toBe("usage");
+        expect(String((typo as any).detail)).toContain("wildwestgame");
+        const fresh = await root.post({ from: "root", to: "@all", type: "note", body: "x", channel: "e2-fresh-lane" });
+        expect(fresh.error).toBeUndefined();
+
+        // dm~ pair channels are system-managed (name grammar has no '~', so
+        // channelCreate can never collide with one — the exclusion is belt
+        // and braces for future grammars).
+        expect((await root.channelCreate({ name: "dm~root-e2guy" })).error).toBe("usage");
+      });
+    });
+
     test("status: principal wins over p.agent (finding B2/P1 spoof)", async () => {
       await withBus(async (h, root) => {
         const w = (await seedAgent(h, root, "s2", "worker")) as any;
