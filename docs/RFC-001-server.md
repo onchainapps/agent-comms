@@ -251,7 +251,9 @@ Three orthogonal axes:
   there too). **The `agent_retired` check is NOT part of the warning: it rejects with
   `identity_conflict` in BOTH modes (grok: do not weaken R1 into the warning).**
   Recipient-token grammar pinned (§4):
-  `'@all' | 'group:' ID | bare ID-or-role`.
+  `'@all' | 'group:' ID | bare ID-or-role`. `@all` **delivery** is a subscription
+  default (E1, claude t_58d62457): opting out is **per-call** (`noAll`), never a
+  token property — the same call must not mean different things per credential.
 - **Token format:** `ac_` + base64url(32 random bytes). Lookup: locate row by `prefix` (first
   12 chars after `ac_`), compute `HMAC-SHA256(key=salt, msg=token)`,
   `crypto.timingSafeEqual` on the two 32-byte digests (never raw-token `===`). `Authorization`

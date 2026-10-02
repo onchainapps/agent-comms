@@ -224,7 +224,11 @@ export function startServer(opts: ServerOpts): RunningServer {
   function scopeMatch(s: Sub, m: { channel: string; recipients: string; sender: string; created_at: string }): boolean {
     if (s.scope === "all") return true;
     if (s.scope.startsWith("channel:")) return m.channel === s.scope.slice(8);
-    // mine — same predicate as waitStep delivery (recipientsMatch, F honesty).
+    // mine — same predicate FUNCTION as waitStep delivery (recipientsMatch, F
+    // honesty). Note (claude E1 NIT-1): waitStep may pass {ignoreAll} per-call
+    // (E1 noAll); stream scope=mine has no noAll knob yet, so the equivalence
+    // holds only for default-predicate callers. Add the param here if an SSE
+    // auditor view ever needs it.
     return m.sender === s.agentId ||
       core.recipientsMatch(m.recipients, s.agentId, core.roleOf(s.agentId), core.membershipsOf(s.agentId), m.created_at);
   }

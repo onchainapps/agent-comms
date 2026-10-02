@@ -431,6 +431,7 @@ async function cmdToken(a: Args) {
 // ---------- watch ----------
 async function cmdWatch(a: Args) {
   if (REMOTE) return cmdWatchRemote(a);
+  if (a.all && a["no-all"]) console.error("warning: --all overrides --no-all (firehose prints every visible row); drop one flag");
   const bus = core();
   const role = bus.roleOf(a.agent);
   // F: membership resolves at TAIL time — reload the incarnation Map every tick.
@@ -474,6 +475,9 @@ async function cmdWatch(a: Args) {
  * from the floor, exactly where retained history starts.
  */
 async function cmdWatchRemote(a: Args) {
+  // claude E1 NIT-2: --all wins (the predicate is never consulted in firehose
+  // mode); say so instead of silently ignoring --no-all.
+  if (a.all && a["no-all"]) console.error("warning: --all overrides --no-all (firehose prints every visible row); drop one flag");
   const ivSec = a.interval ?? 3;
   const capSec = a.timeout ?? 28800;
   // claude M3: resolve the PRINCIPAL first (cheap read; identity comes from

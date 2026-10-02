@@ -544,6 +544,9 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   /** The probe-verified delivery statement (F): one UNION ALL, every arm an
    *  index SEARCH, positional binds (house style — bun:sqlite does NOT bind
    *  named params from {agent}). Role NULL ⇒ arm returns 0 rows (skip). */
+  // NIT-3 (claude t_58d62457): this SQL twin has no noAll knob — if one is ever
+  // added, the JS≡SQL parity fuzz MUST thread the same opts through both sides
+  // or it will pin the wrong equivalence.
   function deliveredMsgIds(agent: string, role: string | null): Set<string> {
     const rows = d.query(`
       SELECT msg FROM message_recipients WHERE target = ?

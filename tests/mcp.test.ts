@@ -29,9 +29,13 @@ function bootstrap(home: string) {
  *  matched BY ID (concurrent calls finish out of order); id-less / unmatched
  *  messages go to the FIFO used by raw(). */
 function mcpClient(url: string, token: string, extraEnv: Record<string, string> = {}, args: string[] = []) {
+  // claude E1 MINOR-3: scrub ambient COMMS_* like golden/cli-remote do — a
+  // sourced COMMS_FINGERPRINT would otherwise leak into join identity.
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const k of Object.keys(env)) if (k.startsWith("COMMS_")) delete env[k];
   const proc = Bun.spawn([process.execPath, join(REPO, "bin/mcp.ts"), ...args], {
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
-    env: { ...process.env, COMMS_URL: url, COMMS_TOKEN: token, ...extraEnv },
+    env: { ...env, COMMS_URL: url, COMMS_TOKEN: token, ...extraEnv } as Record<string, string>,
   });
   let buf = "";
   const queue: ((m: any) => void)[] = [];
@@ -351,7 +355,9 @@ describe("M5 review fold (claude)", () => {
     for (let i = 0; i < 300; i++) b.post(localCtx("root"), { from: "root", to: "ag1", type: "note", body: "x".repeat(900) } as any);
     b.close();
     const srv = startServer({ home, port: 0 });
-    const proc = Bun.spawn([process.execPath, join(REPO, "bin/mcp.ts")], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: { ...process.env, COMMS_URL: srv.url, COMMS_TOKEN: ag1 } });
+    const env: Record<string, string | undefined> = { ...process.env };
+    for (const k of Object.keys(env)) if (k.startsWith("COMMS_")) delete env[k];
+    const proc = Bun.spawn([process.execPath, join(REPO, "bin/mcp.ts")], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: { ...env, COMMS_URL: srv.url, COMMS_TOKEN: ag1 } as Record<string, string> });
     try {
       proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "p", version: "0" } } }) + "\n");
       proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "comms_inbox", arguments: { limit: 500 } } }) + "\n");
