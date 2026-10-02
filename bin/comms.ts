@@ -321,7 +321,7 @@ async function cmdGroup(a: Args) {
 }
 
 async function cmdInbox(a: Args) {
-  const v = unwrap(await CALL("inbox", a.agent, { agent: a.agent, open: a.open, unread: a.unread, channel: a.channel }));
+  const v = unwrap(await CALL("inbox", a.agent, { agent: a.agent, open: a.open, unread: a.unread, channel: a.channel, ...(a["no-all"] ? { noAll: true } : {}) }));
   // claude M3 B2: core returns a Set, the wire (and the Session contract)
   // an array — one CALL surface must normalize ONE shape.
   const unread = new Set<string>(v.unreadIds);
@@ -420,7 +420,7 @@ async function cmdWatch(a: Args) {
   const ivSec = a.interval ?? 3;
   const capSec = a.timeout ?? 28800;
   const seen = new Set(bus.allMessageIds()); // core accessor — no SQL in the shell (finding 9)
-  const scope = a.all ? (a.channel ? `all of #${a.channel}` : "ALL channels (firehose)") : (a.channel ? `#${a.channel} addressed to me` : "addressed to me");
+  const scope = a.all ? (a.channel ? `all of #${a.channel}` : "ALL channels (firehose)") : a["no-all"] ? (a.channel ? `#${a.channel} addressed to me (no @all)` : "addressed to me (no @all)") : (a.channel ? `#${a.channel} addressed to me` : "addressed to me");
   console.log(`watch: ${a.agent} (role=${role ?? "-"}) scope=${scope}; every ${ivSec}s; ${a.once ? "one-shot" : `cap ${capSec}s`}. baseline=${seen.size} msgs`);
   let stop = false;
   process.on("SIGTERM", () => { stop = true; });
@@ -434,8 +434,10 @@ async function cmdWatch(a: Args) {
       seen.add(r.id);
       if (r.sender === a.agent) continue;
       if (a.channel && r.channel !== a.channel) continue;
-      // --all surfaces every message in scope (a whole channel); default = only addressed to me
-      if (a.all || bus.recipientsMatch(r.recipients, a.agent, role, mem, r.created_at)) { console.log(`NEW ${fmtRow(r)}`); hitForMe = true; }
+      // --all surfaces every message in scope (a whole channel); default = only addressed to me;
+      // E1 --no-all drops the @all broadcast arm (auditor watch — announces must not
+      // subscribe you to the firehose; role/group/id arms still deliver).
+      if (a.all || bus.recipientsMatch(r.recipients, a.agent, role, mem, r.created_at, a["no-all"] ? { ignoreAll: true } : undefined)) { console.log(`NEW ${fmtRow(r)}`); hitForMe = true; }
     }
     if (a.once) break;
     if (hitForMe && a["exit-on-new"]) { console.log("watch: message for me; exiting"); break; }
@@ -469,8 +471,10 @@ async function cmdWatchRemote(a: Args) {
   // commits into the SAME row would permanently skip what the other
   // views haven't printed yet. Plain `watch --for <me>` keeps 'cli'.
   const consumer = typeof a.consumer === "string" ? a.consumer
-    : `cli${other ? `@${target}` : ""}${a.all ? ".all" : ""}${a.channel ? `#${a.channel}` : ""}`;
-  const scope = a.all ? (a.channel ? `all of #${a.channel}` : "ALL channels (firehose)") : (a.channel ? `#${a.channel} addressed to me` : "addressed to me");
+    : `cli${other ? `@${target}` : ""}${a.all ? ".all" : ""}${a["no-all"] ? ".noall" : ""}${a.channel ? `#${a.channel}` : ""}`;
+  // E1: the predicate variant MUST live in the consumer key — a noAll cursor
+  // sharing 'cli' would skip @all rows the default view never printed (§6).
+  const scope = a.all ? (a.channel ? `all of #${a.channel}` : "ALL channels (firehose)") : a["no-all"] ? (a.channel ? `#${a.channel} addressed to me (no @all)` : "addressed to me (no @all)") : (a.channel ? `#${a.channel} addressed to me` : "addressed to me");
   console.log(`watch: ${target} scope=${scope}; every ${ivSec}s; ${a.once ? "one-shot" : `cap ${capSec}s`} (remote, cursor consumer=${consumer})`);
   let stop = false;
   process.on("SIGTERM", () => { stop = true; });
@@ -531,7 +535,7 @@ async function cmdWatchRemote(a: Args) {
       let resynced = false;
       let last = committed;
       for (;;) {
-        const w = await CALL("waitStep", a.agent, { consumer, ...(other ? { for: target } : {}) });
+        const w = await CALL("waitStep", a.agent, { consumer, ...(other ? { for: target } : {}), ...(a["no-all"] ? { noAll: true } : {}) });
         if (w.error === "resync") { await recover(w.data); committed = ""; resynced = true; break; }
         const v = unwrap(w);
         for (const m of v.messages) {
@@ -576,6 +580,7 @@ transport: COMMS_URL+COMMS_TOKEN ⇒ remote · --local forces direct · else COM
 group: group create|join|leave|list|show|delete <name> [--agent who] · post --to group:<name>
 token: token create --agent <id> [--kind human] [--scopes a,b] [--admin] [--force] | token list | token revoke --id N
 watch --all (remote) pages history since-cursors: public rows are visible to every token; dm~ rows need membership or read:dm (ruling c).
+watch --no-all (E1) drops the @all broadcast arm: only id/role/group-addressed mail prints (auditor watch; consumer-namespaced cursor).
 run 'bun comms.ts <cmd> --help-ish' — see header of this file for full usage.`;
 
 async function main() {

@@ -14,6 +14,12 @@ import { startServer } from "../src/server/mod.ts";
 import { UI_HTML, UI_CSP } from "../src/server/ui.ts";
 
 const REPO = import.meta.dir + "/..";
+// HERMETIC: these suites SPAWN the CLI/server/dashboard binaries, which read
+// COMMS_* from the environment (§7). A developer shell that sourced its
+// agent-comms env file (COMMS_URL/COMMS_TOKEN/COMMS_HOME…) must not silently
+// repoint spawned children at a live server (E1-era incident: sourced
+// COMMS_URL made ui/cli-remote spawn server-mode dashboards ⇒ 2 fail).
+for (const k of Object.keys(process.env)) if (k.startsWith("COMMS_")) delete process.env[k];
 
 function tmp() { return mkdtempSync(join(tmpdir(), "comms-m4-")); }
 

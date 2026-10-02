@@ -313,7 +313,7 @@ export function startServer(opts: ServerOpts): RunningServer {
       case "join": return call(session.joinAgent({ agent: p.agent ?? session.agentId, role: p.role ?? "", caps: p.caps, fingerprint: p.fingerprint }));
       case "who": return call(session.listAgents(!p.all));
       case "post": return call(session.post({ from: p.from ?? session.agentId, to: Array.isArray(p.to) ? p.to.join(",") : String(p.to ?? ""), type: String(p.type ?? ""), subject: p.subject, body: String(p.body ?? ""), thread: p.thread, re: p.re, tags: p.tags, channel: p.channel, as: p.as, idempotencyKey: p.idempotencyKey, dm: p.dm }));
-      case "inbox": return call(session.inbox({ agent: p.for ?? p.agent ?? session.agentId, open: p.open, unread: p.unread, channel: p.channel, mark: p.mark }));
+      case "inbox": return call(session.inbox({ agent: p.for ?? p.agent ?? session.agentId, open: p.open, unread: p.unread, channel: p.channel, mark: p.mark, noAll: p.noAll }));
       case "read": return call(session.read({ agent: p.for ?? p.agent ?? session.agentId, id: String(p.id ?? "") }));
       case "thread": return call(session.threadOf(String(p.id ?? "")));
       case "receipts": return call(session.receipts(String(p.id ?? "")));
@@ -321,7 +321,7 @@ export function startServer(opts: ServerOpts): RunningServer {
       case "channels": return call(session.channels());
       case "history": return call(session.history({ channel: p.channel, since: p.since, limit: p.limit }));
       case "rename": return call(session.rename({ agent: p.agent ?? session.agentId, to: String(p.to ?? p.newId ?? "") }));
-      case "inbox.wait": return call(session.waitStep({ for: p.for, consumer: p.consumer, since: p.since }));
+      case "inbox.wait": return call(session.waitStep({ for: p.for, consumer: p.consumer, since: p.since, noAll: p.noAll }));
       case "cursor.get": return call(session.cursorGet({ consumer: p.consumer }));
       case "cursor.set": return call(session.cursorSet({ consumer: String(p.consumer ?? ""), cursor: String(p.cursor ?? ""), force: p.force }));
       case "token.create": return call(session.tokenCreate({ agent: String(p.agent ?? ""), kind: p.kind, label: p.label, scopes: p.scopes, admin: p.admin, force: p.force }));

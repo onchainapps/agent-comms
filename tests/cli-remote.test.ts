@@ -12,6 +12,11 @@ import { openBus, localCtx } from "../src/bus.ts";
 import { REMOTE_METHODS } from "../src/cli-wire.ts"; // m1 pin: CLI wire map vs live server (never import bin/comms.ts — it runs main())
 
 const REPO = import.meta.dir + "/..";
+// HERMETIC: this suite spawns the CLI/server with env: {...process.env, ...} —
+// a developer's sourced COMMS_* env must not leak into children that expect a
+// clean transport slate (§7 precedence reads the environment). Per-test
+// explicit env entries still win (spread order). See ui.test.ts same guard.
+for (const k of Object.keys(process.env)) if (k.startsWith("COMMS_")) delete process.env[k];
 const CLI = join(REPO, "bin/comms.ts");
 
 function tmp() { return mkdtempSync(join(tmpdir(), "comms-m3-")); }

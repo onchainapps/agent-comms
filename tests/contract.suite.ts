@@ -79,6 +79,30 @@ export function contractSuite(name: string, make: Factory) {
       });
     });
 
+    test("E1: inbox/waitStep noAll drops ONLY the @all arm (id/role/group still deliver)", async () => {
+      await withBus(async (h, root) => {
+        const w = (await seedAgent(h, root, "e1-watch", "e1role")) as any;
+        const s = w.value.session;
+        await root.post({ from: "root", to: "e1-watch", type: "note", body: "by-id" });
+        const bAll = await root.post({ from: "root", to: "@all", type: "announce", body: "broadcast" });
+        await root.post({ from: "root", to: "e1role", type: "note", body: "by-role" });
+        const ids = (r: any) => (r as any).value.rows.map((x: any) => x.id);
+        // default inbox: all three arms deliver (legacy behavior — pinned).
+        expect(ids(await s.inbox({ agent: "e1-watch" })).length).toBe(3);
+        // noAll: broadcast arm drops, id + role arms stay.
+        const nb = ids(await s.inbox({ agent: "e1-watch", noAll: true }));
+        expect(nb.length).toBe(2);
+        expect(nb).not.toContain((bAll as any).value.id);
+        // waitStep noAll under a NAMESPACED consumer; default consumer still
+        // sees the broadcast — both fresh (no stored cursor ⇒ scan from 0),
+        // independent positions in the events space.
+        const wNo = (await s.waitStep({ consumer: "cli.noall", noAll: true })) as any;
+        expect(wNo.value.messages.map((m: any) => m.body)).toEqual(["by-id", "by-role"]);
+        const wDef = (await s.waitStep({ consumer: "cli" })) as any;
+        expect(wDef.value.messages.map((m: any) => m.body)).toContain("broadcast");
+      });
+    });
+
     test("status: principal wins over p.agent (finding B2/P1 spoof)", async () => {
       await withBus(async (h, root) => {
         const w = (await seedAgent(h, root, "s2", "worker")) as any;

@@ -159,9 +159,15 @@ const SPLIT_SQL = `WITH RECURSIVE s(rest,tok) AS (
 export function recipientsMatch(
   recips: string, agent: string, role?: string | null,
   memberships?: Map<string, string>, msgCreatedAt?: string,
+  opts?: { ignoreAll?: boolean },
 ): boolean {
   const toks = new Set(csv(recips));
-  if (toks.has("@all") || toks.has(agent)) return true;
+  if (toks.has(agent)) return true;
+  // E1: @all is delivery by default (rename/announce depend on it reaching
+  // every inbox). ignoreAll opts a SINGLE consumer out of the broadcast arm —
+  // auditors watching a chatty bus must not subscribe to every announce.
+  // Same function, one flag: no second predicate can drift (card t_bd5d63cf).
+  if (!opts?.ignoreAll && toks.has("@all")) return true;
   if (role && toks.has(role)) return true;
   if (memberships?.size)
     for (const t of toks)
@@ -1286,7 +1292,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     return { value: { id: m.id, channel, thread, file } };
   }
 
-  function inbox(ctx: Ctx<M>, p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean }): Res<{ rows: MsgRow[]; unreadIds: Set<string> }> {
+  function inbox(ctx: Ctx<M>, p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean; noAll?: boolean }): Res<{ rows: MsgRow[]; unreadIds: Set<string> }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     const rootCtx = isRootCtx(ctx);
     if ((mode === "server" || !rootCtx) && p.agent !== ctx.principal.agentId && !hasScope(ctx, "read:all"))
@@ -1314,7 +1320,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       if (r.sender === p.agent) return false;
       if (p.channel && r.channel !== p.channel) return false;
       if (!callerSeesDm(r.channel)) return false;
-      if (!recipientsMatch(r.recipients, p.agent, role, mem, r.created_at)) return false;
+      if (!recipientsMatch(r.recipients, p.agent, role, mem, r.created_at, p.noAll ? { ignoreAll: true } : undefined)) return false;
       if (p.open && !["open", "acked", "in_progress"].includes(r.status)) return false;
       if (p.unread && readIds.has(r.id)) return false;
       return true;
@@ -1775,7 +1781,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   /** finding 9/11: the inboxWait SCAN lives here — server-reachable, fully
    *  asserted (read:all gate, epoch check, malformed cursor). The wait LOOP
    *  (backoff) is transport-side via seams.sleep. */
-  function waitStep(ctx: Ctx<M>, p: { for?: string; consumer?: string; since?: string }): Res<{ messages: MsgRow[]; cursor: string; done: boolean }> {
+  function waitStep(ctx: Ctx<M>, p: { for?: string; consumer?: string; since?: string; noAll?: boolean }): Res<{ messages: MsgRow[]; cursor: string; done: boolean }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     const target = p.for ?? ctx.principal.agentId;
     if (target !== ctx.principal.agentId && !hasScope(ctx, "read:all"))
@@ -1814,7 +1820,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       if (e.kind !== "msg" || !e.msg_id) continue;
       const m = d.query("SELECT * FROM messages WHERE id=?").get(e.msg_id) as MsgRow | null;
       // G2: SSE/stream canSee on EVERY event carrying a msg_id (server mode).
-      if (m && m.sender !== target && canSeeChannel(ctx, m.channel) && recipientsMatch(m.recipients, target, role, mem, m.created_at)) messages.push(m);
+      // E1: noAll opts this consumer out of the @all broadcast arm (auditor
+      // watch). The CALLER must namespace the consumer (cli.noall…) — a
+      // different predicate must never share a cursor row with the default.
+      if (m && m.sender !== target && canSeeChannel(ctx, m.channel) && recipientsMatch(m.recipients, target, role, mem, m.created_at, p.noAll ? { ignoreAll: true } : undefined)) messages.push(m);
     }
     return { value: { messages, cursor: `${ep}.${cur}`, done: messages.length > 0 } };
   }

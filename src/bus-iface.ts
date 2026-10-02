@@ -16,7 +16,7 @@ export interface Session {
   joinAgent(p: { agent: string; role: string; caps?: string; fingerprint?: string | null }): Promise<Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number }>>;
   listAgents(activeOnly: boolean): Promise<Res<AgentRow[]>>;
   post(p: { from: string; to: string; type: string; subject?: string; body: string; thread?: string | null; re?: string | null; tags?: string; channel?: string | null; as?: string | null; idempotencyKey?: string | null; dm?: string | null }): Promise<Res<{ id: string; channel: string; thread: string; file: string }>>;
-  inbox(p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean }): Promise<Res<{ rows: MsgRow[]; unreadIds: string[] }>>;
+  inbox(p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean; noAll?: boolean }): Promise<Res<{ rows: MsgRow[]; unreadIds: string[] }>>;
   read(p: { agent: string; id: string }): Promise<Res<MsgRow & { receipts: Receipts }>>;
   threadOf(id: string): Promise<Res<{ rows: MsgRow[]; receipts: Receipts[] }>>;
   receipts(id: string): Promise<Res<MsgRow & { receipts: Receipts }>>;
@@ -24,7 +24,7 @@ export interface Session {
   channels(): Promise<Res<{ name: string; n: number; last: string | null; purpose: string | null }[]>>;
   rename(p: { agent: string; to: string; fingerprint?: string | null }): Promise<Res<{ announced: MsgRow }>>;
   history(p: { channel?: string | null; limit?: number; since?: string }): Promise<Res<{ rows: MsgRow[]; hasMore: boolean; cursor: string }>>;
-  waitStep(p: { for?: string; consumer?: string; since?: string }): Promise<Res<{ messages: MsgRow[]; cursor: string; done: boolean }>>;
+  waitStep(p: { for?: string; consumer?: string; since?: string; noAll?: boolean }): Promise<Res<{ messages: MsgRow[]; cursor: string; done: boolean }>>;
   cursorGet(p: { consumer?: string }): Promise<Res<{ epoch: string; seq: number }>>;
   cursorSet(p: { consumer: string; cursor: string; force?: boolean }): Promise<Res<null>>;
   tokenCreate(p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean }): Promise<Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string }>>;
