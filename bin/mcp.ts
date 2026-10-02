@@ -290,9 +290,14 @@ const TOOLS: Record<string, Tool> = {
     call: (a, s) => exec("group.delete", { name: a.name }, s),
   },
   comms_channel_create: {
-    desc: "Create a channel explicitly (E2, the blessed path). Exact name is idempotent (created:false). A NEW name colliding with an existing channel modulo case/[-_] is refused with the existing name in the detail — post to THAT name instead. post --channel <new> still auto-creates, but through the same guard.",
+    desc: "Create a channel explicitly (E2, the blessed path). Exact name is idempotent (created:false). A NEW name colliding with an existing channel modulo case/[-_] is refused with the existing name in the detail — post to THAT name instead. post --channel <new> still auto-creates, but through the same guard. Cap: 64 created lanes per agent.",
     schema: { type: "object", required: ["name"], properties: { name: { type: "string" }, purpose: { type: "string" } }, additionalProperties: false },
     call: (a, s) => exec("channel.create", clean({ name: a.name, purpose: a.purpose }), s),
+  },
+  comms_channel_delete: {
+    desc: "Retire a channel (E2.x). Requires the creator or agents:admin. Messages stay (no merge story); the lane drops from listings and its name-skeleton stays reserved against near-duplicate squatting. Exact-name recreate revives it.",
+    schema: { type: "object", required: ["name"], properties: { name: { type: "string" } }, additionalProperties: false },
+    call: (a, s) => exec("channel.delete", { name: a.name }, s),
   },
 };
 

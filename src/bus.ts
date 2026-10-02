@@ -203,7 +203,7 @@ type Core = ReturnType<typeof openBusCore>;
  *  in (probe-verified with tsc). */
 export type Bus<M extends Mode = Mode> = M extends "server" ? Omit<Core,
   "joinAgent" | "post" | "inbox" | "read" | "threadOf" | "receipts" | "setStatus" | "channels" | "rename" | "history" | "waitStep" | "tokenCreate" | "tokenList" | "tokenRevoke" | "mode" |
-  "groupCreate" | "groupJoin" | "groupLeave" | "groupDelete" | "groupList" | "groupShow" | "channelCreate"
+  "groupCreate" | "groupJoin" | "groupLeave" | "groupDelete" | "groupList" | "groupShow" | "channelCreate" | "channelDelete"
 > & ServerOnly : Omit<Core, "mode"> & { readonly mode: "local" };
 interface ServerOnly {
   // discriminant so Bus<"local"> is NOT structurally assignable to Bus<"server">
@@ -229,6 +229,7 @@ interface ServerOnly {
   tokenRevoke: (ctx: Ctx<"server">, p: { id: number }) => Res<{ revoked: boolean }>;
   groupCreate: (ctx: Ctx<"server">, p: { name: string; agent?: string }) => Res<{ name: string; created: boolean }>;
   channelCreate: (ctx: Ctx<"server">, p: { name: string; purpose?: string }) => Res<{ name: string; created: boolean }>;
+  channelDelete: (ctx: Ctx<"server">, p: { name: string }) => Res<{ name: string; deleted: boolean }>;
   groupJoin: (ctx: Ctx<"server">, p: { name: string; agent?: string }) => Res<{ name: string; members: string[] }>;
   groupLeave: (ctx: Ctx<"server">, p: { name: string; agent?: string }) => Res<{ name: string; left: boolean }>;
   groupDelete: (ctx: Ctx<"server">, p: { name: string }) => Res<{ name: string; deleted: boolean }>;
@@ -324,6 +325,12 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     CREATE INDEX IF NOT EXISTS gm_agent ON group_members(agent_id, grp);
     -- F n5: delete+recreate backlog guard (upserted PK, never siblings).
     CREATE TABLE IF NOT EXISTS group_tombstones(
+      name TEXT PRIMARY KEY, deleted_at TEXT NOT NULL);
+    -- E2.x (claude t_1ed3ec7c MINOR-1): channel retirement memory. Tombstones
+    -- participate in the chanNorm near-dup scan so delete-all-variants-then-
+    -- recreate cannot resurrect the wildwestgame incident or let a variant
+    -- squat the canonical skeleton during the gap.
+    CREATE TABLE IF NOT EXISTS channel_tombstones(
       name TEXT PRIMARY KEY, deleted_at TEXT NOT NULL);
     -- M1.5 App G: the ONE confidentiality boundary. Literal member ids only —
     -- role/group/@all are NEVER consulted for access.
@@ -502,6 +509,9 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
 
   function ensureChannel(name: string, by: string) {
     d.run("INSERT OR IGNORE INTO channels(name,purpose,created_at,created_by) VALUES(?,?,?,?)", [name, "", nowIso(), by]);
+    // E2.x: an exact-name recreate revives the lane — clear its tombstone so
+    // channels() lists it (the tombstone only holds the skeleton while dead).
+    d.run("DELETE FROM channel_tombstones WHERE name=?", [name]);
   }
 
   // E2 (t_52610023, wildw_client lesson): canonical channel identity stays
@@ -510,11 +520,25 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   // The guard is a tiny scan (channels are few); dm-shaped rows are excluded
   // (system-managed pair names, not human-typed lanes).
   const chanNorm = (n: string) => n.toLowerCase().replace(/[-_]/g, "");
-  function channelDup(name: string): string | null {
+  // E2.x: tombstones participate in the scan — delete-all-variants-then-recreate
+  // must not resurrect the incident, and a variant may not squat the retired
+  // skeleton during the gap. `retired:true` changes the pointer text only.
+  function channelDup(name: string): { name: string; retired: boolean } | null {
     const norm = chanNorm(name);
     for (const r of d.query("SELECT name FROM channels").all() as any[])
-      if (r.name !== name && !DM_SHAPED_RE.test(r.name) && chanNorm(r.name) === norm) return r.name;
+      if (r.name !== name && !DM_SHAPED_RE.test(r.name) && chanNorm(r.name) === norm) return { name: r.name, retired: false };
+    for (const r of d.query("SELECT name FROM channel_tombstones").all() as any[])
+      if (r.name !== name && !DM_SHAPED_RE.test(r.name) && chanNorm(r.name) === norm) return { name: r.name, retired: true };
     return null;
+  }
+
+  // E2.x (claude t_1ed3ec7c Q5): the missing control on ungated creation is
+  // COST, not permission — mirror the group squatting cap. Tombstoned lanes
+  // don't count (delete frees room); dm~ rows are system-managed, not typed
+  // lanes, and don't count either.
+  const CHANNEL_CREATE_CAP = 64;
+  function channelCapHit(by: string): boolean {
+    return (d.query("SELECT count(*) c FROM channels WHERE created_by=? AND name NOT LIKE 'dm~%'").get(by) as any).c >= CHANNEL_CREATE_CAP;
   }
 
   function channelCreate(ctx: Ctx<M>, p: { name: string; purpose?: string }): Res<{ name: string; created: boolean }> {
@@ -534,9 +558,20 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       try {
         if (d.query("SELECT 1 FROM channels WHERE name=?").get(p.name)) { d.exec("COMMIT"); return { value: { name: p.name, created: false } }; }
         const dup = channelDup(p.name);
-        if (dup) { d.exec("ROLLBACK"); return { error: "usage", detail: `channel '${p.name}' already exists as '${dup}' (near-duplicate — post to the existing name, or choose a distinct one)` }; }
+        if (dup) {
+          d.exec("ROLLBACK");
+          return { error: "usage", detail: dup.retired
+            ? `channel '${p.name}' collides with retired lane '${dup.name}' (near-duplicate of a deleted channel — choose a distinct name)`
+            : `channel '${p.name}' already exists as '${dup.name}' (near-duplicate — post to the existing name, or choose a distinct one)` };
+        }
+        if (channelCapHit(ctx.principal.agentId)) { d.exec("ROLLBACK"); return { error: "usage", detail: `channel squatting cap: ${CHANNEL_CREATE_CAP} channels created per agent (delete lanes you retired)` }; }
+        // E2.x: same-second recreate = contention (group tombstone precedent) —
+        // the second boundary is the resume-handoff floor for cursors.
+        const tomb = (d.query("SELECT deleted_at FROM channel_tombstones WHERE name=?").get(p.name) as any)?.deleted_at as string | undefined;
+        if (tomb !== undefined && nowIso() <= tomb) { d.exec("ROLLBACK"); return { error: "contention", detail: `channel '${p.name}' deleted <1s ago; retry after the second boundary` }; }
         d.run("INSERT INTO channels(name,purpose,created_at,created_by) VALUES(?,?,?,?)",
           [p.name, p.purpose ?? "", nowIso(), ctx.principal.agentId]);
+        d.run("DELETE FROM channel_tombstones WHERE name=?", [p.name]); // exact recreate revives
         d.exec("COMMIT");
       } catch (e) { d.exec("ROLLBACK"); throw e; }
       return { value: { name: p.name, created: true } };
@@ -544,6 +579,39 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       const msg = String(e?.message ?? e);
       if (msg.includes("SQLITE_BUSY")) return { error: "contention", detail: "busy" };
       return { error: "internal", detail: `channelCreate: ${msg}` };
+    }
+  }
+
+  // E2.x (claude t_1ed3ec7c MINOR-1, wildw_client 20261002T072640-e535 rule
+  // verbatim): retire a lane — creator or agents:admin. Messages are NOT
+  // deleted (no merge story: delete+repost covers reality); the tombstone
+  // (a) keeps the chanNorm skeleton occupied so variants can't squat it and
+  // (b) drops the lane from the channels() listing (monotonic shrink).
+  // Exact-name recreate stays allowed (rename-back); variants are refused.
+  function channelDelete(ctx: Ctx<M>, p: { name: string }): Res<{ name: string; deleted: boolean }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    if (typeof p.name !== "string" || !ID_RE.test(p.name)) return { error: "usage", detail: `invalid channel name: ${p.name}` };
+    if (p.name === "general") return { error: "usage", detail: "the general lane is seeded and cannot be deleted" };
+    if (!isRootCtx(ctx) && !hasScope(ctx, "agents:admin")) {
+      const by = (d.query("SELECT created_by FROM channels WHERE name=?").get(p.name) as any)?.created_by;
+      if (by !== ctx.principal.agentId) return { error: "forbidden", detail: "channel.delete requires the creator or agents:admin" };
+    }
+    const t = nowIso();
+    try {
+      d.exec("BEGIN IMMEDIATE");
+      try {
+        if (!d.query("SELECT name FROM channels WHERE name=?").get(p.name)) { d.exec("ROLLBACK"); return { error: "not_found", detail: `no such channel: ${p.name}` }; }
+        d.run("DELETE FROM channels WHERE name=?", [p.name]);
+        d.run(`INSERT INTO channel_tombstones(name,deleted_at) VALUES(?,?)
+               ON CONFLICT(name) DO UPDATE SET deleted_at = excluded.deleted_at
+               WHERE excluded.deleted_at > channel_tombstones.deleted_at`, [p.name, t]);
+        d.exec("COMMIT");
+      } catch (e) { d.exec("ROLLBACK"); throw e; }
+      return { value: { name: p.name, deleted: true } };
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      if (msg.includes("SQLITE_BUSY")) return { error: "contention", detail: "busy" };
+      return { error: "internal", detail: `channelDelete: ${msg}` };
     }
   }
 
@@ -1257,7 +1325,13 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       // fleet a week (wildw_client lesson). Exact-name creates are untouched.
       if (channel !== "general" && !d.query("SELECT 1 FROM channels WHERE name=?").get(channel)) {
         const dup = channelDup(channel);
-        if (dup) return { error: "usage", detail: `channel '${channel}' already exists as '${dup}' (near-duplicate — post to the existing name, or channel create a distinct one)` };
+        if (dup) return { error: "usage", detail: dup.retired
+          ? `channel '${channel}' collides with retired lane '${dup.name}' (near-duplicate of a deleted channel — choose a distinct name)`
+          : `channel '${channel}' already exists as '${dup.name}' (near-duplicate — post to the existing name, or channel create a distinct one)` };
+        // E2.x: the cap applies to the auto-create back door too — otherwise
+        // gating only channel.create gates the blessed path and leaves this
+        // one open (claude Q5). general is seeded and exempt.
+        if (channelCapHit(sender)) return { error: "usage", detail: `channel squatting cap: ${CHANNEL_CREATE_CAP} channels created per agent (delete lanes you retired)` };
       }
       ensureChannel(channel, sender); // policy-free for public channels (G1)
     }
@@ -1452,7 +1526,12 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
 
   function channels(ctx: Ctx<M>): Res<{ name: string; n: number; last: string | null; purpose: string | null }[]> {
     const bad = ctxCheck(ctx); if (bad) return bad;
-    const counts = d.query("SELECT channel name, COUNT(*) n, MAX(created_at) last FROM messages GROUP BY channel").all() as any[];
+    // E2.x: retired lanes stay out of the listing even while their messages
+    // survive (claude Q2 monotonic shrink — the scar stops being visible once
+    // someone sweeps it; the tombstone keeps the skeleton occupied either way).
+    const tombs = new Set((d.query("SELECT name FROM channel_tombstones").all() as any[]).map((r) => r.name));
+    const counts = (d.query("SELECT channel name, COUNT(*) n, MAX(created_at) last FROM messages GROUP BY channel").all() as any[])
+      .filter((c) => !tombs.has(c.name));
     const cmap = new Map<string, any>(counts.map((c) => [c.name, c]));
     for (const c of d.query("SELECT name, purpose FROM channels").all() as any[])
       if (!cmap.has(c.name)) cmap.set(c.name, { name: c.name, n: 0, last: null, purpose: c.purpose });
@@ -1979,7 +2058,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     tokenCreate, tokenVerify, tokenById, tokenList, tokenRevoke, tokenTouch,
     cursorGet, cursorSet, history, waitStep, tailEvents, eventsHighWater, epoch, gcFloor, rotateEpoch, gc, preflight,
     allMessages, allMessageIds, messageById, messageByFile, ensureChannel,
-    groupCreate, groupJoin, groupLeave, groupDelete, groupList, groupShow, channelCreate,
+    groupCreate, groupJoin, groupLeave, groupDelete, groupList, groupShow, channelCreate, channelDelete,
     canSeeChannel, membershipsOf, deliveredMsgIds, dmMembers, dmMembersFor, dmChannelForPair,
     isActive, recipientsMatch, roleOf, receiptsForMsg, renderMd, touch, close,
   };

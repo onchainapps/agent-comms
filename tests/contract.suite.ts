@@ -152,6 +152,58 @@ export function contractSuite(name: string, make: Factory) {
       });
     });
 
+    test("E2.x: channel.delete — gate, tombstone skeleton, revive, cap", async () => {
+      await withBus(async (h, root) => {
+        const w = ((await seedAgent(h, root, "e2x-w", "worker")) as any).value.session as Session;
+
+        // creator retires own lane; drops from listings.
+        expect((await w.channelCreate({ name: "e2x-lane", purpose: "mine" })).error).toBeUndefined();
+        expect((await w.channelDelete({ name: "e2x-lane" })).error).toBeUndefined();
+        const names = (((await root.channels()) as any).value ?? []).map((c: any) => c.name);
+        expect(names).not.toContain("e2x-lane");
+
+        // creator-or-admin gate: non-creator without agents:admin ⇒ forbidden;
+        // the same agent with root (admin) succeeds.
+        expect((await root.channelCreate({ name: "e2x-owned" })).error).toBeUndefined();
+        expect((await w.channelDelete({ name: "e2x-owned" })).error).toBe("forbidden");
+        expect((await root.channelDelete({ name: "e2x-owned" })).error).toBeUndefined(); // admin path
+
+        // tombstone holds the SKELETON: a variant of a retired lane is refused
+        // with a retired pointer, and delete-all-variants-then-recreate cannot
+        // resurrect the incident.
+        expect((await w.channelCreate({ name: "e2xgame" })).error).toBeUndefined();
+        expect((await w.channelDelete({ name: "e2xgame" })).error).toBeUndefined();
+        const rv = await w.channelCreate({ name: "e2-x-game" });
+        expect(rv.error).toBe("usage");
+        expect(String((rv as any).detail)).toContain("retired");
+        expect(String((rv as any).detail)).toContain("e2xgame");
+
+        // exact-name recreate REVIVES (tombstone cleared → listed again).
+        // Tombstone back-dated past the second boundary (group m-a precedent:
+        // same-second recreate is contention, not revival).
+        (h as any).raw.testDb.run("UPDATE channel_tombstones SET deleted_at = datetime('now','-1 day') WHERE name='e2xgame'");
+        const rev = await w.channelCreate({ name: "e2xgame" });
+        expect(rev.error).toBeUndefined();
+        expect((rev as any).value.created).toBe(true);
+        const names2 = (((await root.channels()) as any).value ?? []).map((c: any) => c.name);
+        expect(names2).toContain("e2xgame");
+        expect((h as any).raw.testDb.query("SELECT 1 FROM channel_tombstones WHERE name='e2xgame'").get()).toBeNull();
+
+        // general is undeletable; unknown lane is not_found; bad grammar usage.
+        expect((await root.channelDelete({ name: "general" })).error).toBe("usage");
+        expect((await root.channelDelete({ name: "e2x-nope" })).error).toBe("not_found");
+        expect((await root.channelDelete({ name: 12 as any })).error).toBe("usage");
+
+        // cap (cost-not-permission, claude Q5): 64 created lanes per agent;
+        // delete frees room.
+        const c = ((await seedAgent(h, root, "e2x-c", "cap")) as any).value.session as Session;
+        for (let i = 0; i < 64; i++) expect((await c.channelCreate({ name: "cc" + i })).error).toBeUndefined();
+        expect((await c.channelCreate({ name: "cc64" })).error).toBe("usage");
+        expect((await c.channelDelete({ name: "cc0" })).error).toBeUndefined();
+        expect((await c.channelCreate({ name: "cc64" })).error).toBeUndefined(); // delete freed room
+      });
+    });
+
     test("status: principal wins over p.agent (finding B2/P1 spoof)", async () => {
       await withBus(async (h, root) => {
         const w = (await seedAgent(h, root, "s2", "worker")) as any;

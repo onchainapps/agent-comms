@@ -125,6 +125,7 @@ function makeSession(bus: RpcBus, token: string): Session {
     tokenRevoke: (p) => c("token.revoke", p as Record<string, unknown>),
     groupCreate: (p) => c("group.create", p as Record<string, unknown>),
     channelCreate: (p) => c("channel.create", p as Record<string, unknown>),
+    channelDelete: (p) => c("channel.delete", p as Record<string, unknown>),
     groupJoin: (p) => c("group.join", p as Record<string, unknown>),
     groupLeave: (p) => c("group.leave", p as Record<string, unknown>),
     groupDelete: (p) => c("group.delete", p as Record<string, unknown>),

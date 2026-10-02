@@ -115,7 +115,7 @@ describe("M5 MCP adapter (§10-M5)", () => {
       // grok M5 #2: parity with the server's dispatch set (§10-M5 "same RPC
       // methods") — every remotely-callable method except the web-cookie/SSE
       // ones (login/logout/stream.ticket) must have a tool.
-      for (const n of ["comms_rename", "comms_token_create", "comms_token_list", "comms_token_revoke", "comms_group_create", "comms_group_delete", "comms_group_leave", "comms_cursor_get", "comms_who", "comms_channels", "comms_thread", "comms_status", "comms_history", "comms_channel_create"])
+      for (const n of ["comms_rename", "comms_token_create", "comms_token_list", "comms_token_revoke", "comms_group_create", "comms_group_delete", "comms_group_leave", "comms_cursor_get", "comms_who", "comms_channels", "comms_thread", "comms_status", "comms_history", "comms_channel_create", "comms_channel_delete"])
         expect(names).toContain(n);
       for (const t of tl.result.tools) expect(typeof t.description).toBe("string");
 

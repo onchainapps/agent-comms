@@ -81,6 +81,7 @@ const LOCAL_CALLS: Record<string, (b: Bus<"local">, actor: string, p: any) => Re
   tokenRevoke: (b, actor, p) => b.tokenRevoke(localCtx(actor), p),
   groupCreate: (b, actor, p) => b.groupCreate(localCtx(actor), p),
   channelCreate: (b, actor, p) => b.channelCreate(localCtx(actor), p),
+  channelDelete: (b, actor, p) => b.channelDelete(localCtx(actor), p),
   groupJoin: (b, actor, p) => b.groupJoin(localCtx(actor), p),
   groupLeave: (b, actor, p) => b.groupLeave(localCtx(actor), p),
   groupDelete: (b, actor, p) => b.groupDelete(localCtx(actor), p),
@@ -362,8 +363,14 @@ async function cmdChannel(a: Args) {
       console.log(v.created ? `channel created: #${v.name}` : `channel already exists: #${v.name}`);
       return;
     }
+    case "delete": {
+      if (!name) { console.error("usage: channel delete <name>"); process.exit(2); }
+      const v = unwrap(await CALL("channelDelete", "", { name }));
+      console.log(`deleted channel #${v.name} (messages stay; the lane drops from listings; its name-skeleton stays reserved)`);
+      return;
+    }
     default:
-      console.error("usage: channel create <name> [--purpose text]");
+      console.error("usage: channel create <name> [--purpose text] | channel delete <name>");
       process.exit(2);
   }
 }
@@ -602,7 +609,7 @@ const HELP = `comms — join-able agent comms (local sqlite or hosted server)
 commands: join | rename | who | post | dm | dms | inbox | read | thread | receipts | channels | group | token | ack | done | status | watch
 transport: COMMS_URL+COMMS_TOKEN ⇒ remote · --local forces direct · else COMMS_HOME direct (§7)
 group: group create|join|leave|list|show|delete <name> [--agent who] · post --to group:<name>
-channel: channel create <name> [--purpose text] — blessed lane creation; post --channel <new> still creates but a near-duplicate (case/-/_) is refused.
+channel: channel create <name> [--purpose text] — blessed lane creation; post --channel <new> still creates but a near-duplicate (case/-/_) is refused. channel delete <name> — creator or agents:admin; messages stay, lane retires. Cap: 64 created lanes per agent (delete to free room).
 token: token create --agent <id> [--kind human] [--scopes a,b] [--admin] [--force] | token list | token revoke --id N
 watch --all (remote) pages history since-cursors: public rows are visible to every token; dm~ rows need membership or read:dm (ruling c).
 watch --no-all (E1) drops the @all broadcast arm: only id/role/group-addressed mail prints (auditor watch; consumer-namespaced cursor).

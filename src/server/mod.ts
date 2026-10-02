@@ -34,7 +34,7 @@ export const LIMITS = {
   maxSessionsPerToken: 8,
 };
 
-const WRITE_METHODS = new Set(["join", "post", "status", "rename", "token.create", "token.revoke", "group.create", "group.join", "group.leave", "group.delete", "channel.create", "cursor.set", "login"]);
+const WRITE_METHODS = new Set(["join", "post", "status", "rename", "token.create", "token.revoke", "group.create", "group.join", "group.leave", "group.delete", "channel.create", "channel.delete", "cursor.set", "login"]);
 
 // §7 /raw filename gate: msg-<...>.md, no '/' (regex runs before any join).
 const FILE_RE = /^msg-[A-Za-z0-9._-]+\.md$/;
@@ -335,6 +335,7 @@ export function startServer(opts: ServerOpts): RunningServer {
       // grok E2 B1: pass params RAW (String() coercion here masked the local-vs-RPC
       // divergence — core now type-checks and answers usage on both transports).
       case "channel.create": return call(session.channelCreate({ name: p.name as string, purpose: p.purpose as string | undefined }));
+      case "channel.delete": return call(session.channelDelete({ name: p.name as string }));
       case "group.join": return call(session.groupJoin({ name: String(p.name ?? ""), agent: p.agent }));
       case "group.leave": return call(session.groupLeave({ name: String(p.name ?? ""), agent: p.agent }));
       case "group.delete": return call(session.groupDelete({ name: String(p.name ?? "") }));

@@ -32,6 +32,7 @@ export interface Session {
   tokenRevoke(p: { id: number }): Promise<Res<{ revoked: boolean }>>;
   groupCreate(p: { name: string; agent?: string }): Promise<Res<{ name: string; created: boolean }>>;
   channelCreate(p: { name: string; purpose?: string }): Promise<Res<{ name: string; created: boolean }>>;
+  channelDelete(p: { name: string }): Promise<Res<{ name: string; deleted: boolean }>>;
   groupJoin(p: { name: string; agent?: string }): Promise<Res<{ name: string; members: string[] }>>;
   groupLeave(p: { name: string; agent?: string }): Promise<Res<{ name: string; left: boolean }>>;
   groupDelete(p: { name: string }): Promise<Res<{ name: string; deleted: boolean }>>;
@@ -92,6 +93,7 @@ function wrapSessionImpl<M extends Mode>(bus: Bus<M>, ctx: Ctx<M>): Session {
     tokenRevoke: (p) => a(bus.tokenRevoke(c, p)),
     groupCreate: (p) => a(bus.groupCreate(c, p)),
     channelCreate: (p) => a(bus.channelCreate(c, p)),
+    channelDelete: (p) => a(bus.channelDelete(c, p)),
     groupJoin: (p) => a(bus.groupJoin(c, p)),
     groupLeave: (p) => a(bus.groupLeave(c, p)),
     groupDelete: (p) => a(bus.groupDelete(c, p)),
