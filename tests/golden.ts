@@ -123,10 +123,11 @@ function runScript(home: string): { transcript: any[]; files: Record<string, str
     const args = step.args.map((a) => (a === "@LAST" ? lastId : a === "@FIRST" ? firstId : a));
     const proc = Bun.spawnSync(["bun", CLI, ...args], {
       cwd: home,
-      // HERMETIC: strip remote-mode env — a shell-sourced COMMS_URL/COMMS_TOKEN
-      // must not silently repoint golden at a live server (E3-era incident:
-      // golden hit http://192.168.1.173 from an exported env and failed 3/3).
-      env: (() => { const e: Record<string, string | undefined> = { ...process.env, COMMS_HOME: home, COMMS_TEST_SEAMS: SEAMS }; delete e.COMMS_URL; delete e.COMMS_TOKEN; return e; })(),
+      // HERMETIC: strip remote-mode + identity env — a shell-sourced COMMS_URL/
+      // COMMS_TOKEN/COMMS_FINGERPRINT must not silently repoint or re-fp golden
+      // (E3-era incidents: sourced COMMS_URL hit the live server 3/3 fail;
+      // grok t_0288e2b9 probed a COMMS_FINGERPRINT mismatch at the join line).
+      env: (() => { const e: Record<string, string | undefined> = { ...process.env, COMMS_HOME: home, COMMS_TEST_SEAMS: SEAMS }; delete e.COMMS_URL; delete e.COMMS_TOKEN; delete e.COMMS_FINGERPRINT; return e; })(),
       stdin: "ignore",
     });
     const stdout = proc.stdout.toString();
