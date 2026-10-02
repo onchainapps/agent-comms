@@ -356,6 +356,8 @@ async function cmdChannel(a: Args) {
   const name = a.channel ?? a._pos?.[1];
   switch (sub) {
     case "create": {
+      // grok E2 B1: missing name = usage line + exit 2, not a TypeError.
+      if (!name) { console.error("usage: channel create <name> [--purpose text]"); process.exit(2); }
       const v = unwrap(await CALL("channelCreate", "", { name, ...(a.purpose ? { purpose: String(a.purpose) } : {}) }));
       console.log(v.created ? `channel created: #${v.name}` : `channel already exists: #${v.name}`);
       return;

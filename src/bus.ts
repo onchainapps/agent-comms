@@ -104,7 +104,10 @@ export const DM_RE = new RegExp(`^dm~(${ID_RE.source.slice(1, -1)})~(${ID_RE.sou
 export const DM_SHAPED_RE = /^dm~/;
 /** App G1: ONE helper for the write gate (post/preflight). Read filters do NOT
  *  widen (§9: regexes gate writes only). Name SHAPE is the authority for canSee. */
-export const validChannelName = (n: string) => ID_RE.test(n) || DM_RE.test(n);
+// grok E2 B1: typeof guard FIRST — ID_RE.test(12) ToString-coerces to "12" and
+// PASSES, so a non-string channel reached the DB bind and 500'd instead of
+// usage. The regex is not a type check.
+export const validChannelName = (n: string) => typeof n === "string" && (ID_RE.test(n) || DM_RE.test(n));
 /** App G1: canonical dm channel name — code-unit sort (NOT localeCompare:
  *  locales order -/_ differently), lo==hi rejected by the caller. */
 export function dmChannelName(a: string, b: string, suffix?: string): string {
@@ -516,13 +519,32 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
 
   function channelCreate(ctx: Ctx<M>, p: { name: string; purpose?: string }): Res<{ name: string; created: boolean }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
-    if (!ID_RE.test(p.name)) return { error: "usage", detail: `invalid channel name: ${p.name} (ID_RE; ':' and '~' excluded)` };
+    // grok E2 B1/B2: typeof BEFORE regex — ID_RE.test(12) ToString-coerces and
+    // PASSES, then chanNorm/bind throw (TypeError / 500). Both must be usage.
+    if (typeof p.name !== "string" || !ID_RE.test(p.name))
+      return { error: "usage", detail: `invalid channel name: ${p.name} (ID_RE; ':' and '~' excluded)` };
+    if (p.purpose !== undefined && typeof p.purpose !== "string")
+      return { error: "usage", detail: `purpose must be a string (got ${typeof p.purpose})` };
     if (d.query("SELECT 1 FROM channels WHERE name=?").get(p.name)) return { value: { name: p.name, created: false } };
-    const dup = channelDup(p.name);
-    if (dup) return { error: "usage", detail: `channel '${p.name}' already exists as '${dup}' (near-duplicate — post to the existing name, or choose a distinct one)` };
-    d.run("INSERT INTO channels(name,purpose,created_at,created_by) VALUES(?,?,?,?)",
-      [p.name, p.purpose ?? "", nowIso(), ctx.principal.agentId]);
-    return { value: { name: p.name, created: true } };
+    // grok E2 m-tx: check+insert in ONE txn (house pattern, groupEnsure) — the
+    // window is unreachable under the single-writer server but two local
+    // processes could both pass the scan pre-INSERT.
+    try {
+      d.exec("BEGIN IMMEDIATE");
+      try {
+        if (d.query("SELECT 1 FROM channels WHERE name=?").get(p.name)) { d.exec("COMMIT"); return { value: { name: p.name, created: false } }; }
+        const dup = channelDup(p.name);
+        if (dup) { d.exec("ROLLBACK"); return { error: "usage", detail: `channel '${p.name}' already exists as '${dup}' (near-duplicate — post to the existing name, or choose a distinct one)` }; }
+        d.run("INSERT INTO channels(name,purpose,created_at,created_by) VALUES(?,?,?,?)",
+          [p.name, p.purpose ?? "", nowIso(), ctx.principal.agentId]);
+        d.exec("COMMIT");
+      } catch (e) { d.exec("ROLLBACK"); throw e; }
+      return { value: { name: p.name, created: true } };
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      if (msg.includes("SQLITE_BUSY")) return { error: "contention", detail: "busy" };
+      return { error: "internal", detail: `channelCreate: ${msg}` };
+    }
   }
 
   const roleOf = (agent: string): string | null =>

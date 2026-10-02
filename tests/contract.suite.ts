@@ -128,6 +128,15 @@ export function contractSuite(name: string, make: Factory) {
           expect(names).not.toContain(v);
         }
         expect((await root.channelCreate({ name: "WildWestGame" })).error).toBe("usage");
+        expect((await root.channelCreate({ name: "a:b" })).error).toBe("usage"); // ':' unpinned before (grok E2)
+
+        // grok E2 B1/B2: the regex is not a type check — ID_RE.test(12) ToString-
+        // coerces to "12" and PASSES, then chanNorm/bind threw (TypeError local,
+        // HTTP 500 on purpose). Both transports must now answer usage.
+        expect((await root.channelCreate({ name: 12 as any })).error).toBe("usage");
+        expect((await root.channelCreate({ name: undefined as any })).error).toBe("usage");
+        expect((await root.channelCreate({ name: "e2-typed", purpose: 12 as any })).error).toBe("usage");
+        expect((await root.post({ from: "root", to: "@all", type: "note", body: "x", channel: 12 as any })).error).toBe("usage");
 
         // post to an unknown channel still auto-creates — but THROUGH the guard.
         const typo = await root.post({ from: "root", to: "@all", type: "note", body: "x", channel: "wild-west-game" });

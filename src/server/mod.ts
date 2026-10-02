@@ -332,7 +332,9 @@ export function startServer(opts: ServerOpts): RunningServer {
       case "token.list": return call(session.tokenList());
       case "token.revoke": return call(session.tokenRevoke({ id: Number(p.id) }));
       case "group.create": return call(session.groupCreate({ name: String(p.name ?? ""), agent: p.agent }));
-      case "channel.create": return call(session.channelCreate({ name: String(p.name ?? ""), purpose: p.purpose }));
+      // grok E2 B1: pass params RAW (String() coercion here masked the local-vs-RPC
+      // divergence — core now type-checks and answers usage on both transports).
+      case "channel.create": return call(session.channelCreate({ name: p.name as string, purpose: p.purpose as string | undefined }));
       case "group.join": return call(session.groupJoin({ name: String(p.name ?? ""), agent: p.agent }));
       case "group.leave": return call(session.groupLeave({ name: String(p.name ?? ""), agent: p.agent }));
       case "group.delete": return call(session.groupDelete({ name: String(p.name ?? "") }));
