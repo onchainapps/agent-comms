@@ -106,7 +106,7 @@ async function waitLoop(a: Record<string, any>, signal: AbortSignal): Promise<Ou
   let since: string | undefined = a.since;
   const seqOf = (c?: string) => (c ? Number(c.slice(c.lastIndexOf(".") + 1)) : null);
   for (;;) {
-    const r = await call("inbox.wait", clean({ consumer, since }), signal);
+    const r = await call("inbox.wait", clean({ consumer, since, noAll: a.noAll }), signal);
     if (r.error === "resync" && a.since === undefined) {
       // §6 recovery commit (the CLI watch does exactly this): everything
       // below the floor is gone; resume from the retained floor. Only on the
@@ -158,10 +158,10 @@ const TOOLS: Record<string, Tool> = {
     call: (a, s) => exec("post", clean({ ...a, idempotencyKey: a.idempotencyKey ?? `mcp:${crypto.randomUUID()}` }), s),
   },
   comms_inbox: {
-    desc: "List the caller's inbox, NEWEST `limit` rows (default 50) plus total/truncated — filter with unread/open/channel rather than raising limit. mark=true (default false — peek) marks EVERY matching row read server-side, so it disables truncation: combine it with unread/channel filters.",
+    desc: "List the caller's inbox, NEWEST `limit` rows (default 50) plus total/truncated — filter with unread/open/channel rather than raising limit. mark=true (default false — peek) marks EVERY matching row read server-side, so it disables truncation: combine it with unread/channel filters. noAll=true (E1) drops the @all broadcast arm from delivery — only id/role/group-addressed rows (auditor view; does NOT change ack permission).",
     schema: {
       type: "object",
-      properties: { open: { type: "boolean" }, unread: { type: "boolean" }, channel: { type: "string" }, mark: { type: "boolean" }, limit: { type: "integer", minimum: 1, maximum: 500 } },
+      properties: { open: { type: "boolean" }, unread: { type: "boolean" }, channel: { type: "string" }, mark: { type: "boolean" }, noAll: { type: "boolean" }, limit: { type: "integer", minimum: 1, maximum: 500 } },
       additionalProperties: false,
     },
     call: async (a, s) => {
@@ -214,8 +214,8 @@ const TOOLS: Record<string, Tool> = {
     call: (a, s) => exec("history", clean(a), s),
   },
   comms_wait: {
-    desc: "Block up to `timeout` s (default 30, ≤50 so the reply beats a 60 s client request timeout) until messages addressed to this agent arrive: {messages, cursor}. At-least-once: NOTHING is committed — after processing, call comms_cursor_set(cursor); an empty result's cursor is safe to commit too (it skips scanned noise). since defaults from the stored cursor for (this agent, consumer). If the stored cursor is stale (epoch rotated / below retention) the adapter performs the §6 recovery commit itself and returns resynced:true.",
-    schema: { type: "object", properties: { consumer: { type: "string", pattern: CONSUMER_PAT, description: "durable-cursor lane, default 'mcp'" }, since: { type: "string", pattern: CURSOR_PAT }, timeout: { type: "number", minimum: 0, maximum: 50, description: "seconds, default 30; 0 = one non-blocking step" } }, additionalProperties: false },
+    desc: "Block up to `timeout` s (default 30, ≤50 so the reply beats a 60 s client request timeout) until messages addressed to this agent arrive: {messages, cursor}. At-least-once: NOTHING is committed — after processing, call comms_cursor_set(cursor); an empty result's cursor is safe to commit too (it skips scanned noise). since defaults from the stored cursor for (this agent, consumer). If the stored cursor is stale (epoch rotated / below retention) the adapter performs the §6 recovery commit itself and returns resynced:true. noAll=true (E1) drops the @all broadcast arm — use a DISTINCT consumer (e.g. 'mcp.noall') so the two predicates never share a cursor row.",
+    schema: { type: "object", properties: { consumer: { type: "string", pattern: CONSUMER_PAT, description: "durable-cursor lane, default 'mcp'" }, since: { type: "string", pattern: CURSOR_PAT }, timeout: { type: "number", minimum: 0, maximum: 50, description: "seconds, default 30; 0 = one non-blocking step" }, noAll: { type: "boolean" } }, additionalProperties: false },
     // grok M5 #1 + claude B1: server inbox.wait is ONE non-blocking waitStep;
     // the long-poll is THIS adapter's job (claude's waitLoop supersedes the
     // earlier 500 ms loop: full 500-event pages re-step without sleeping, live

@@ -212,7 +212,7 @@ interface ServerOnly {
   // a Ctx<"local"> slip back in (probe-verified).
   joinAgent: (ctx: Ctx<"server">, p: { agent: string; role: string; caps?: string; fingerprint?: string | null }) => Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number }>;
   post: (ctx: Ctx<"server">, p: { from: string; to: string; type: string; subject?: string; body: string; thread?: string | null; re?: string | null; tags?: string; channel?: string | null; as?: string | null; idempotencyKey?: string | null; dm?: string | null }) => Res<{ id: string; channel: string; thread: string; file: string }>;
-  inbox: (ctx: Ctx<"server">, p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean }) => Res<{ rows: MsgRow[]; unreadIds: Set<string> }>;
+  inbox: (ctx: Ctx<"server">, p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean; noAll?: boolean }) => Res<{ rows: MsgRow[]; unreadIds: Set<string> }>;
   read: (ctx: Ctx<"server">, p: { agent: string; id: string }) => Res<MsgRow & { receipts: Receipts }>;
   threadOf: (ctx: Ctx<"server">, id: string) => Res<{ rows: MsgRow[]; receipts: Receipts[] }>;
   receipts: (ctx: Ctx<"server">, id: string) => Res<MsgRow & { receipts: Receipts }>;
@@ -220,7 +220,7 @@ interface ServerOnly {
   channels: (ctx: Ctx<"server">) => Res<{ name: string; n: number; last: string | null; purpose: string | null }[]>;
   rename: (ctx: Ctx<"server">, p: { agent: string; to: string; fingerprint?: string | null }) => Res<{ announced: MsgRow }>;
   history: (ctx: Ctx<"server">, p: { channel?: string | null; limit?: number; since?: string }) => Res<{ rows: MsgRow[]; hasMore: boolean; cursor: string }>;
-  waitStep: (ctx: Ctx<"server">, p: { for?: string; consumer?: string; since?: string }) => Res<{ messages: MsgRow[]; cursor: string; done: boolean }>;
+  waitStep: (ctx: Ctx<"server">, p: { for?: string; consumer?: string; since?: string; noAll?: boolean }) => Res<{ messages: MsgRow[]; cursor: string; done: boolean }>;
   tokenCreate: (ctx: Ctx<"server">, p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean }) => Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string }>;
   tokenList: (ctx: Ctx<"server">) => Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; created_at: string; last_used: string; revoked_at: string | null }[] }>;
   tokenRevoke: (ctx: Ctx<"server">, p: { id: number }) => Res<{ revoked: boolean }>;
