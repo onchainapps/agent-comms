@@ -709,7 +709,9 @@ comparison** (not `localeCompare`: locales order `-`/`_` differently), `lo == hi
 creation collision after id-reuse. `~` is not in `ID_RE` ⇒ split unambiguous. Channel
 validation widens to `ID_RE || DM_RE` via ONE helper used by `post()` (the write gate) and
 `preflight()` (else every DM is flagged bad); the public-lane ensure core (written
-`ensureChannel`, `channelEnsureInTxn` since E2.x) stays policy-free. Read
+`ensureChannel`, `channelEnsureInTxn` since E2.x) stays ACCESS-policy-free (no
+dm/membership gate — claude t_9e2bdf8e NIT-A); the near-dup guard and the cap it
+carries are lane-lifecycle rules shared by both creation paths, not access policy. Read
 filters (history/inbox/watch) do NOT widen (§9 gates writes only). DM names are up to 73
 chars (`3 + 32 + 1 + 32 + 5` suffix) — no ≤64 channel-length assumption exists anywhere in
 the schema, indexes, or mirror paths (claude m1). `--dm <peer>` sugar ⇒

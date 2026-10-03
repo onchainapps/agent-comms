@@ -2087,7 +2087,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     joinAgent, listAgents, post, inbox, read, threadOf, receipts, setStatus, channels, rename,
     tokenCreate, tokenVerify, tokenById, tokenList, tokenRevoke, tokenTouch,
     cursorGet, cursorSet, history, waitStep, tailEvents, eventsHighWater, epoch, gcFloor, rotateEpoch, gc, preflight,
-    allMessages, allMessageIds, messageById, messageByFile, channelEnsureInTxn,
+    allMessages, allMessageIds, messageById, messageByFile,
     groupCreate, groupJoin, groupLeave, groupDelete, groupList, groupShow, channelCreate, channelDelete,
     canSeeChannel, membershipsOf, deliveredMsgIds, dmMembers, dmMembersFor, dmChannelForPair,
     isActive, recipientsMatch, roleOf, receiptsForMsg, renderMd, touch, close,
