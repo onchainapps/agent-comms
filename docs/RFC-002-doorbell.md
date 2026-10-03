@@ -104,30 +104,55 @@ deleted; idle cost drops to zero; wake latency drops from minutes to ~sub-second
 - **N3** (only if N1/N2 prove out): in-server dispatcher sharing the SSE tailer (removes the
   per-subscription waitStep fan-out).
 
-## 7. N1 landed (DRAFT-AS-BUILT delta, commit TBD by review)
+## 7. N1 as-built — verdict-folded (claude t_20f2527a + grok t_8bf95e6e, comments 85/86)
 
-`bin/notifier.ts` + `tests/notifier.test.ts` implement N1 ahead of verdicts — N1 touches
-zero core/server code, so verdicts can still redirect N2/N3 without rework. Deltas from the
-draft body above, all discovered while building:
+Both verdicts: APPROVE direction, REQUEST_CHANGES on the draft. Folded into the N1
+implementation (`bin/notifier.ts`, `tests/notifier.test.ts`) — N1 touches zero
+core/server code, so nothing else moves. Deltas from §§1–6 as written:
 
-- **`inbox.wait` `done` is NOT the drain signal** (`done = messages.length > 0`, §6 core):
-  the drain loop follows the CLI watch rule — advance ⇒ keep draining without sleeping
-  (claude M3 B1 lineage). Empty-burst advances commit immediately (livelock guard).
-- **Consumer namespace `notify.<name>`** (dot, not colon — `:` is outside CONSUMER_RE).
-- **Baseline pass**: a fresh consumer (cursor `{epoch,0}`) commits its scan position WITHOUT
-  firing hooks — a first start never doorbells the retained history (live-verified on .173:
-  26 retained msgs skipped, zero hooks).
-- **dm~ skip is client-side per sub** (`dmDoorbells: false` default) — the server predicate
-  is unchanged; the notifier just doesn't ring for lanes it can't name safely (Q3).
-- **exec hook = argv, no shell**; burst rides stdin as one JSON line; counts via
-  `COMMS_DOORBELL_COUNT` env (Q4 rule: message bytes never reach argv).
-- **Coalesce**: window flush at `coalesceMs` (default 5 s), forced at 50 msgs or 20 s age,
-  and a `--once` run always drains-and-flushes (no window wait for cron-shaped use).
-- **At-least-once pinned**: hook failure holds the cursor; the retry re-derives the same
-  burst from the stored cursor (id-keyed ⇒ dup, never loss). Test: sink 500s once ⇒ same id
-  delivered twice, cursor monotone after success.
+- **Topology (claude MAJOR-1)**: the notifier runs on the SINK host (gateway binds
+  127.0.0.1:8642 on the workstation; exec/tmux hooks must be local). RPC-only, never
+  local-direct (§9). **N3 struck** — in-server dispatch was a strawman debate; SSE-kick
+  optimization may return later but is not a milestone.
+- **Payoff is latency, not inference (claude MAJOR-2)**: all fleet watchers are monitor
+  hash-gated (no LLM turn when unchanged). Crons are NOT deleted — they relax to a
+  10–15 min fallback sweep so "doorbell loss = latency only" stays TRUE.
+- **Head init + resync (claude MAJOR-3)**: a fresh consumer drains to head WITHOUT
+  firing (retained history is context, not news). Resync = force-commit to floor, scan
+  to head without replay, then exactly ONE `{event:"comms.resync", messages:[]}` ring —
+  the sink sweeps via pull. Pinned against a live rotateEpoch().
+- **Wake adapter (claude MAJOR-4)**: Hermes sinks should use gateway `cron_job` routes
+  with `--route-profile` pointing at the EXISTING watcher jobs (at-most-once claim,
+  tuned prompts, X-Request-ID idempotency, HMAC V2) — not fresh `--prompt` runs. Two
+  live-gateway verifications are still OPEN (see §8). Exec hooks stay the fallback for
+  gateway-less hosts.
+- **Own-token default (claude Q3)**: each sub runs under the RECIPIENT's own token when
+  configured (`cfg.token` = fallback; then for≠self needs read:all, server-gated and
+  pinned). No privileged scope in the common path ⇒ dm~ doorbells just work
+  (`dmDoorbells:false` opts out); read:all-as-omniview is rejected. Method surface the
+  notifier uses: cursorGet / cursorSet / inbox.wait only.
+- **Rate doctrine (claude Q5)**: wakes, not POSTs. Leading edge (first ring of a quiet
+  period, bucket permitting) + ONE trailing coalesced ring at window end (default 60 s
+  ≥ run length). Per-sub WakeBucket: 3 burst, refill 1/2min — steady state equals the
+  cron it relaxes. `--once` bypasses bucket+window (cron-shaped drain).
+- **Per-sub waitStep, server predicate (grok Q2)**: no client-side addressed predicate
+  (no third `recipientsMatch`; SSE frames carry no recipients; maxStreamsPerToken=2
+  forecloses N streams). `inbox.wait` is NOT a long-poll (timeout ignored — probed):
+  loop polls ≥1s, re-steps immediately only on a ≥500-event page jump.
+- **Consumer key `notify.<name>[.noall]`** (grok pin 1 + E1 rule): `:` is outside
+  CONSUMER_RE; the predicate variant MUST namespace the cursor row. Pinned.
+- **exec hook (grok pin 6)**: static argv, NO shell, burst on stdin as one JSON line,
+  counts via COMMS_DOORBELL_* env. Config is operator-owned — not "0600 root", just
+  operator-trust like systemd ExecStart.
+- **Commit discipline (grok pin 4)**: cursor advances ONLY after hook success; a held
+  burst (failed hook or empty bucket) never lets the commit pass un-hooked matches;
+  empty-burst advances commit anyway (livelock guard, claude M3 B1 lineage).
 
-Cron retirement + gateway webhook enablement are deliberately NOT done yet: the gateway
-webhook platform is disabled on the multiplexer (needs `hermes gateway setup` or config —
-operator call), and grok's 2-min cron is his review-loop wake — swapping it mid-review is
-his and mike's decision, not a side effect of a commit.
+## 8. Open before fleet rollout (not code blockers)
+
+- (v1) Does a webhook-fired gateway run pass the monitor hash gate? If not, coalesce
+  windows must exceed run length harder (bucket already bounds storms).
+- (v2) A doorbell arriving during a held cron claim is dropped ⇒ the trailing ring +
+  fallback cron cover it; confirm the cron_job route's at-most-once semantics live.
+- Enable the webhook platform on the multiplexer (operator), then wire one watcher
+  end-to-end (grok's, as pilot) before touching the others.

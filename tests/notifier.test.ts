@@ -1,10 +1,12 @@
 /**
- * RFC-002 N1 notifier tests: doorbell semantics against a live server-mode
- * core (serverHandle session — same Session surface RpcBus reconstructs).
- * Pins: pointer-only payload (no body/file), baseline-no-storm, at-least-once
- * on hook failure (cursor held, dup-on-retry not loss), idempotent rescan,
- * dm~ default-off, coalesce into ONE call, empty-burst livelock commit,
- * exec hook argv+stdin shape, read:all gate for for≠self.
+ * RFC-002 N1 notifier tests (verdict-folded): doorbell semantics against a live
+ * server-mode core (serverHandle session — same Session surface RpcBus builds).
+ * Pins: pointer-only payload (no body/file), head-init (no history storm),
+ * at-least-once on hook failure (cursor held, dup-on-retry not loss), idempotent
+ * rescan, dm~ rings under the own-token default (dmDoorbells:false skips),
+ * drain coalesces into ONE call, empty-burst livelock commit, exec hook
+ * argv+stdin shape, read:all gate for for≠self, noAll consumer-key namespacing,
+ * resync = head scan + exactly ONE comms.resync ring, WakeBucket math.
  */
 import { expect, describe, test } from "bun:test";
 import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
@@ -12,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openBus, localCtx } from "../src/bus.ts";
 import { serverHandle, seedAgent, type Session } from "../src/bus-iface.ts";
-import { runSub, type Sub } from "../bin/notifier.ts";
+import { runSub, WakeBucket, type Sub } from "../bin/notifier.ts";
 
 function tmp() { return mkdtempSync(join(tmpdir(), "comms-nbf-")); }
 
@@ -111,21 +113,26 @@ describe("RFC-002 notifier (N1)", () => {
     } finally { core.close(); rmSync(home, { recursive: true, force: true }); }
   });
 
-  test("dm~ lanes never doorbell by default; dmDoorbells opts in", async () => {
+  test("dm~ rings under the own-token default; dmDoorbells:false skips", async () => {
     const { home, core, root, sender, reader } = await harness();
     try {
+      // own-token premise (claude Q3): the recipient's own token sees dm~ rows,
+      // so the default RINGS for them. Opt-out is explicit.
+      const sub: Sub = { name: "t4", for: "nbf-reader", hook: { kind: "http", url: "http://127.0.0.1:1/x" }, coalesceMs: 200 };
       const s = sink();
-      const sub: Sub = { name: "t4", for: "nbf-reader", hook: { kind: "http", url: s.url }, coalesceMs: 200 };
-      await runSub(reader, sub, { once: true });
+      sub.hook = { kind: "http", url: s.url };
+      await runSub(reader, sub, { once: true }); // head init
       await sender.post({ from: "nbf-sender", to: "nbf-reader", type: "note", body: "dm one", dm: "nbf-reader" });
       await runSub(reader, sub, { once: true });
-      expect(s.bursts.length).toBe(0);
-      const sub2: Sub = { ...sub, name: "t4b", dmDoorbells: true };
-      await runSub(reader, sub2, { once: true }); // baseline for the new consumer
-      await sender.post({ from: "nbf-sender", to: "nbf-reader", type: "note", body: "dm two", dm: "nbf-reader" });
-      await runSub(reader, sub2, { once: true });
       expect(s.bursts.length).toBe(1);
       expect(s.bursts[0].messages[0].channel).toMatch(/^dm~/);
+      const sub2: Sub = { ...sub, name: "t4b", dmDoorbells: false };
+      const s2 = sink();
+      sub2.hook = { kind: "http", url: s2.url };
+      await runSub(reader, sub2, { once: true }); // head init for the new consumer
+      await sender.post({ from: "nbf-sender", to: "nbf-reader", type: "note", body: "dm two", dm: "nbf-reader" });
+      await runSub(reader, sub2, { once: true });
+      expect(s2.bursts.length).toBe(0);
     } finally { core.close(); rmSync(home, { recursive: true, force: true }); }
   });
 
@@ -171,9 +178,65 @@ describe("RFC-002 notifier (N1)", () => {
       for (let i = 0; i < 60; i++) await other.post({ from: "nbf-other", to: "nbf-other", type: "note", body: "not for reader" });
       await runSub(reader, sub, { once: true });
       expect(s.bursts.length).toBe(0);
-      const c = await reader.cursorGet({ consumer: "notify.t7" });
-      expect(((c as any).value as any).seq).toBeGreaterThan(0); // scan advanced despite zero matches
+      const c = ((await reader.cursorGet({ consumer: "notify.t7" })) as any).value;
+      expect(c.seq).toBeGreaterThan(0); // scan advanced despite zero matches
       s.close();
     } finally { core.close(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("noAll predicate namespaces the consumer key (E1 rule)", async () => {
+    const { home, h, core, root, sender, reader } = await harness();
+    try {
+      const s = sink();
+      const sub: Sub = { name: "t8", for: "nbf-reader", noAll: true, hook: { kind: "http", url: s.url }, coalesceMs: 200 };
+      await runSub(reader, sub, { once: true }); // head init
+      await sender.post({ from: "nbf-sender", to: "nbf-reader", type: "note", body: "direct" });
+      await sender.post({ from: "nbf-sender", to: "@all", type: "announce", body: "broadcast" });
+      await runSub(reader, sub, { once: true });
+      expect(s.bursts.length).toBe(1);
+      expect(s.bursts[0].messages.length).toBe(1); // @all arm dropped
+      // cursor landed on the NAMESPACED row, not notify.t8
+      const c = ((await reader.cursorGet({ consumer: "notify.t8.noall" })) as any).value;
+      expect(c.seq).toBeGreaterThan(0);
+      const plain = ((await reader.cursorGet({ consumer: "notify.t8" })) as any).value;
+      expect(plain.seq).toBe(0);
+      s.close();
+    } finally { core.close(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("epoch rotation ⇒ head scan + exactly ONE comms.resync ring (no replay)", async () => {
+    const { home, core, root, sender, reader } = await harness();
+    try {
+      const s = sink();
+      const sub: Sub = { name: "t9", for: "nbf-reader", hook: { kind: "http", url: s.url }, coalesceMs: 200 };
+      await runSub(reader, sub, { once: true }); // head init
+      await sender.post({ from: "nbf-sender", to: "nbf-reader", type: "note", body: "before rotation" });
+      await runSub(reader, sub, { once: true }); // ring it, commit on old epoch
+      expect(s.bursts.length).toBe(1);
+      (core as any).rotateEpoch();
+      await sender.post({ from: "nbf-sender", to: "nbf-reader", type: "note", body: "after rotation" });
+      await runSub(reader, sub, { once: true });
+      const events = s.bursts.map((b) => b.event);
+      expect(events.filter((e) => e === "comms.resync").length).toBe(1); // ONE ring
+      expect(events.filter((e) => e === "comms.mail").length).toBe(1);   // MAJOR-3: head scan does NOT replay
+      const resyncRing = s.bursts.find((b) => b.event === "comms.resync");
+      expect(resyncRing.messages.length).toBe(0);                        // pointer to "sweep me", not N rings
+      const c = ((await reader.cursorGet({ consumer: "notify.t9" })) as any).value;
+      expect(c.seq).toBeGreaterThan(0);                                  // committed at head on the new epoch
+      s.close();
+    } finally { core.close(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("WakeBucket: 3 burst, refill 1/2min, cap at burst", () => {
+    const b = new WakeBucket(3, 120_000);
+    const t0 = Date.now();
+    expect(b.take(t0)).toBe(true); expect(b.take(t0)).toBe(true); expect(b.take(t0)).toBe(true);
+    expect(b.take(t0)).toBe(false);                       // budget spent
+    expect(b.take(t0 + 119_000)).toBe(false);             // partial refill does not tick early
+    expect(b.take(t0 + 120_000)).toBe(true);              // one token after 2 min
+    expect(b.take(t0 + 600_000)).toBe(true);              // refill capped at 3, not 4
+    expect(b.take(t0 + 600_001)).toBe(true);
+    expect(b.take(t0 + 600_002)).toBe(true);
+    expect(b.take(t0 + 600_003)).toBe(false);             // cap honored
   });
 });
