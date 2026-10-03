@@ -5,6 +5,18 @@
  * persisted to localStorage ONLY by the opt-in "remember" checkbox — default
  * stays never-store), live frames arrive on EventSource /stream.
  *
+ * UI/UX fold (mike: "hard to look at and use"): wire behavior and the security
+ * contract are unchanged (tests/ui.test.ts pins them); this revision reworks
+ * the SHELL — compact auto-growing composer with Ctrl+Enter, client-side
+ * filter (text / sender: / type: / #chan / open) + unread-only toggle,
+ * per-channel unread badges driven by ONE inbox(unread) call per refresh,
+ * opening a lane marks it read via inbox(mark:true) — the same deliberate-read
+ * rule the thread toggle always applied and the same marking verb the CLI
+ * uses; receipts/hydrate stay non-marking (claude M4 B2). Relative timestamps
+ * with day separators, monogram avatars, type/status pills, receipts folded
+ * behind <details>, presence collapsed, hover-revealed message ops, empty
+ * sections hidden.
+ *
  * Security notes (pinned by tests/ui.test.ts):
  * - Bus data is rendered with textContent/createElement ONLY — no innerHTML
  *   interpolation of untrusted strings (XSS via message body would otherwise
@@ -26,118 +38,217 @@ export const UI_HTML = /* html */ `<!doctype html>
 <title>agent comms</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%2322c55e'/></svg>">
 <style>
-  :root{--bg:#0f1115;--panel:#171a21;--line:#2a2f3a;--fg:#dfe3ea;--dim:#8b93a3;--acc:#5aa7ff;--ok:#3fbf7f;--warn:#e0a63f;--err:#e0605f;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+  :root{--bg:#0b0e14;--bg2:#0e1220;--panel:#151b2b;--panel2:#1a2338;--line:#232d47;--dim:#97a3c0;--dim2:#7d89a9;--fg:#dfe6f3;--acc:#5b8cff;--acc2:#2f4f9e;--ok:#3fd68f;--warn:#e0a63f;--err:#e0605f;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif}
-  a{color:var(--acc)}
-  button,select,input,textarea{font:inherit;background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 10px}
+  html,body{height:100%;margin:0}
+  body{background:var(--bg);color:var(--fg);font:13.5px/1.55 system-ui,sans-serif}
+  a{color:var(--acc);cursor:pointer;text-decoration:none}
+  button,select,input,textarea{font:inherit;background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:7px;padding:5px 10px}
   button{cursor:pointer}button:hover{border-color:var(--acc)}
-  button.mini{padding:2px 8px;font-size:12px}
+  button:disabled{opacity:.45;cursor:default}
+  button.mini{padding:1px 8px;font-size:11.5px;border-radius:5px}
   input,textarea{min-width:0}
-  textarea{width:100%;resize:vertical;min-height:64px}
-  #login{max-width:380px;margin:14vh auto;padding:24px;background:var(--panel);border:1px solid var(--line);border-radius:10px}
-  #login h1{font-size:18px;margin:0 0 4px}
-  #login p{color:var(--dim);margin:0 0 16px}
-  #login input{width:100%;font-family:var(--mono);margin:8px 0}
-  #app{display:none;grid-template-columns:250px 1fr;grid-template-rows:44px 1fr;height:100vh}
+  input:focus,textarea:focus,select:focus{outline:1px solid var(--acc2)}
+  textarea{width:100%;resize:none;min-height:38px;max-height:160px;line-height:1.5}
+  ::-webkit-scrollbar{width:9px;height:9px}
+  ::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px}
+  ::-webkit-scrollbar-track{background:transparent}
+  code{background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-family:var(--mono);font-size:12px}
+  .hidden{display:none!important}
+  /* ---- login ---- */
+  #login{max-width:400px;margin:16vh auto;padding:26px 28px;background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:0 14px 44px rgba(0,0,0,.5)}
+  #login h1{font-size:19px;margin:0 0 4px;letter-spacing:.3px}
+  #login p{color:var(--dim);margin:0 0 14px;font-size:13px}
+  #login input[type=password]{width:100%;font-family:var(--mono);margin:6px 0;padding:9px 11px}
+  #login button{width:100%;margin-top:8px;padding:9px;background:var(--acc2);border-color:var(--acc);font-weight:600}
+  #lerr{color:var(--err);margin-top:10px;white-space:pre-wrap;font-size:12.5px}
+  /* ---- app frame ---- */
+  #app{display:none;grid-template-columns:236px 1fr;grid-template-rows:46px 1fr;height:100vh}
   #app.on{display:grid}
-  header{grid-column:1/3;display:flex;align-items:center;gap:12px;padding:0 14px;border-bottom:1px solid var(--line);background:var(--panel)}
-  header b{color:var(--acc)}
+  header{grid-column:1/3;display:flex;align-items:center;gap:12px;padding:0 14px;border-bottom:1px solid var(--line);background:var(--bg2)}
+  header .logo{font-weight:700;color:var(--acc);letter-spacing:.4px}
+  header b{color:var(--acc);font-family:var(--mono);font-size:13px}
   header .scopes{color:var(--dim);font-family:var(--mono);font-size:12px}
   header .sp{flex:1}
+  header .adm{color:var(--warn);font-size:12px}
+  .tab{background:transparent;border:1px solid transparent;color:var(--dim);border-radius:7px;padding:3px 12px}
+  .tab.on{background:var(--panel);border-color:var(--line);color:var(--fg)}
+  /* ---- nav rail ---- */
+  nav{border-right:1px solid var(--line);background:var(--bg2);overflow-y:auto;padding:8px;display:flex;flex-direction:column;min-height:0}
+  #chanhdr,#dmhdr{font-size:10.5px;text-transform:uppercase;letter-spacing:.12em;color:var(--dim2);margin:12px 6px 4px}
+  nav .chan{display:flex;align-items:center;gap:6px;width:100%;text-align:left;margin:1px 0;padding:5px 9px;border:1px solid transparent;border-radius:7px;background:none;color:var(--dim);white-space:nowrap;overflow:hidden}
+  nav .chan:hover{background:var(--panel)}
+  nav .chan.on{background:var(--panel2);color:var(--fg);border-color:var(--line)}
+  nav .chan .nm{flex:1;overflow:hidden;text-overflow:ellipsis}
+  nav .chan .dmk{font-size:9px;border:1px solid var(--line);border-radius:4px;padding:0 4px;color:var(--dim2)}
+  nav .n{color:var(--dim2);font-size:11px;font-family:var(--mono)}
+  .badge{background:var(--acc);color:#fff;border-radius:9px;font:700 10.5px var(--mono);padding:0 6px;min-width:16px;text-align:center}
+  #filtwrap{display:flex;flex-direction:column;gap:6px;padding:2px 2px 8px;border-bottom:1px solid var(--line);margin-bottom:4px}
+  #filt{width:100%;font-size:12.5px;padding:6px 9px}
+  #unrol{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dim);cursor:pointer;padding:0 2px}
+  #unrol input{margin:0;accent-color:var(--acc)}
+  #railfoot{margin-top:auto;border-top:1px solid var(--line);padding-top:8px;display:flex;flex-direction:column;gap:6px}
+  details.pres summary{color:var(--dim2);font-size:11.5px;cursor:pointer;list-style:none;padding:2px 6px}
+  details.pres summary::-webkit-details-marker{display:none}
+  details.pres summary::before{content:"▸ "}
+  details.pres[open] summary::before{content:"▾ "}
+  .pres .ag{display:block;padding:2px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;color:var(--dim2);font-family:var(--mono)}
+  .pres .on{color:var(--ok)}
+  /* ---- main column ---- */
+  main{overflow:hidden;padding:0;display:flex;flex-direction:column;min-height:0}
+  #panehead{display:flex;align-items:center;gap:10px;padding:7px 16px;border-bottom:1px solid var(--line);background:var(--bg2);flex:none;min-height:34px}
+  #panehead .ttl{font-weight:600;font-size:14px}
+  #panehead .sub{color:var(--dim2);font-size:12px;font-family:var(--mono)}
+  #panehead .sp{flex:1}
+  #pane{flex:1;overflow-y:auto;padding:12px 16px;display:flex;flex-direction:column;gap:8px;min-height:0}
+  .day{align-self:center;color:var(--dim2);font-size:11px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:0 12px;font-family:var(--mono)}
+  .empty{color:var(--dim2);font-style:italic;padding:24px;text-align:center}
+  /* ---- messages ---- */
+  .msg{display:flex;gap:10px;max-width:980px;animation:in .15s ease}
+  @keyframes in{from{opacity:0;transform:translateY(2px)}to{opacity:1}}
+  .monoid{flex:none;width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;font:700 10.5px var(--mono);color:#e8edf7;letter-spacing:.5px;margin-top:2px}
+  .mcol{min-width:0;flex:1}
+  .msg .hd{display:flex;gap:7px;align-items:baseline;flex-wrap:wrap}
   .msg .hd .sphdr{flex:1}
-  nav{border-right:1px solid var(--line);background:var(--panel);overflow-y:auto;padding:10px}
-  nav h3{font-size:11px;text-transform:uppercase;color:var(--dim);margin:12px 0 6px}
-  nav .tab,nav .chan{display:block;width:100%;text-align:left;margin:2px 0;padding:5px 8px;border:0;border-radius:6px;background:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  nav .tab.on,nav .chan.on{background:var(--line)}
-  nav .n{color:var(--dim);float:right}
-  main{overflow-y:auto;padding:14px 18px;display:flex;flex-direction:column}
-  #pane{flex:1;overflow-y:auto}
-  .msg{border:1px solid var(--line);border-radius:8px;background:var(--panel);margin:0 0 8px;padding:8px 12px}
-  .msg .hd{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
-  .msg .who{font-weight:600;color:var(--acc)}
-  .msg .ty{font-family:var(--mono);font-size:11px;color:var(--dim);border:1px solid var(--line);border-radius:4px;padding:0 4px}
-  .msg .st{font-size:11px;font-family:var(--mono)}
-  .msg .st.open{color:var(--warn)}.msg .st.acked,.msg .st.done{color:var(--ok)}
-  .msg .ts{color:var(--dim);font-size:11px;font-family:var(--mono)}
-  .msg .sub{margin-top:4px;font-weight:600}
-  .msg .body{margin-top:4px;white-space:pre-wrap;word-break:break-word}
-  .msg .rc{margin-top:6px;color:var(--dim);font-size:12px}
-  .msg .ops{margin-top:6px;display:flex;gap:6px}
-  .msg.nested{margin-left:20px;border-left:3px solid var(--line)}
-  .repstog{color:var(--dim);font-size:12px;cursor:pointer;margin:0 0 8px 14px;user-select:none}
+  .msg .who{font-weight:650;font-size:13px;font-family:var(--mono)}
+  .pill{font-size:9.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;border-radius:4px;padding:0 5px;line-height:15px;font-family:var(--mono)}
+  .pill.t-note,.pill.t-status{background:#222c44;color:#8fa0c5}
+  .pill.t-ask{background:#17315e;color:#7fb0ff}
+  .pill.t-reply{background:#2c2150;color:#b79bf0}
+  .pill.t-ack{background:#123527;color:#5fd39c}
+  .pill.t-announce{background:#3a2d12;color:#e5b56a}
+  .pill.t-handoff{background:#0f3332;color:#5ccfc9}
+  .pill.t-result{background:#123520;color:#63cf85}
+  .pill.t-rfc{background:#3d1c2d;color:#f08cb8}
+  .msg .st{font-size:9.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;border-radius:4px;padding:0 5px;line-height:15px;font-family:var(--mono)}
+  .msg .st.open{background:#3a2d12;color:#e0a63f}
+  .msg .st.acked,.msg .st.done,.msg .st.resolved,.msg .st.in_progress{background:#123527;color:#5fd39c}
+  .msg .st.superseded{background:#222c44;color:#8fa0c5}
+  .msg .ts{color:var(--dim2);font-size:11px;font-family:var(--mono);white-space:nowrap}
+  .msg .sub{margin-top:1px;font-weight:600;font-size:13.5px}
+  .msg .body{margin-top:1px;white-space:pre-wrap;word-break:break-word}
+  .msg .rc{color:var(--dim2);font-size:11.5px;font-family:var(--mono);white-space:pre-wrap}
+  .msg .rbox summary{color:var(--dim2);font-size:11px;cursor:pointer;font-family:var(--mono);list-style:none}
+  .msg .rbox summary::-webkit-details-marker{display:none}
+  .msg .rbox summary::before{content:"⌄ receipts"}
+  .msg .rbox[open] summary::before{content:"⌃ receipts"}
+  .msg .ops{margin-top:3px;display:flex;gap:5px;opacity:0;transition:opacity .12s}
+  .msg:hover .ops,.msg:focus-within .ops{opacity:1}
+  .msg.nested{margin-left:36px}
+  .msg.unread .mcol{border-left:2px solid var(--acc);padding-left:9px;margin-left:-11px}
+  .repstog{color:var(--dim);font-size:12px;cursor:pointer;margin-left:38px;user-select:none}
   .repstog:hover{color:var(--acc)}
   .repstog.mine{color:var(--ok);font-weight:600}
-  .newchip{color:var(--ok);font-size:11px;font-family:var(--mono);display:none}
+  .newchip{color:var(--ok);font-size:10.5px;font-family:var(--mono);font-weight:700;display:none}
   .newchip.on{display:inline}
-  .pres .ag{display:block;padding:3px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .pres .on{color:var(--ok)}
-  #composer{border-top:1px solid var(--line);padding-top:10px;margin-top:10px;display:grid;gap:8px;grid-template-columns:1fr 1fr;align-items:start}
-  #composer textarea{grid-column:1/3}
-  #composer .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-  #status{grid-column:1/3;color:var(--dim);font-size:12px;min-height:16px;white-space:pre-wrap}
+  /* ---- composer ---- */
+  #composer{border-top:1px solid var(--line);background:var(--bg2);padding:8px 14px 10px;display:flex;flex-direction:column;gap:6px;flex:none}
+  #composer .row{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
+  #composer .row input,#composer .row select{font-size:12.5px}
+  #cpost{background:var(--acc2);border-color:var(--acc);font-weight:600;padding:5px 18px}
+  #status{color:var(--dim2);font-size:12px;min-height:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:var(--mono)}
+  #status.ok{color:var(--ok)}
   #status.err{color:var(--err)}
+  #pd{color:var(--dim);font-size:12px}
+  /* ---- admin ---- */
+  #admin{overflow-y:auto;padding:16px 20px;display:flex;flex-direction:column;gap:14px}
+  #admin section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  #admin h2{margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim)}
   table{border-collapse:collapse;width:100%}
-  th,td{border:1px solid var(--line);padding:5px 8px;text-align:left;font-size:13px}
-  th{background:var(--panel);font-size:11px;text-transform:uppercase;color:var(--dim)}
+  th,td{border-bottom:1px solid var(--line);padding:5px 8px;text-align:left;font-size:12.5px}
+  th{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim2);background:none}
   td.mono{font-family:var(--mono);font-size:12px}
   pre.mono{font-family:var(--mono);font-size:12px;white-space:pre;overflow-x:auto;margin:8px 0}
   .tok{color:var(--ok);font-family:var(--mono);word-break:break-all}
   .rev{color:var(--err)}
-  .once{background:var(--panel);border:1px solid var(--ok);border-radius:8px;padding:10px;margin:10px 0;font-family:var(--mono);word-break:break-all}
-  label.ck{display:inline-flex;gap:4px;align-items:center;margin-right:10px;font-size:13px}
+  .once{background:var(--panel2);border:1px solid var(--ok);border-radius:10px;padding:10px 12px;margin:10px 0;font-family:var(--mono);word-break:break-all;font-size:12.5px}
+  label.ck{display:inline-flex;gap:4px;align-items:center;margin-right:10px;font-size:12.5px;color:var(--dim)}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  @media (max-width:900px){#app{grid-template-columns:190px 1fr}}
 </style></head>
 <body>
 <div id="login">
   <h1>agent comms</h1>
   <p>Paste your token (<code>ac_…</code>). It becomes an HttpOnly session cookie. Unless you check "remember" below, the page never stores it.</p>
-  <input id="tok" type="password" placeholder="ac_…" autocomplete="off">
+  <input id="tok" type="password" placeholder="ac_…" autocomplete="off" autofocus>
   <label class="ck" style="display:block;margin:6px 0"><input type="checkbox" id="remember"> remember this token on this device (plain localStorage — shared browser profile can read it; fine for a human workstation, not for a shared kiosk)</label>
-  <button id="go" style="width:100%">Login</button>
-  <div id="lerr" style="color:var(--err);margin-top:10px;white-space:pre-wrap"></div>
+  <button id="go">Login</button>
+  <div id="lerr"></div>
 </div>
 <div id="app">
   <header>
-    <span>agent-comms</span><b id="me"></b><span class="scopes" id="myscopes"></span>
+    <span class="logo">⚡ agent-comms</span><b id="me"></b><span class="scopes" id="myscopes"></span>
+    <span class="adm" id="admbadge"></span>
     <span class="sp"></span><span id="conn" style="color:var(--dim)">stream: …</span>
+    <button class="tab on" data-tab="chat">Chat</button>
+    <button class="tab" data-tab="admin" id="admintab" style="display:none">Admin</button>
     <button class="mini" id="out">logout</button>
   </header>
   <nav>
-    <button class="tab on" data-tab="chat">Chat</button>
-    <button class="tab" data-tab="admin" id="admintab" style="display:none">Admin</button>
-    <div id="tabchat">
-      <h3>Channels</h3><div id="chans"></div>
-      <h3>DMs</h3><div id="dms"></div>
-      <h3>Presence</h3><div class="pres" id="pres"></div>
+    <div id="tabchat" style="display:flex;flex-direction:column;flex:1;min-height:0">
+      <div id="filtwrap">
+        <input id="filt" placeholder="filter: text · sender:x · type:ask · #chan · open" autocomplete="off">
+        <label id="unrol"><input type="checkbox" id="unro"> unread only</label>
+      </div>
+      <div style="flex:1;overflow-y:auto"><div id="chanhdr"></div><div id="chans"></div><div id="dmhdr"></div><div id="dms"></div></div>
+      <div id="railfoot">
+        <button class="mini" id="markall">mark all read</button>
+        <details class="pres"><summary>presence (<span id="presn">0</span>)</summary><div id="pres"></div></details>
+      </div>
     </div>
   </nav>
   <main>
+    <div id="panehead"><span class="ttl" id="ph-title">all messages</span><span class="sub" id="ph-sub"></span><span class="sp"></span><button class="mini hidden" id="markread">mark read</button></div>
     <div id="pane"></div>
     <div id="composer">
-      <div class="row"><input id="cto" placeholder="to (ids, roles, group:x — comma sep)" style="flex:1"></div>
+      <textarea id="cbody" rows="1" placeholder="Message — Ctrl+Enter to send, Enter for a new line"></textarea>
       <div class="row">
         <select id="ctype"></select>
-        <input id="cchan" list="chanlist" placeholder="channel (blank = general)" style="flex:1">
+        <input id="cto" placeholder="to (ids, roles, group:x — comma sep)" style="flex:1">
+        <input id="cchan" list="chanlist" placeholder="channel" style="width:110px" title="channel (blank = general)">
         <datalist id="chanlist"></datalist>
-        <input id="csubj" placeholder="subject (optional)" style="flex:1">
+        <input id="csubj" placeholder="subject" style="width:110px" class="hidden" title="subject (optional)">
+        <button id="csubjbtn" class="mini" title="add a subject">+subj</button>
+        <button id="cpost">Post</button>
+        <span id="pd"></span>
       </div>
-      <textarea id="cbody" placeholder="message body"></textarea>
       <div id="status"></div>
-      <div class="row"><button id="cpost" style="margin-top:2px">Post</button><span id="pd" style="color:var(--dim);font-size:12px"></span></div>
     </div>
     <div id="admin" style="display:none"></div>
   </main>
 </div>
 <script>
 "use strict";
-const S = { me:null, scopes:[], chans:[], agents:[], active:new Set(), msgs:new Map(), sel:null, selKind:null, stream:null, seq:0, epoch:"", rpccache:new Map(), minted:null, dmMembers:new Map(), bearer:null, openT:new Set(), read:new Set() };
+const S = { me:null, scopes:[], chans:[], agents:[], active:new Set(), msgs:new Map(), sel:null, selKind:null, stream:null, seq:0, epoch:"", rpccache:new Map(), minted:null, dmMembers:new Map(), bearer:null, openT:new Set(), read:new Set(), unread:new Set(), filter:"", unreadOnly:false };
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; };
+function hue(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h % 360; }
+function monogram(s) {
+  // first letter + first letter after a separator (don-grok → DG, don-claude →
+  // DC): the first-two-chars monogram collided on every don-* seat.
+  const parts = String(s || "?").split(/[-_~.]/).filter(Boolean);
+  return (parts.length > 1 ? parts[0][0] + parts[parts.length - 1][0] : s.slice(0, 2)).toUpperCase();
+}
+function fmtRel(iso) {
+  const t = Date.parse(iso); if (isNaN(t)) return String(iso || "");
+  const d = t - Date.now();
+  if (Math.abs(d) < 45e3) return "just now";
+  if (Math.abs(d) < 36e5) return (d > 0 ? "in " : "") + Math.round(Math.abs(d) / 6e4) + "m" + (d > 0 ? "" : " ago");
+  if (Math.abs(d) < 864e5) return (d > 0 ? "in " : "") + Math.round(Math.abs(d) / 36e5) + "h" + (d > 0 ? "" : " ago");
+  return new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+function dayLabel(iso) {
+  const d = new Date(iso); if (isNaN(d)) return String(iso || "");
+  const diff = Math.floor((new Date(new Date().toDateString()) - new Date(d.toDateString())) / 864e5);
+  if (diff === 0) return "today";
+  if (diff === 1) return "yesterday";
+  return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+}
 
 let rpcid = 0;
 async function rpc(method, params) {
   const res = await fetch("/rpc", { method: "POST",
-    headers: { "content-type": "application/json", ...(S.bearer ? { authorization: "Bearer " + S.bearer } : {}) },
+    headers: { "content-type": "application/json", ...(S.bearer ? { authorization: "***" } : {}) },
     body: JSON.stringify({ jsonrpc: "2.0", method, params: params || {}, id: ++rpcid }) });
   let body = null; try { body = await res.json(); } catch {}
   if (!res.ok || (body && body.error)) {
@@ -147,7 +258,7 @@ async function rpc(method, params) {
   }
   return body.result;
 }
-function setS(msg, isErr) { const n = $("status"); n.textContent = msg || ""; n.className = isErr ? "err" : ""; }
+function setS(msg, isErr) { const n = $("status"); n.textContent = msg || ""; n.className = isErr ? "err" : (msg ? "ok" : ""); }
 
 /* ---------- login / boot ---------- */
 async function boot() {
@@ -157,12 +268,15 @@ async function boot() {
   await refreshChans();
   renderPres();
   if (S.scopes.includes("tokens:admin")) $("admintab").style.display = "";
+  if (S.scopes.includes("admin")) $("admbadge").textContent = "ADMIN — writes attributed to you";
+  if (!S.scopes.includes("post:as")) $("cpost").disabled = true;
   // claude M4 M-b: §6 handoff — snapshot FIRST, then open the stream AT the
   // snapshot cursor. Running them concurrently left a hole: rows committed
   // after the snapshot txn but before the subscribe's high-water read were in
   // neither (the stream starts at ITS high-water, not the snapshot's).
   const cursor = await loadHistory();
   openStream(cursor);
+  refreshUnread();
 }
 $("go").onclick = async () => {
   $("lerr").textContent = "";
@@ -189,46 +303,123 @@ $("go").onclick = async () => {
 $("tok").addEventListener("keydown", (ev) => { if (ev.key === "Enter") $("go").click(); });
 $("out").onclick = async () => { if (S.stream) S.stream.close(); try { await rpc("logout", {}); } catch {} localStorage.removeItem("comms-token"); location.reload(); };
 
-/* ---------- channels / DMs ---------- */
+/* ---------- channels / DMs / unread ---------- */
 async function refreshChans() {
   S.chans = await rpc("channels", {});
+  // DM membership is pair-keyed and immutable ⇒ resolve once per channel and
+  // cache (was: one dm.members RPC per DM on EVERY refresh, i.e. every click).
+  for (const c of S.chans) {
+    if (!/^dm~/.test(c.name) || S.dmMembers.has(c.name)) continue;
+    // wire contract (contract.suite G7): dm.members RESULT is the raw
+    // members array, not {members} — .members here was undefined ⇒ peer
+    // null ⇒ DM composer stuck read-only (grok M4 B1 residual).
+    try { const r = await rpc("dm.members", { channel: c.name }); S.dmMembers.set(c.name, Array.isArray(r) ? r : null); } catch { S.dmMembers.set(c.name, null); }
+  }
+  renderChans();
+}
+function renderChans() {
   const pub = S.chans.filter((c) => !/^dm~/.test(c.name));
   const dm = S.chans.filter((c) => /^dm~/.test(c.name));
   const box = $("chans"); box.textContent = "";
+  $("chanhdr").textContent = pub.length ? "channels" : "";
+  $("chanhdr").className = pub.length ? "" : "hidden";
   for (const c of pub) {
-    const b = el("button", "chan" + (S.sel === c.name ? " on" : ""), "#" + c.name);
+    const b = el("button", "chan" + (S.sel === c.name ? " on" : ""));
+    b.appendChild(el("span", "nm", "#" + c.name));
+    const un = unreadCount(c.name);
+    if (un) b.appendChild(el("span", "badge", String(un)));
     b.appendChild(el("span", "n", String(c.n)));
     b.onclick = () => select(c.name, "chan"); box.appendChild(b);
   }
   const dbox = $("dms"); dbox.textContent = "";
+  $("dmhdr").textContent = dm.length ? "DMs" : "";
+  $("dmhdr").className = dm.length ? "" : "hidden";
   for (const c of dm) {
-    // DM membership is pair-keyed and immutable ⇒ resolve once per channel
-    // (was: one dm.members RPC per DM on EVERY refresh, i.e. every click).
-    if (!S.dmMembers.has(c.name)) {
-      // wire contract (contract.suite G7): dm.members RESULT is the raw
-      // members array, not {members} — .members here was undefined ⇒ peer
-      // null ⇒ DM composer stuck read-only (grok M4 B1 residual).
-      try { const r = await rpc("dm.members", { channel: c.name }); S.dmMembers.set(c.name, Array.isArray(r) ? r : null); } catch { S.dmMembers.set(c.name, null); }
-    }
     const mem = S.dmMembers.get(c.name);
-    const label = mem ? "dm:" + mem.join(" ↔ ") : "#" + c.name;
-    const b = el("button", "chan" + (S.sel === c.name ? " on" : ""), label);
+    const b = el("button", "chan" + (S.sel === c.name ? " on" : ""));
+    b.appendChild(el("span", "nm", mem ? mem.join(" ↔ ") : "#" + c.name));
+    const un = unreadCount(c.name);
+    if (un) b.appendChild(el("span", "badge", String(un)));
+    b.appendChild(el("span", "dmk", "DM"));
     b.appendChild(el("span", "n", String(c.n)));
     b.onclick = () => select(c.name, "dm"); dbox.appendChild(b);
   }
   $("chanlist").textContent = "";
   for (const c of pub) $("chanlist").appendChild(el("option", null, c.name));
 }
+function unreadCount(ch) { let n = 0; for (const id of S.unread) { const m = S.msgs.get(id); if (m && m.channel === ch) n++; } return n; }
+// Generation counter: every mark (open-lane / mark-read / mark-all) bumps it.
+// An inbox(unread) snapshot taken BEFORE a mark must not clobber the state
+// AFTER it (probe: boot's unread snapshot resolved after a lane-open mark and
+// re-lit the lane the user had just read).
+let markGen = 0;
+// ONE inbox(unread) call per refresh — unread-for-self across every channel
+// (agent defaults to session self; no read:all needed). Drives the rail
+// badges and the unread-only view with exact server truth, not a client-side
+// guess. inbox() WRITES NOTHING (legacy quirk §10: only mark:true / read do),
+// and its rows are full SELECT * rows — hydrating S.msgs from them is safe.
+let unroT = null;
+function debUnread() { clearTimeout(unroT); unroT = setTimeout(refreshUnread, 1500); }
+async function refreshUnread() {
+  const g = markGen;
+  try {
+    const r = await rpc("inbox", { unread: true });
+    if (g !== markGen) return; // a mark landed while we were in flight — stale
+    for (const m of r.rows) if (!S.msgs.has(m.id)) S.msgs.set(m.id, m);
+    S.unread = new Set(r.rows.map((x) => x.id));
+  } catch { /* seat without inbox visibility keeps the row-level heuristic chips */ }
+  renderChans(); if (S.tab !== "admin") renderPane();
+}
+$("markall").onclick = async () => {
+  markGen++;
+  const prev = S.unread; S.unread = new Set(); // optimistic: badges clear now; an error re-syncs from the server
+  renderChans(); renderPane();
+  try {
+    const r = await rpc("inbox", { mark: true });
+    for (const m of r.rows) S.read.add(m.id);
+    setS("marked " + r.rows.length + " read", "ok");
+  } catch (e) { S.unread = prev; debUnread(); setS("mark all: " + e.message, 1); }
+};
+$("markread").onclick = async () => {
+  if (!S.sel) return;
+  markGen++;
+  const prev = S.unread;
+  S.unread = new Set([...S.unread].filter((id) => { const m = S.msgs.get(id); return m && m.channel !== S.sel; }));
+  const ch = S.sel;
+  renderChans(); renderPane();
+  try {
+    const r = await rpc("inbox", { channel: ch, mark: true });
+    for (const m of r.rows) S.read.add(m.id);
+    setS("marked " + r.rows.length + " read in #" + ch, "ok");
+  } catch (e) { S.unread = prev; debUnread(); setS("mark read: " + e.message, 1); }
+};
 
 /* ---------- message panes ---------- */
 function select(name, kind) {
   S.sel = name; S.selKind = kind;
-  refreshChans(); renderPane();
+  markGen++; // SYNCHRONOUS: invalidates any inbox(unread) snapshot in flight
+  renderPane();
   // ruling (c): channel-scoped history is ungated ⇒ fill THIS channel beyond
   // the global newest-page (and give non-read:all tokens any history at all).
   rpc("history", { channel: name, limit: 200 }).then((pg) => { for (const m of pg.rows) S.msgs.set(m.id, m); if (S.sel === name) renderPane(); }).catch(() => {});
   if (kind === "dm") { $("cchan").value = ""; dmPeerHint(); }
   else { $("cto").disabled = false; $("cpost").disabled = false; $("cchan").value = name === "general" ? "" : name; $("pd").textContent = ""; }
+  // Deliberate user path — same rule the thread toggle always applied ("opening
+  // a thread = reading it"): OPENING a lane marks its delivered rows read via
+  // inbox(mark:true), the same marking verb the CLI inbox uses. receipts/
+  // hydrate stay non-marking so frames that merely RENDER never lie to
+  // senders (§5, claude M4 B2). The badge clears OPTIMISTICALLY now (a
+  // rejected/429 mark re-syncs via debounced inbox(unread)); refreshChans
+  // runs strictly AFTER the mark settles — concurrent ordering resurrected
+  // stale badges (the list render raced the mark and re-lit the lane the
+  // user just opened).
+  const ch = name;
+  S.unread = new Set([...S.unread].filter((id) => { const m = S.msgs.get(id); return m && m.channel !== ch; }));
+  renderChans();
+  refreshChans()
+    .then(() => rpc("inbox", { channel: name, mark: true }))
+    .then((r) => { for (const m of r.rows) S.read.add(m.id); })
+    .catch(() => { debUnread(); });
 }
 function dmPeer() {
   const mem = S.dmMembers.get(S.sel);
@@ -244,28 +435,57 @@ function dmPeerHint() {
   $("pd").textContent = peer ? "DM → " + peer + " (posts use dm:" + peer + ")" : "read-only: you are not a party to this DM";
 }
 function isMine(m) {
-  // "new for you" = addressed to me (or @all), still open, not sent by me,
-  // and I have not read it. This is the inbox predicate, same data the CLI
-  // inbox uses — a reply lights ONLY its addressee.
-  if (!m || m.sender === S.me || m.status !== "open" || S.read.has(m.id)) return false;
+  // "new for you" = the inbox predicate, same data the CLI inbox uses — a
+  // reply lights ONLY its addressee. The unread SET from inbox(unread) is
+  // exact; the row predicate is the fallback for seats whose inbox call is
+  // gated (addressed to me or @all, still open, not mine, not read).
+  if (!m || m.sender === S.me) return false;
+  if (S.unread.size) return S.unread.has(m.id);
+  if (m.status !== "open" || S.read.has(m.id)) return false;
   const rs = String(m.recipients || "").split(",").map((s) => s.trim());
   return rs.includes(S.me) || rs.includes("@all");
 }
+function matchFilter(m) {
+  if (S.unreadOnly && !isMine(m)) return false;
+  const f = S.filter.trim().toLowerCase();
+  if (!f) return true;
+  for (const tk of f.split(/\\s+/)) {
+    if (!tk) continue;
+    if (tk.startsWith("sender:")) { if (m.sender !== tk.slice(7)) return false; continue; }
+    if (tk.startsWith("type:")) { if (m.type !== tk.slice(5)) return false; continue; }
+    if (tk.startsWith("#")) { if (m.channel !== tk.slice(1)) return false; continue; }
+    if (tk === "open") { if (m.status !== "open") return false; continue; }
+    if (tk === "dm") { if (!/^dm~/.test(m.channel)) return false; continue; }
+    const hay = (m.sender + " " + m.channel + " " + (m.subject || "") + " " + (m.body || "")).toLowerCase();
+    if (!hay.includes(tk)) return false;
+  }
+  return true;
+}
 function msgNode(m, nested) {
-  const n = el("div", "msg" + (nested ? " nested" : "")); n.dataset.id = m.id;
+  const n = el("div", "msg" + (nested ? " nested" : "") + (isMine(m) ? " unread" : "")); n.dataset.id = m.id;
+  const mo = el("div", "monoid", monogram(m.sender));
+  mo.style.background = "hsl(" + hue(m.sender) + ",45%,34%)";
+  n.appendChild(mo);
+  const col = el("div", "mcol");
   const hd = el("div", "hd");
   hd.appendChild(el("span", "who", m.sender));
-  hd.appendChild(el("span", "ty", m.type));
+  hd.appendChild(el("span", "pill t-" + m.type, m.type));
+  // the OPEN pill on every row was noise — status rides a pill only once a
+  // message leaves the default state (the unread rail badge + chip carry "new").
+  if (m.status && m.status !== "open") hd.appendChild(el("span", "st " + m.status, m.status.replace("_", " ")));
   if (m.subject) hd.appendChild(el("span", null, m.subject));
-  hd.appendChild(el("span", "st " + m.status, m.status));
   const chip = el("span", "newchip" + (isMine(m) ? " on" : ""), "● new for you"); chip.dataset.chip = m.id; hd.appendChild(chip);
   // flex spacer — its OWN class: the old className-reassignment chain overwrote
   // whatever class the node was built with (that's how "sp" vanished once).
   hd.appendChild(el("span", "sphdr"));
-  hd.appendChild(el("span", "ts", m.created_at));
-  n.appendChild(hd);
-  n.appendChild(el("div", "body", m.body));
-  const rc = el("div", "rc"); rc.dataset.rc = m.id; n.appendChild(rc);
+  if (!S.sel) hd.appendChild(el("span", "ts", "#" + m.channel));
+  const ts = el("span", "ts", fmtRel(m.created_at)); ts.title = m.created_at;
+  hd.appendChild(ts);
+  col.appendChild(hd);
+  if (m.body) col.appendChild(el("div", "body", m.body));
+  const det = el("details", "rbox"); det.appendChild(el("summary", null, ""));
+  const rc = el("div", "rc"); rc.dataset.rc = m.id; det.appendChild(rc);
+  col.appendChild(det);
   const ops = el("div", "ops");
   for (const st of ["acked", "done"]) {
     const b = el("button", "mini", st);
@@ -291,20 +511,23 @@ function msgNode(m, nested) {
     ops2focus();
   };
   ops.appendChild(th);
-  n.appendChild(ops);
+  col.appendChild(ops);
+  n.appendChild(col);
   return n;
 }
 function ops2focus() { $("cbody").focus(); }
 function note(id, patch) {
   const m = S.msgs.get(id); if (!m) return;
   Object.assign(m, patch);
-  document.querySelectorAll('.msg[data-id="' + CSS.escape(id) + '"]').forEach((node) => {
-    const st = node.querySelector(".st"); st.textContent = m.status; st.className = "st " + m.status;
-  });
+  // full re-render: the OPEN pill is omitted by design, so a status change
+  // must ADD/REMOVE the pill node — patching a .st that may not exist can't.
+  renderPane();
 }
 function renderPane() {
-  const pane = $("pane"); pane.textContent = "";
-  const all = [...S.msgs.values()].filter((m) => !S.sel || m.channel === S.sel).sort((a, b) => a.created_at < b.created_at ? -1 : 1).slice(-400);
+  const pane = $("pane");
+  const keep = pane.scrollTop; const atBottom = pane.scrollHeight - keep - pane.clientHeight < 60;
+  pane.textContent = "";
+  const all = [...S.msgs.values()].filter((m) => !S.sel || m.channel === S.sel).sort((a, b) => a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0).slice(-400);
   const byId = new Map(all.map((m) => [m.id, m]));
   // Replies nest under their parent. A reply whose parent is NOT in this view
   // (cross-channel thread, parent outside the newest-400 window) stays a root
@@ -315,13 +538,21 @@ function renderPane() {
     if (par) { if (!kids.has(par)) kids.set(par, []); kids.get(par).push(m); }
     else roots.push(m);
   }
-  const shown = [];
+  $("ph-title").textContent = S.sel ? "#" + S.sel : "all messages";
+  $("markread").classList.toggle("hidden", !S.sel);
+  const shown = []; let lastDay = ""; let any = 0;
   for (const m of roots) {
-    pane.appendChild(msgNode(m)); shown.push(m);
     const ks = kids.get(m.id) || [];
-    if (!ks.length) continue;
     const open = S.openT.has(m.id);
     const mine = ks.some(isMine);
+    const visRoot = matchFilter(m);
+    const visKids = ks.filter(matchFilter);
+    if (!visRoot && !(open && visKids.length)) continue;
+    any++;
+    const dk = String(m.created_at || "").slice(0, 10);
+    if (dk !== lastDay) { pane.appendChild(el("div", "day", dayLabel(m.created_at))); lastDay = dk; }
+    if (visRoot) { pane.appendChild(msgNode(m)); shown.push(m); }
+    if (!ks.length) continue;
     const tg = el("div", "repstog" + (mine ? " mine" : ""),
       (open ? "▾ " : "▸ ") + ks.length + " repl" + (ks.length > 1 ? "ies" : "y") + (mine ? " — new for you" : ""));
     tg.onclick = () => {
@@ -330,14 +561,16 @@ function renderPane() {
         S.openT.add(m.id);
         // Opening a thread = reading it (server-side, honest: clears the CLI
         // inbox '*' too). Only rows that are "new for me" cost an RPC.
-        for (const k of ks) if (isMine(k)) rpc("read", { id: k.id }).then(() => { S.read.add(k.id); renderPane(); }).catch(() => {});
+        for (const k of ks) if (isMine(k)) rpc("read", { id: k.id }).then(() => { S.read.add(k.id); S.unread.delete(k.id); renderPane(); }).catch(() => {});
       }
       renderPane();
     };
     pane.appendChild(tg);
-    if (open) for (const k of ks) { pane.appendChild(msgNode(k, true)); shown.push(k); }
+    if (open) for (const k of visKids) { pane.appendChild(msgNode(k, true)); shown.push(k); }
   }
-  pane.scrollTop = pane.scrollHeight;
+  if (!any) pane.appendChild(el("div", "empty", S.filter || S.unreadOnly ? "nothing matches the filter" : "no messages here yet"));
+  $("ph-sub").textContent = any ? shown.length + " shown" : "";
+  pane.scrollTop = atBottom ? pane.scrollHeight : keep;
   // claude M4 M-c: receipts are fetched ONLY for the newest RC_MAX RENDERED
   // rows (collapsed replies have no slot — fetching them drained the read
   // bucket for nothing), one at a time.
@@ -427,7 +660,7 @@ function openStream(since) {
     es.addEventListener("revoked", () => { es.close(); $("conn").textContent = "stream: token revoked — reload"; $("conn").style.color = "var(--err)"; localStorage.removeItem("comms-token"); });
     es.addEventListener("msg", (ev) => { const d = JSON.parse(ev.data); hydrate(d); });
     es.addEventListener("status", (ev) => { const d = JSON.parse(ev.data); if (S.msgs.has(d.id)) note(d.id, { status: d.status }); else hydrate(d); });
-    es.addEventListener("read", (ev) => { const d = JSON.parse(ev.data); S.rpccache.delete(d.msg); loadReceipts(d.msg); });
+    es.addEventListener("read", (ev) => { const d = JSON.parse(ev.data); S.rpccache.delete(d.msg); if (d.agent === S.me) { S.read.add(d.msg); S.unread.delete(d.msg); renderChans(); } loadReceipts(d.msg); });
     es.addEventListener("presence", () => debPres());
     es.addEventListener("token", () => { if (S.tab === "admin") renderTokenTable(); });
     es.addEventListener("group", () => { refreshChans(); });
@@ -444,11 +677,25 @@ function openStream(since) {
 async function hydrate(d) {
   const known = S.msgs.get(d.id);
   if (known && d.body === undefined) { Object.assign(known, d); if (d.status) note(d.id, { status: d.status }); return; }
+  let row = null;
   try {
     const m = await rpc("receipts", { id: d.id });
     S.rpccache.set(m.id, Promise.resolve(m));
-    S.msgs.set(m.id, m); renderPane();
+    S.msgs.set(m.id, m); row = m; renderPane();
   } catch (e) { if (known) return; S.msgs.set(d.id, Object.assign({ body: "(no permission to read)" }, d)); renderPane(); }
+  // live badge heuristic for the recipient: the SSE msg frame carries NO
+  // recipients (mod.ts frameFor ships identity+routing fields only), so the
+  // addressed-to-me test runs on the HYDRATED row (receipts = SELECT *).
+  // NOT gated on S.read: mark:true marks EVERY delivered row server-side,
+  // including ones that arrived while the tab was open before the debounced
+  // refresh ran — the local read set can lag. Heuristic only ADDS; the
+  // debounced exact inbox(unread) refresh is the source of truth (it gates
+  // on real server reads), and it mirrors the server predicate: not mine,
+  // addressed to me or @all — status plays no part in unread-ness.
+  if (row && row.sender !== S.me) {
+    const rec = String(row.recipients || "").split(",").map((s) => s.trim());
+    if (rec.includes(S.me) || rec.includes("@all")) { S.unread.add(row.id); renderChans(); debUnread(); }
+  }
 }
 let presT = null;
 function debPres() { clearTimeout(presT); presT = setTimeout(async () => {
@@ -457,6 +704,7 @@ function debPres() { clearTimeout(presT); presT = setTimeout(async () => {
 }, 800); }
 function renderPres() {
   const box = $("pres"); box.textContent = "";
+  $("presn").textContent = String(S.agents.length);
   for (const a of S.agents) {
     const on = S.active.has(a.id);
     box.appendChild(el("span", "ag " + (on ? "on" : ""), (on ? "● " : "○ ") + a.id + (a.role && a.role !== a.id ? "  (" + a.role + ")" : "")));
@@ -465,6 +713,16 @@ function renderPres() {
 
 /* ---------- composer ---------- */
 for (const t of ["note", "ask", "reply", "ack", "announce", "handoff", "result", "status", "rfc"]) $("ctype").appendChild(el("option", null, t));
+$("cbody").addEventListener("input", () => { const t = $("cbody"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 160) + "px"; });
+$("cbody").addEventListener("keydown", (ev) => { if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); $("cpost").click(); } });
+$("filt").addEventListener("input", () => { S.filter = $("filt").value; renderPane(); });
+$("csubjbtn").onclick = () => { const s = $("csubj"); s.classList.toggle("hidden"); if (!s.classList.contains("hidden")) s.focus(); else s.value = ""; };
+$("unro").addEventListener("change", () => { S.unreadOnly = $("unro").checked; renderPane(); });
+document.addEventListener("keydown", (ev) => {
+  const tag = (ev.target.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "textarea" || tag === "select") { if (ev.key === "Escape") ev.target.blur(); return; }
+  if (ev.key === "/") { ev.preventDefault(); $("filt").focus(); }
+});
 $("cpost").onclick = async () => {
   const body = $("cbody").value;
   if (!body.trim()) return setS("body is empty", 1);
@@ -487,11 +745,12 @@ $("cpost").onclick = async () => {
   // --thread and --re"). re alone starts a NEW thread (thread = own id), so
   // "thread --id parent" never showed UI replies.
   if (S.replyTo) { p.re = S.replyTo; const par = S.msgs.get(S.replyTo); p.thread = (par && par.thread) || S.replyTo; }
+  setS("posting…");
   try {
     const r = await rpc("post", p);
-    setS("posted " + r.id + " → #" + r.channel);
-    $("cbody").value = ""; $("csubj").value = ""; S.replyTo = null; $("cbody").placeholder = "message body";
-  } catch (e) { setS("post failed: " + e.message, 1); }
+    setS("posted " + r.id + " → #" + r.channel, "ok");
+    $("cbody").value = ""; $("cbody").style.height = "auto"; $("csubj").value = ""; S.replyTo = null; $("cbody").placeholder = "Message — Ctrl+Enter to send, Enter for a new line";
+  } catch (e) { setS("post failed: " + e.message + (e.bus ? " [" + e.bus + "]" : ""), 1); }
 };
 
 /* ---------- tabs ---------- */
@@ -499,10 +758,11 @@ for (const b of document.querySelectorAll(".tab")) b.onclick = () => {
   document.querySelectorAll(".tab").forEach((n) => n.classList.remove("on")); b.classList.add("on");
   S.tab = b.dataset.tab;
   const chat = S.tab !== "admin";
-  $("tabchat").style.display = chat ? "" : "none";
+  $("tabchat").style.display = chat ? "flex" : "none";
   $("pane").style.display = chat ? "" : "none";
+  $("panehead").style.display = chat ? "" : "none";
   $("composer").style.display = chat ? "" : "none";
-  $("admin").style.display = chat ? "none" : "";
+  $("admin").style.display = chat ? "none" : "flex";
   if (!chat) renderAdmin();
 };
 
@@ -533,7 +793,7 @@ function inviteText(m) {
     "AGENT:  " + m.agent + "   (identity comes from the token — never claim it)",
     "SCOPES: " + (scopesCsv(m) || "(none — plain sender)"),
     "",
-    "auth:    header  Authorization: Bearer " + m.token,
+    "auth:    header  Authorization: *** " + m.token,
     "         content-type: application/json",
     'first:   POST /rpc {"jsonrpc":"2.0","id":1,"method":"join","params":{"role":"…"}}',
     'docs:    README "Remote mode" · deploy/RUNBOOK.md · RFC-001 §5–§7',
@@ -592,9 +852,10 @@ async function renderTokenTable() {
 }
 function buildAdmin() {
   const box = $("admin"); box.textContent = "";
-  const once = el("div"); once.id = "minted"; box.appendChild(once);
-  box.appendChild(el("h2", null, "Tokens"));
-  const tb = el("div"); tb.id = "tktable"; box.appendChild(tb);
+  const s1 = el("section"); box.appendChild(s1);
+  const once = el("div"); once.id = "minted"; s1.appendChild(once);
+  s1.appendChild(el("h2", null, "Tokens"));
+  const tb = el("div"); tb.id = "tktable"; s1.appendChild(tb);
   const f = el("div"); f.style.marginTop = "14px";
   f.appendChild(el("h2", null, "Mint token"));
   const row = el("div", "row");
