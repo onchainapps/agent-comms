@@ -1,0 +1,30 @@
+# RFC-002 N1 doorbell notifier. Run it NEXT TO the sinks it rings (typically the
+# gateway host, not the bus host) — it is a plain RPC client, §9-safe.
+# Install: adjust BUN/paths, then daemon-reload + enable --now.
+[Unit]
+Description=agent-comms delivery doorbell notifier (RFC-002)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=comms
+Group=comms
+ExecStart=/usr/local/bin/bun /opt/agent-comms/current/bin/notifier.ts --config /etc/agent-comms/notifier.json
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# exec hooks may need to reach tmux/etc — widen the sandbox deliberately:
+# ReadWritePaths=/tmp
+# Environment=TMUX_SOCKET=…
+
+[Install]
+WantedBy=multi-user.target

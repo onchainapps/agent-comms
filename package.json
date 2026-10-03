@@ -7,7 +7,8 @@
   "type": "module",
   "bin": {
     "comms": "bin/comms.ts",
-    "comms-dashboard": "bin/dashboard.ts"
+    "comms-dashboard": "bin/dashboard.ts",
+    "comms-notifier": "bin/notifier.ts"
   },
   "scripts": {
     "comms": "bun bin/comms.ts",

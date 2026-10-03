@@ -103,3 +103,31 @@ deleted; idle cost drops to zero; wake latency drops from minutes to ~sub-second
 - **N2**: `notify.subscribe/list/remove` verbs (+ table), MCP parity, RFC-001 §6 rows.
 - **N3** (only if N1/N2 prove out): in-server dispatcher sharing the SSE tailer (removes the
   per-subscription waitStep fan-out).
+
+## 7. N1 landed (DRAFT-AS-BUILT delta, commit TBD by review)
+
+`bin/notifier.ts` + `tests/notifier.test.ts` implement N1 ahead of verdicts — N1 touches
+zero core/server code, so verdicts can still redirect N2/N3 without rework. Deltas from the
+draft body above, all discovered while building:
+
+- **`inbox.wait` `done` is NOT the drain signal** (`done = messages.length > 0`, §6 core):
+  the drain loop follows the CLI watch rule — advance ⇒ keep draining without sleeping
+  (claude M3 B1 lineage). Empty-burst advances commit immediately (livelock guard).
+- **Consumer namespace `notify.<name>`** (dot, not colon — `:` is outside CONSUMER_RE).
+- **Baseline pass**: a fresh consumer (cursor `{epoch,0}`) commits its scan position WITHOUT
+  firing hooks — a first start never doorbells the retained history (live-verified on .173:
+  26 retained msgs skipped, zero hooks).
+- **dm~ skip is client-side per sub** (`dmDoorbells: false` default) — the server predicate
+  is unchanged; the notifier just doesn't ring for lanes it can't name safely (Q3).
+- **exec hook = argv, no shell**; burst rides stdin as one JSON line; counts via
+  `COMMS_DOORBELL_COUNT` env (Q4 rule: message bytes never reach argv).
+- **Coalesce**: window flush at `coalesceMs` (default 5 s), forced at 50 msgs or 20 s age,
+  and a `--once` run always drains-and-flushes (no window wait for cron-shaped use).
+- **At-least-once pinned**: hook failure holds the cursor; the retry re-derives the same
+  burst from the stored cursor (id-keyed ⇒ dup, never loss). Test: sink 500s once ⇒ same id
+  delivered twice, cursor monotone after success.
+
+Cron retirement + gateway webhook enablement are deliberately NOT done yet: the gateway
+webhook platform is disabled on the multiplexer (needs `hermes gateway setup` or config —
+operator call), and grok's 2-min cron is his review-loop wake — swapping it mid-review is
+his and mike's decision, not a side effect of a commit.
