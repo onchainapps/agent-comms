@@ -209,8 +209,41 @@ export function contractSuite(name: string, make: Factory) {
         expect((await w.channelDelete({ name: "e2xgame2" })).error).toBeUndefined();
         expect(((h as any).raw.testDb.query("SELECT deleted_by FROM channel_tombstones WHERE name='e2xgame2'").get() as any).deleted_by).toBe(w.agentId);
 
-        // NIT-3 (claude t_3fb757d5): non-creator typo ⇒ not_found, not forbidden.
+        // NIT-3 (claude t_3fb757d5) + grok finding 3: non-creator typo ⇒
+        // not_found, not forbidden — gate + existence re-read INSIDE the txn.
         expect((await w.channelDelete({ name: "e2x-nope-at-all" })).error).toBe("not_found");
+
+        // grok findings 1/4 re-fold pins (floor ruling: claude MINOR-1 removed
+        // the same-second contention as cargo-cult — events carry no channel
+        // column, nothing reads deleted_at. The blessed path and the post back
+        // door must therefore be IDENTICAL, not one floored + one open):
+        // same-second delete ⇒ revive works via BOTH paths, tombstone cleared.
+        expect((await w.channelCreate({ name: "e2xsec" })).error).toBeUndefined();
+        expect((await w.channelDelete({ name: "e2xsec" })).error).toBeUndefined();
+        const rev3 = await w.channelCreate({ name: "e2xsec" }); // same second, no floor
+        expect(rev3.error).toBeUndefined();
+        expect((rev3 as any).value.created).toBe(true);
+        expect((h as any).raw.testDb.query("SELECT 1 FROM channel_tombstones WHERE name='e2xsec'").get()).toBeNull();
+        expect((await w.channelDelete({ name: "e2xsec" })).error).toBeUndefined();
+        const pRev = await w.post({ from: w.agentId, to: "@all", type: "note", body: "revive via back door", channel: "e2xsec" });
+        expect(pRev.error).toBeUndefined(); // same second, same semantics as create
+        expect((h as any).raw.testDb.query("SELECT 1 FROM channel_tombstones WHERE name='e2xsec'").get()).toBeNull();
+        expect(((h as any).raw.testDb.query("SELECT created_by FROM channels WHERE name='e2xsec'").get() as any).created_by).toBe(w.agentId);
+
+        // grok finding 4: a post to a LIVE lane must NOT touch tombstones.
+        // (A tombstone co-existing with a live row is hand-SQL residue — claude
+        // NIT-1 — but the hot path must never be what erases it.)
+        expect((await w.channelCreate({ name: "e2xlive" })).error).toBeUndefined();
+        (h as any).raw.testDb.run("INSERT INTO channel_tombstones(name,deleted_at,deleted_by) VALUES('e2xlive','2020-01-01T00:00:00Z',?)", [w.agentId]);
+        expect((await w.post({ from: w.agentId, to: "@all", type: "note", body: "hot path", channel: "e2xlive" })).error).toBeUndefined();
+        expect((h as any).raw.testDb.query("SELECT 1 FROM channel_tombstones WHERE name='e2xlive'").get()).not.toBeNull();
+
+        // grok finding 2 (txn shape): a back-door post REJECTED by the guard or
+        // the cap leaves NO message row and NO channel row (all inside the one
+        // BEGIN IMMEDIATE now).
+        expect((await w.post({ from: w.agentId, to: "@all", type: "note", body: "x", channel: "e2-x-sec" })).error).toBe("usage"); // live sibling e2xsec
+        expect((h as any).raw.testDb.query("SELECT 1 FROM channels WHERE name='e2-x-sec'").get()).toBeNull();
+        expect((h as any).raw.testDb.query("SELECT 1 FROM messages WHERE channel='e2-x-sec'").get()).toBeNull();
 
         // general is undeletable; unknown lane is not_found; bad grammar usage.
         expect((await root.channelDelete({ name: "general" })).error).toBe("usage");

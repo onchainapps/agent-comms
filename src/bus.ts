@@ -515,11 +515,24 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     }
   }
 
-  function ensureChannel(name: string, by: string) {
-    d.run("INSERT OR IGNORE INTO channels(name,purpose,created_at,created_by) VALUES(?,?,?,?)", [name, "", nowIso(), by]);
-    // E2.x: an exact-name recreate revives the lane — clear its tombstone so
-    // channels() lists it (the tombstone only holds the skeleton while dead).
-    d.run("DELETE FROM channel_tombstones WHERE name=?", [name]);
+  // E2.x re-fold (grok t_0cfd1b84 findings 1/2/4): ONE txn-LESS ensure core for
+  // both creation paths (channelCreate + the post auto-create back door), in the
+  // house groupEnsureInTxn shape. Runs inside the caller's BEGIN IMMEDIATE, so
+  // (a) dup scan / cap / INSERT / tombstone-clear are never a TOCTOU window,
+  // (b) a failed message txn can never have already committed a revival, and
+  // (c) a post to a LIVE lane touches channel_tombstones ZERO times (the old
+  // ensureChannel deleted the tombstone on every public post — an autocommit
+  // write-lock on the hot path and the mechanism of the back-door bypass).
+  function channelEnsureInTxn(name: string, by: string, purpose = ""): { created: boolean } | BusError {
+    if (d.query("SELECT 1 FROM channels WHERE name=?").get(name)) return { created: false };
+    const dup = channelDup(name);
+    if (dup) return { error: "usage", detail: dup.retired
+      ? `channel '${name}' collides with retired lane '${dup.name}' (near-duplicate of a deleted channel — choose a distinct name)`
+      : `channel '${name}' already exists as '${dup.name}' (near-duplicate — post to the existing name, or choose a distinct one)` };
+    if (channelCapHit(by)) return { error: "usage", detail: `channel squatting cap: ${CHANNEL_CREATE_CAP} channels created per agent (delete lanes you retired)` };
+    d.run("INSERT INTO channels(name,purpose,created_at,created_by) VALUES(?,?,?,?)", [name, purpose, nowIso(), by]);
+    d.run("DELETE FROM channel_tombstones WHERE name=?", [name]); // exact recreate revives
+    return { created: true };
   }
 
   // E2 (t_52610023, wildw_client lesson): canonical channel identity stays
@@ -565,24 +578,18 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     // grok E2 m-tx: check+insert in ONE txn (house pattern, groupEnsure) — the
     // window is unreachable under the single-writer server but two local
     // processes could both pass the scan pre-INSERT.
+    let created = false;
     try {
       d.exec("BEGIN IMMEDIATE");
       try {
-        if (d.query("SELECT 1 FROM channels WHERE name=?").get(p.name)) { d.exec("COMMIT"); return { value: { name: p.name, created: false } }; }
-        const dup = channelDup(p.name);
-        if (dup) {
-          d.exec("ROLLBACK");
-          return { error: "usage", detail: dup.retired
-            ? `channel '${p.name}' collides with retired lane '${dup.name}' (near-duplicate of a deleted channel — choose a distinct name)`
-            : `channel '${p.name}' already exists as '${dup.name}' (near-duplicate — post to the existing name, or choose a distinct one)` };
-        }
-        if (channelCapHit(ctx.principal.agentId)) { d.exec("ROLLBACK"); return { error: "usage", detail: `channel squatting cap: ${CHANNEL_CREATE_CAP} channels created per agent (delete lanes you retired)` }; }
-        d.run("INSERT INTO channels(name,purpose,created_at,created_by) VALUES(?,?,?,?)",
-          [p.name, p.purpose ?? "", nowIso(), ctx.principal.agentId]);
-        d.run("DELETE FROM channel_tombstones WHERE name=?", [p.name]); // exact recreate revives
+        // E2.x re-fold (grok finding 2): the blessed path runs the SAME shared
+        // core as the post back door — one shape, one txn, no drift.
+        const en = channelEnsureInTxn(p.name, ctx.principal.agentId, p.purpose ?? "");
+        if ("error" in en) { d.exec("ROLLBACK"); return en; }
+        created = en.created;
         d.exec("COMMIT");
       } catch (e) { d.exec("ROLLBACK"); throw e; }
-      return { value: { name: p.name, created: true } };
+      return { value: { name: p.name, created } };
     } catch (e: any) {
       const msg = String(e?.message ?? e);
       if (msg.includes("SQLITE_BUSY")) return { error: "contention", detail: "busy" };
@@ -600,17 +607,23 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (typeof p.name !== "string" || !ID_RE.test(p.name)) return { error: "usage", detail: `invalid channel name: ${p.name}` };
     if (p.name === "general") return { error: "usage", detail: "the general lane is seeded and cannot be deleted" };
-    // NIT-3 (claude t_3fb757d5): existence BEFORE the gate — a non-creator's
-    // typo must answer not_found, not forbidden (TOCTOU moot under §9 single writer).
-    const row = d.query("SELECT created_by FROM channels WHERE name=?").get(p.name) as any | undefined;
-    if (!row) return { error: "not_found", detail: `no such channel: ${p.name}` };
-    if (!isRootCtx(ctx) && !hasScope(ctx, "agents:admin") && row.created_by !== ctx.principal.agentId)
-      return { error: "forbidden", detail: "channel.delete requires the creator or agents:admin" };
+    // E2.x re-fold (grok t_0cfd1b84 finding 2/3 + claude NIT-3): existence AND
+    // the creator-or-admin gate are re-read INSIDE BEGIN IMMEDIATE — missing →
+    // not_found for EVERY principal (public lanes are listed; no oracle to
+    // protect), and a concurrent delete+exact-recreate cannot let an in-flight
+    // delete remove the NEW incarnation whose created_by was re-stamped after
+    // a pre-txn gate read passed (same class as group m9).
+    const admin = isRootCtx(ctx) || hasScope(ctx, "agents:admin");
     const t = nowIso();
     try {
       d.exec("BEGIN IMMEDIATE");
       try {
-        if (!d.query("SELECT name FROM channels WHERE name=?").get(p.name)) { d.exec("ROLLBACK"); return { error: "not_found", detail: `no such channel: ${p.name}` }; }
+        const row = d.query("SELECT created_by FROM channels WHERE name=?").get(p.name) as any | undefined;
+        if (!row) { d.exec("ROLLBACK"); return { error: "not_found", detail: `no such channel: ${p.name}` }; }
+        if (!admin && row.created_by !== ctx.principal.agentId) {
+          d.exec("ROLLBACK");
+          return { error: "forbidden", detail: "channel.delete requires the creator or agents:admin" };
+        }
         d.run("DELETE FROM channels WHERE name=?", [p.name]);
         d.run(`INSERT INTO channel_tombstones(name,deleted_at,deleted_by) VALUES(?,?,?)
                ON CONFLICT(name) DO UPDATE SET deleted_at = excluded.deleted_at, deleted_by = excluded.deleted_by
@@ -1330,20 +1343,12 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       }
     } else {
       channel = channel || "general";
-      // E2: implicit create (post to an unknown channel) goes THROUGH the
-      // near-duplicate guard — a typo'd lane costs the poster 1 s, not the
-      // fleet a week (wildw_client lesson). Exact-name creates are untouched.
-      if (channel !== "general" && !d.query("SELECT 1 FROM channels WHERE name=?").get(channel)) {
-        const dup = channelDup(channel);
-        if (dup) return { error: "usage", detail: dup.retired
-          ? `channel '${channel}' collides with retired lane '${dup.name}' (near-duplicate of a deleted channel — choose a distinct name)`
-          : `channel '${channel}' already exists as '${dup.name}' (near-duplicate — post to the existing name, or channel create a distinct one)` };
-        // E2.x: the cap applies to the auto-create back door too — otherwise
-        // gating only channel.create gates the blessed path and leaves this
-        // one open (claude Q5). general is seeded and exempt.
-        if (channelCapHit(sender)) return { error: "usage", detail: `channel squatting cap: ${CHANNEL_CREATE_CAP} channels created per agent (delete lanes you retired)` };
-      }
-      ensureChannel(channel, sender); // policy-free for public channels (G1)
+      // E2.x re-fold (grok t_0cfd1b84 findings 1/2): the near-dup guard, the
+      // cap, and the revive now run INSIDE the message BEGIN IMMEDIATE via
+      // channelEnsureInTxn (groupEnsureInTxn shape) — the pre-txn check+ensure
+      // was a TOCTOU window (two connections both observed count=63 ⇒ 65 rows)
+      // and a committed revival even if the message txn later failed. A post
+      // to a LIVE lane touches channel_tombstones zero times (grok finding 4).
     }
     const mid = newId(sender.split("-")[0]);
     // M5 (round 2): thread is DERIVED from the final id — recomputed on every
@@ -1392,6 +1397,16 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
             d.exec("ROLLBACK"); // never return out of an open txn
             return { error: "not_found", detail: `no such channel: ${requestedChannel ?? channel}` };
           }
+        }
+        // E2.x re-fold (grok t_0cfd1b84 finding 1/2/4): public-lane creation
+        // from the post back door runs the SAME shared core as channel.create,
+        // INSIDE this txn — a usage reject leaves no channel row, a failed
+        // message txn rolls the revival back, and a post to a LIVE lane
+        // touches channel_tombstones zero times. dm~ creation stays dmCreateInTxn's
+        // job (above); general is seeded at open, so the existence check no-ops.
+        if (!dmPending && channel !== "general" && !DM_SHAPED_RE.test(channel) && !d.query("SELECT 1 FROM channels WHERE name=?").get(channel)) {
+          const en = channelEnsureInTxn(channel, sender);
+          if ("error" in en) { d.exec("ROLLBACK"); return en; }
         }
         let id = mid, tries = 0;
         for (;;) {
@@ -1581,7 +1596,9 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     if ((d.query("SELECT id FROM agents WHERE role=? AND id!=?").get(p.to, p.agent) as any)?.id)
       return { error: "identity_conflict", detail: `error: '${p.to}' is held as a role by another agent (N3) — pick a free name.` };
     const t = nowIso();
-    ensureChannel("general", p.to);
+    // general is seeded at open; this is the legacy-DB belt (no tombstone
+    // touch — E2.x re-fold, grok finding 4: hot paths never write tombstones).
+    d.run("INSERT OR IGNORE INTO channels(name,purpose,created_at,created_by) VALUES('general','','',?)", [p.to]);
     const mid = newId(String(p.to).split("-")[0]);
     const fname = `msg-${stamp()}-${p.to}-announce-${mid.split("-").pop()}.md`;
     const m: MsgRow = {
@@ -2070,7 +2087,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     joinAgent, listAgents, post, inbox, read, threadOf, receipts, setStatus, channels, rename,
     tokenCreate, tokenVerify, tokenById, tokenList, tokenRevoke, tokenTouch,
     cursorGet, cursorSet, history, waitStep, tailEvents, eventsHighWater, epoch, gcFloor, rotateEpoch, gc, preflight,
-    allMessages, allMessageIds, messageById, messageByFile, ensureChannel,
+    allMessages, allMessageIds, messageById, messageByFile, channelEnsureInTxn,
     groupCreate, groupJoin, groupLeave, groupDelete, groupList, groupShow, channelCreate, channelDelete,
     canSeeChannel, membershipsOf, deliveredMsgIds, dmMembers, dmMembersFor, dmChannelForPair,
     isActive, recipientsMatch, roleOf, receiptsForMsg, renderMd, touch, close,
