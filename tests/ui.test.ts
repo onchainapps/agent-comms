@@ -379,4 +379,64 @@ describe("M4 web UI (§8)", () => {
     // M-b: stream opens AT the snapshot cursor (§6 handoff)
     expect(UI_HTML).toContain("const cursor = await loadHistory();\n  openStream(cursor);");
   });
+
+  test("UI/UX fold pins (grok B1-B3 / claude B1+M1+M2): bearer scheme survives redaction; marking is unread-scoped and generation-guarded at both edges", async () => {
+    // B1 (both reviewers): the tool layer that reads ui.ts redacts "Bearer <tok>"
+    // to asterisks in its OUTPUT; twice a redacted read was written straight back.
+    // The scheme must be assembled from split literals so that hazard cannot
+    // round-trip, and NO bare asterisk-triple may appear anywhere in the page.
+    expect(UI_HTML).toContain('const authz = () => "Bear" + "er ";');
+    expect(UI_HTML.includes("***")).toBe(false);
+    // Every authorization header the page sends goes through authz() — 4 sites:
+    // rpc(), the /stream.ticket mint, the remember-boot probe, the invite text.
+    const authSites = (UI_HTML.match(/authorization: /g) ?? []).length + (UI_HTML.match(/Authorization: /g) ?? []).length;
+    const authzUses = (UI_HTML.match(/authz\(\) \+/g) ?? []).length;
+    expect(authSites).toBe(4);
+    expect(authzUses).toBe(4);
+    // Live cookie-less probe: the header the page ACTUALLY builds must 200.
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0, secureCookie: false });
+    try {
+      const authz = () => "Bear" + "er "; // the page's own construction, verbatim
+      const call = (method: string, params: unknown) => fetch(`${srv.url}/rpc`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: authz() + tok },
+        body: JSON.stringify({ jsonrpc: "2.0", method, params, id: 1 }),
+      });
+      // login reads params.token (cookie bootstrap); the bearer header is the
+      // fallback for EVERY call after that — exactly the sequence the page runs.
+      const lg = await fetch(`${srv.url}/rpc`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "login", params: { token: tok }, id: 1 }),
+      });
+      expect(lg.status).toBe(200);
+      const ch = await call("channels", {}); // bearer, NO cookie — the plain-HTTP Chrome path
+      expect(ch.status).toBe(200);
+      const tk = await fetch(`${srv.url}/stream.ticket`, { method: "POST", headers: { authorization: authz() + tok } });
+      expect(tk.status).toBe(200); // the §6 mint path grok/claude found dead since 12a1a11
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+
+    // M1 (claude): every deliberate mark is scoped to UNREAD rows so a re-click
+    // marks zero rows, re-emits zero read events, and never rewrites readers[].at.
+    expect(UI_HTML).toContain("Object.assign({ mark: true, unread: true }, extra)");
+    const rawMarks = (UI_HTML.match(/mark: true/g) ?? []).length;
+    expect(rawMarks).toBe(1); // ONLY inside markInbox — no site bypasses the wrapper
+    // B2 (claude D1/D2): the guard bumps at BOTH edges and a discarded snapshot
+    // is rescheduled, never silently dropped.
+    const mi = /async function markInbox[\s\S]*?\n\}/.exec(UI_HTML)![0];
+    expect(mi.includes("markGen++;")).toBe(true);
+    expect(/finally\s*\{\s*markGen\+\+;\s*debUnread\(\);\s*\}/.test(mi)).toBe(true);
+    expect(/if \(g !== markGen\) \{ debUnread\(\); return; \}/.test(UI_HTML)).toBe(true);
+    // the thread-toggle read and the SSE self-read path bump the guard too (grok B2)
+    expect(/rpc\("read", \{ id: k\.id \}\)\.then\(\(\) => \{ markGen\+\+/.test(UI_HTML)).toBe(true);
+    expect(/addEventListener\("read", \(ev\) => \{[\s\S]*?if \(d\.agent === S\.me\) \{ markGen\+\+/.test(UI_HTML)).toBe(true);
+    // B3: failure mode is an EXPLICIT flag, never inferred from set size
+    expect(UI_HTML).toContain("if (S.unreadExact) return S.unread.has(m.id);");
+    expect(UI_HTML.includes("if (S.unread.size) return")).toBe(false);
+    // grok M1: success status must not paint red ("ok" is truthy)
+    expect(UI_HTML).toContain("(isErr === 1 || isErr === true) ? \"err\"");
+    // grok M2: post:as is impersonation, not permission — Post must not be gated on it
+    expect(UI_HTML.includes('if (!S.scopes.includes("post:as")) $("cpost").disabled = true;')).toBe(false);
+  });
 });

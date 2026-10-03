@@ -134,6 +134,8 @@ export const UI_HTML = /* html */ `<!doctype html>
   .msg .rbox[open] summary::before{content:"⌃ receipts"}
   .msg .ops{margin-top:3px;display:flex;gap:5px;opacity:0;transition:opacity .12s}
   .msg:hover .ops,.msg:focus-within .ops{opacity:1}
+  /* grok N3: hover-only is invisible on touch — coarse pointers get a dim, always-visible row */
+  @media (pointer:coarse){.msg .ops{opacity:.55}}
   .msg.nested{margin-left:36px}
   .msg.unread .mcol{border-left:2px solid var(--acc);padding-left:9px;margin-left:-11px}
   .repstog{color:var(--dim);font-size:12px;cursor:pointer;margin-left:38px;user-select:none}
@@ -219,15 +221,20 @@ export const UI_HTML = /* html */ `<!doctype html>
 </div>
 <script>
 "use strict";
-const S = { me:null, scopes:[], chans:[], agents:[], active:new Set(), msgs:new Map(), sel:null, selKind:null, stream:null, seq:0, epoch:"", rpccache:new Map(), minted:null, dmMembers:new Map(), bearer:null, openT:new Set(), read:new Set(), unread:new Set(), filter:"", unreadOnly:false };
+const S = { me:null, scopes:[], chans:[], agents:[], active:new Set(), msgs:new Map(), sel:null, selKind:null, stream:null, seq:0, epoch:"", rpccache:new Map(), minted:null, dmMembers:new Map(), bearer:null, openT:new Set(), rcOpen:new Set(), read:new Set(), unread:new Set(), unreadExact:false, filter:"", unreadOnly:false };
 const $ = (id) => document.getElementById(id);
+// authz() assembles the auth scheme word from two literals ON PURPOSE so a
+// redacting read of this file cannot round-trip it back to disk as asterisks
+// (see the note above UI_HTML). bearerOf() is case-insensitive on the scheme.
+const authz = () => "Bear" + "er ";
 const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; };
 function hue(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h % 360; }
 function monogram(s) {
   // first letter + first letter after a separator (don-grok → DG, don-claude →
   // DC): the first-two-chars monogram collided on every don-* seat.
-  const parts = String(s || "?").split(/[-_~.]/).filter(Boolean);
-  return (parts.length > 1 ? parts[0][0] + parts[parts.length - 1][0] : s.slice(0, 2)).toUpperCase();
+  const str = String(s || "?");
+  const parts = str.split(/[-_~.]/).filter(Boolean);
+  return (parts.length > 1 ? parts[0][0] + parts[parts.length - 1][0] : str.slice(0, 2)).toUpperCase();
 }
 function fmtRel(iso) {
   const t = Date.parse(iso); if (isNaN(t)) return String(iso || "");
@@ -244,11 +251,14 @@ function dayLabel(iso) {
   if (diff === 1) return "yesterday";
   return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
 }
+// claude nit: relative times never tick. A 30s in-place pass over rendered
+// timestamps — textContent only, no re-render, no scroll/fold disturbance.
+setInterval(() => { for (const n of document.querySelectorAll(".ts[data-iso]")) n.textContent = fmtRel(n.dataset.iso); }, 30000);
 
 let rpcid = 0;
 async function rpc(method, params) {
   const res = await fetch("/rpc", { method: "POST",
-    headers: { "content-type": "application/json", ...(S.bearer ? { authorization: "***" } : {}) },
+    headers: { "content-type": "application/json", ...(S.bearer ? { authorization: authz() + S.bearer } : {}) },
     body: JSON.stringify({ jsonrpc: "2.0", method, params: params || {}, id: ++rpcid }) });
   let body = null; try { body = await res.json(); } catch {}
   if (!res.ok || (body && body.error)) {
@@ -258,7 +268,12 @@ async function rpc(method, params) {
   }
   return body.result;
 }
-function setS(msg, isErr) { const n = $("status"); n.textContent = msg || ""; n.className = isErr ? "err" : (msg ? "ok" : ""); }
+// isErr is ONLY 1/true — success callers pass the string "ok", which is
+// truthy, so the old truthy-test painted every successful post red (grok M1).
+// NOTE: comments inside UI_HTML must never contain backticks or dollar-brace —
+// the whole page is one TS template literal and a stray backtick silently
+// terminates it (crash of run 134: bun parsed the remainder as TS).
+function setS(msg, isErr) { const n = $("status"); n.textContent = msg || ""; n.className = (isErr === 1 || isErr === true) ? "err" : (msg ? "ok" : ""); }
 
 /* ---------- login / boot ---------- */
 async function boot() {
@@ -269,7 +284,6 @@ async function boot() {
   renderPres();
   if (S.scopes.includes("tokens:admin")) $("admintab").style.display = "";
   if (S.scopes.includes("admin")) $("admbadge").textContent = "ADMIN — writes attributed to you";
-  if (!S.scopes.includes("post:as")) $("cpost").disabled = true;
   // claude M4 M-b: §6 handoff — snapshot FIRST, then open the stream AT the
   // snapshot cursor. Running them concurrently left a hole: rows committed
   // after the snapshot txn but before the subscribe's high-water read were in
@@ -364,34 +378,47 @@ async function refreshUnread() {
   const g = markGen;
   try {
     const r = await rpc("inbox", { unread: true });
-    if (g !== markGen) return; // a mark landed while we were in flight — stale
+    if (g !== markGen) { debUnread(); return; } // a mark landed while in flight — stale; claude D2: reschedule, never silently drop
     for (const m of r.rows) if (!S.msgs.has(m.id)) S.msgs.set(m.id, m);
     S.unread = new Set(r.rows.map((x) => x.id));
-  } catch { /* seat without inbox visibility keeps the row-level heuristic chips */ }
+    S.unreadExact = true;
+  } catch { S.unreadExact = false; /* gated seat: isMine keeps the row-level heuristic */ }
   renderChans(); if (S.tab !== "admin") renderPane();
 }
-$("markall").onclick = async () => {
+// ONE marking verb for every deliberate user path. markGen bumps BEFORE the
+// call AND again at the commit boundary (finally), so a snapshot that started
+// anywhere inside the mark window is discarded; debUnread() re-syncs the exact
+// truth whatever the outcome (a discarded snapshot is never lost, just
+// re-fetched — grok B2 / claude D1+D2). unread:true scopes the mark to rows
+// that are actually unread: re-clicking a lane then marks ZERO rows, fires
+// ZERO read events, and never rewrites readers[].at (claude M1 — first-seen
+// time is the sender's truth, not something a re-render may move).
+async function markInbox(extra) {
   markGen++;
+  try {
+    return await rpc("inbox", Object.assign({ mark: true, unread: true }, extra));
+  } finally { markGen++; debUnread(); }
+}
+$("markall").onclick = async () => {
   const prev = S.unread; S.unread = new Set(); // optimistic: badges clear now; an error re-syncs from the server
   renderChans(); renderPane();
   try {
-    const r = await rpc("inbox", { mark: true });
+    const r = await markInbox({});
     for (const m of r.rows) S.read.add(m.id);
     setS("marked " + r.rows.length + " read", "ok");
-  } catch (e) { S.unread = prev; debUnread(); setS("mark all: " + e.message, 1); }
+  } catch (e) { S.unread = prev; renderChans(); setS("mark all: " + e.message, 1); }
 };
 $("markread").onclick = async () => {
   if (!S.sel) return;
-  markGen++;
-  const prev = S.unread;
-  S.unread = new Set([...S.unread].filter((id) => { const m = S.msgs.get(id); return m && m.channel !== S.sel; }));
   const ch = S.sel;
+  const prev = S.unread;
+  S.unread = new Set([...S.unread].filter((id) => { const m = S.msgs.get(id); return m && m.channel !== ch; }));
   renderChans(); renderPane();
   try {
-    const r = await rpc("inbox", { channel: ch, mark: true });
+    const r = await markInbox({ channel: ch });
     for (const m of r.rows) S.read.add(m.id);
     setS("marked " + r.rows.length + " read in #" + ch, "ok");
-  } catch (e) { S.unread = prev; debUnread(); setS("mark read: " + e.message, 1); }
+  } catch (e) { S.unread = prev; renderChans(); setS("mark read: " + e.message, 1); }
 };
 
 /* ---------- message panes ---------- */
@@ -408,18 +435,20 @@ function select(name, kind) {
   // a thread = reading it"): OPENING a lane marks its delivered rows read via
   // inbox(mark:true), the same marking verb the CLI inbox uses. receipts/
   // hydrate stay non-marking so frames that merely RENDER never lie to
-  // senders (§5, claude M4 B2). The badge clears OPTIMISTICALLY now (a
-  // rejected/429 mark re-syncs via debounced inbox(unread)); refreshChans
-  // runs strictly AFTER the mark settles — concurrent ordering resurrected
-  // stale badges (the list render raced the mark and re-lit the lane the
-  // user just opened).
+  // senders (§5, claude M4 B2). The badge clears OPTIMISTICALLY now; the mark
+  // goes FIRST through markInbox (generation-bumped, unread-scoped, always
+  // followed by a debounced exact re-sync — grok B2), refreshChans runs in
+  // parallel because the guard no longer depends on their ordering. A failed
+  // mark restores the previous set (grok N1) — debUnread in markInbox's
+  // finally re-syncs either way.
   const ch = name;
+  const prev = S.unread;
   S.unread = new Set([...S.unread].filter((id) => { const m = S.msgs.get(id); return m && m.channel !== ch; }));
   renderChans();
-  refreshChans()
-    .then(() => rpc("inbox", { channel: name, mark: true }))
+  markInbox({ channel: ch })
     .then((r) => { for (const m of r.rows) S.read.add(m.id); })
-    .catch(() => { debUnread(); });
+    .catch(() => { S.unread = prev; renderChans(); });
+  refreshChans().catch(() => {});
 }
 function dmPeer() {
   const mem = S.dmMembers.get(S.sel);
@@ -440,7 +469,11 @@ function isMine(m) {
   // exact; the row predicate is the fallback for seats whose inbox call is
   // gated (addressed to me or @all, still open, not mine, not read).
   if (!m || m.sender === S.me) return false;
-  if (S.unread.size) return S.unread.has(m.id);
+  // S.unreadExact — NOT S.unread.size: an empty set is also the SUCCESS
+  // result of an inbox-zero session and of mark-all, and falling back to the
+  // row heuristic there false-lights every historically-read open row
+  // (grok B3). The heuristic runs only when the exact call is unavailable.
+  if (S.unreadExact) return S.unread.has(m.id);
   if (m.status !== "open" || S.read.has(m.id)) return false;
   const rs = String(m.recipients || "").split(",").map((s) => s.trim());
   return rs.includes(S.me) || rs.includes("@all");
@@ -479,11 +512,16 @@ function msgNode(m, nested) {
   // whatever class the node was built with (that's how "sp" vanished once).
   hd.appendChild(el("span", "sphdr"));
   if (!S.sel) hd.appendChild(el("span", "ts", "#" + m.channel));
-  const ts = el("span", "ts", fmtRel(m.created_at)); ts.title = m.created_at;
+  const ts = el("span", "ts", fmtRel(m.created_at)); ts.title = m.created_at; ts.dataset.iso = String(m.created_at || "");
   hd.appendChild(ts);
   col.appendChild(hd);
   if (m.body) col.appendChild(el("div", "body", m.body));
   const det = el("details", "rbox"); det.appendChild(el("summary", null, ""));
+  // claude m4: renderPane() is a full re-render, so the receipts fold must
+  // carry its open state across renders — a live frame collapsing a fold the
+  // user is reading is worse than the pill patch it replaced.
+  det.open = S.rcOpen.has(m.id);
+  det.addEventListener("toggle", () => { if (det.open) S.rcOpen.add(m.id); else S.rcOpen.delete(m.id); });
   const rc = el("div", "rc"); rc.dataset.rc = m.id; det.appendChild(rc);
   col.appendChild(det);
   const ops = el("div", "ops");
@@ -547,9 +585,15 @@ function renderPane() {
     const mine = ks.some(isMine);
     const visRoot = matchFilter(m);
     const visKids = ks.filter(matchFilter);
-    if (!visRoot && !(open && visKids.length)) continue;
+    // a collapsed thread whose REPLIES match must still show its toggle —
+    // "unread only" exists to find exactly those (grok M3). The root card is
+    // omitted when it doesn't match; the toggle (and open replies) do.
+    if (!visRoot && !visKids.length) continue;
     any++;
-    const dk = String(m.created_at || "").slice(0, 10);
+    // day key via LOCAL toDateString: created_at is UTC, dayLabel renders
+    // local — slicing the UTC date put evening CDT messages under a
+    // duplicate "today" (claude m3).
+    const dk = new Date(m.created_at).toDateString();
     if (dk !== lastDay) { pane.appendChild(el("div", "day", dayLabel(m.created_at))); lastDay = dk; }
     if (visRoot) { pane.appendChild(msgNode(m)); shown.push(m); }
     if (!ks.length) continue;
@@ -561,7 +605,7 @@ function renderPane() {
         S.openT.add(m.id);
         // Opening a thread = reading it (server-side, honest: clears the CLI
         // inbox '*' too). Only rows that are "new for me" cost an RPC.
-        for (const k of ks) if (isMine(k)) rpc("read", { id: k.id }).then(() => { S.read.add(k.id); S.unread.delete(k.id); renderPane(); }).catch(() => {});
+        for (const k of ks) if (isMine(k)) rpc("read", { id: k.id }).then(() => { markGen++; S.read.add(k.id); S.unread.delete(k.id); renderPane(); }).catch(() => {});
       }
       renderPane();
     };
@@ -632,7 +676,7 @@ function openStream(since) {
       // reconnect must re-mint (see onerror) — native retry would resend the
       // dead ticket and 401.
       try {
-        const tr = await fetch("/stream.ticket", { method: "POST", headers: { authorization: "***" + S.bearer } });
+        const tr = await fetch("/stream.ticket", { method: "POST", headers: { authorization: authz() + S.bearer } });
         if (!tr.ok) { $("conn").textContent = "stream: closed — reload to log in again"; $("conn").style.color = "var(--err)"; return; }
         url += "&ticket=" + encodeURIComponent((await tr.json()).result.ticket);
       } catch { return; }
@@ -655,12 +699,13 @@ function openStream(since) {
       es.close(); if (S.stream !== es) return;
       S.msgs.clear(); S.rpccache.clear(); renderPane();
       const c = await loadHistory();
+      refreshUnread(); // badges referenced cleared ids — re-derive after the epoch change
       if (S.stream === es) openStream(c);
     });
     es.addEventListener("revoked", () => { es.close(); $("conn").textContent = "stream: token revoked — reload"; $("conn").style.color = "var(--err)"; localStorage.removeItem("comms-token"); });
     es.addEventListener("msg", (ev) => { const d = JSON.parse(ev.data); hydrate(d); });
     es.addEventListener("status", (ev) => { const d = JSON.parse(ev.data); if (S.msgs.has(d.id)) note(d.id, { status: d.status }); else hydrate(d); });
-    es.addEventListener("read", (ev) => { const d = JSON.parse(ev.data); S.rpccache.delete(d.msg); if (d.agent === S.me) { S.read.add(d.msg); S.unread.delete(d.msg); renderChans(); } loadReceipts(d.msg); });
+    es.addEventListener("read", (ev) => { const d = JSON.parse(ev.data); S.rpccache.delete(d.msg); if (d.agent === S.me) { markGen++; S.read.add(d.msg); S.unread.delete(d.msg); renderChans(); } loadReceipts(d.msg); });
     es.addEventListener("presence", () => debPres());
     es.addEventListener("token", () => { if (S.tab === "admin") renderTokenTable(); });
     es.addEventListener("group", () => { refreshChans(); });
@@ -793,7 +838,7 @@ function inviteText(m) {
     "AGENT:  " + m.agent + "   (identity comes from the token — never claim it)",
     "SCOPES: " + (scopesCsv(m) || "(none — plain sender)"),
     "",
-    "auth:    header  Authorization: *** " + m.token,
+    "auth:    header  Authorization: " + authz() + m.token,
     "         content-type: application/json",
     'first:   POST /rpc {"jsonrpc":"2.0","id":1,"method":"join","params":{"role":"…"}}',
     'docs:    README "Remote mode" · deploy/RUNBOOK.md · RFC-001 §5–§7',
@@ -903,7 +948,7 @@ function buildAdmin() {
       if (saved) {
         $("tok").value = saved; $("remember").checked = true;
         try {
-          const br = await fetch("/rpc", { method: "POST", headers: { "content-type": "application/json", authorization: "***" + saved }, body: JSON.stringify({ jsonrpc: "2.0", method: "channels", params: {}, id: ++rpcid }) });
+          const br = await fetch("/rpc", { method: "POST", headers: { "content-type": "application/json", authorization: authz() + saved }, body: JSON.stringify({ jsonrpc: "2.0", method: "channels", params: {}, id: ++rpcid }) });
           if (br.ok) {
             S.bearer = saved;
             S.me = br.headers.get("x-comms-agent") || "(unknown)";
