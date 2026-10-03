@@ -168,18 +168,6 @@ export async function runSub(session: Session, sub: Sub, opts: { once?: boolean;
     return true;
   };
 
-  const headPass = async (): Promise<boolean> => {
-    headInit = false;
-    const had = burst.size; burst.clear();
-    if (!(await commitScan())) return false;
-    log(`head init: ${had} retained msg(s) skipped (subscription starts at head)`);
-    if (resyncPending) {
-      resyncPending = false;
-      return ring("comms.resync", [], true); // exactly one ring, never a replay storm
-    }
-    return true;
-  };
-
   for (;;) {
     const w = await session.waitStep({ ...(sub.for ? { for: sub.for } : {}), consumer, since: scan || undefined, ...(sub.noAll ? { noAll: true } : {}) });
     if (w.error === "resync") { await recover(w.data); backoff = 500; continue; }
@@ -203,8 +191,20 @@ export async function runSub(session: Session, sub: Sub, opts: { once?: boolean;
     const advanced = w.value.cursor !== scan;
     const pageJump = advanced && Number(w.value.cursor.split(".")[1]) - Number(scan.split(".")[1] ?? 0) >= 500;
     scan = w.value.cursor;
-    if (headInit) { if (!(await headPass())) continue; }
-    else if (advanced) {
+    if (headInit) {
+      // MAJOR-3: scan ALL pages to head discarding matches (>500 events is
+      // normal on a lived-in bus); commit once, at head; then one resync ring.
+      burst.clear();
+      if (advanced) continue;
+      headInit = false;
+      if (!(await commitScan())) continue;
+      log("head init: retained history skipped (subscription starts at head)");
+      if (resyncPending) {
+        resyncPending = false;
+        if (!(await ring("comms.resync", [], true))) await sleep(1000); // one ring, never a replay storm
+      }
+      if (once) return;
+    } else if (advanced) {
       // draining a backlog: ring at the memory bound only (grok: re-step on full pages)
       if (burst.size >= FLUSH_MAX_MSGS && !(await ring("comms.mail", [...burst.values()], true))) await sleep(1000);
       if (pageJump || burst.size < FLUSH_MAX_MSGS) continue; // no sleep while the cursor moves
