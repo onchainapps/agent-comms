@@ -279,6 +279,13 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   const acols = d.query("PRAGMA table_info(agents)").all() as any[];
   if (!acols.some((c) => c.name === "fingerprint"))
     d.exec("ALTER TABLE agents ADD COLUMN fingerprint TEXT");
+  // E2.x re-fold (claude t_3fb757d5 MINOR-2): tombstone attribution on DBs
+  // created by ae824a6 (column added after that commit shipped).
+  {
+    const tcols = d.query("PRAGMA table_info(channel_tombstones)").all() as any[];
+    if (tcols.length && !tcols.some((c) => c.name === "deleted_by"))
+      d.exec("ALTER TABLE channel_tombstones ADD COLUMN deleted_by TEXT");
+  }
   if (!acols.some((c) => c.name === "kind"))
     d.exec("ALTER TABLE agents ADD COLUMN kind TEXT DEFAULT 'agent'");
 
@@ -329,9 +336,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     -- E2.x (claude t_1ed3ec7c MINOR-1): channel retirement memory. Tombstones
     -- participate in the chanNorm near-dup scan so delete-all-variants-then-
     -- recreate cannot resurrect the wildwestgame incident or let a variant
-    -- squat the canonical skeleton during the gap.
+    -- squat the canonical skeleton during the gap. deleted_by (claude t_3fb757d5
+    -- MINOR-2): audit trail — "who retired #x" answers from the DB, not logs.
     CREATE TABLE IF NOT EXISTS channel_tombstones(
-      name TEXT PRIMARY KEY, deleted_at TEXT NOT NULL);
+      name TEXT PRIMARY KEY, deleted_at TEXT NOT NULL, deleted_by TEXT);
     -- M1.5 App G: the ONE confidentiality boundary. Literal member ids only —
     -- role/group/@all are NEVER consulted for access.
     CREATE TABLE IF NOT EXISTS channel_members(
@@ -527,6 +535,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const norm = chanNorm(name);
     for (const r of d.query("SELECT name FROM channels").all() as any[])
       if (r.name !== name && !DM_SHAPED_RE.test(r.name) && chanNorm(r.name) === norm) return { name: r.name, retired: false };
+    // REVIVE (name has its own tombstone): only a LIVE sibling blocks — sibling
+    // tombstones guard against NEW spellings, never against a spelling that
+    // already existed (else delete-variant-then-canonical bricks the skeleton).
+    if (d.query("SELECT 1 FROM channel_tombstones WHERE name=?").get(name)) return null;
     for (const r of d.query("SELECT name FROM channel_tombstones").all() as any[])
       if (r.name !== name && !DM_SHAPED_RE.test(r.name) && chanNorm(r.name) === norm) return { name: r.name, retired: true };
     return null;
@@ -565,10 +577,6 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
             : `channel '${p.name}' already exists as '${dup.name}' (near-duplicate — post to the existing name, or choose a distinct one)` };
         }
         if (channelCapHit(ctx.principal.agentId)) { d.exec("ROLLBACK"); return { error: "usage", detail: `channel squatting cap: ${CHANNEL_CREATE_CAP} channels created per agent (delete lanes you retired)` }; }
-        // E2.x: same-second recreate = contention (group tombstone precedent) —
-        // the second boundary is the resume-handoff floor for cursors.
-        const tomb = (d.query("SELECT deleted_at FROM channel_tombstones WHERE name=?").get(p.name) as any)?.deleted_at as string | undefined;
-        if (tomb !== undefined && nowIso() <= tomb) { d.exec("ROLLBACK"); return { error: "contention", detail: `channel '${p.name}' deleted <1s ago; retry after the second boundary` }; }
         d.run("INSERT INTO channels(name,purpose,created_at,created_by) VALUES(?,?,?,?)",
           [p.name, p.purpose ?? "", nowIso(), ctx.principal.agentId]);
         d.run("DELETE FROM channel_tombstones WHERE name=?", [p.name]); // exact recreate revives
@@ -592,19 +600,21 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (typeof p.name !== "string" || !ID_RE.test(p.name)) return { error: "usage", detail: `invalid channel name: ${p.name}` };
     if (p.name === "general") return { error: "usage", detail: "the general lane is seeded and cannot be deleted" };
-    if (!isRootCtx(ctx) && !hasScope(ctx, "agents:admin")) {
-      const by = (d.query("SELECT created_by FROM channels WHERE name=?").get(p.name) as any)?.created_by;
-      if (by !== ctx.principal.agentId) return { error: "forbidden", detail: "channel.delete requires the creator or agents:admin" };
-    }
+    // NIT-3 (claude t_3fb757d5): existence BEFORE the gate — a non-creator's
+    // typo must answer not_found, not forbidden (TOCTOU moot under §9 single writer).
+    const row = d.query("SELECT created_by FROM channels WHERE name=?").get(p.name) as any | undefined;
+    if (!row) return { error: "not_found", detail: `no such channel: ${p.name}` };
+    if (!isRootCtx(ctx) && !hasScope(ctx, "agents:admin") && row.created_by !== ctx.principal.agentId)
+      return { error: "forbidden", detail: "channel.delete requires the creator or agents:admin" };
     const t = nowIso();
     try {
       d.exec("BEGIN IMMEDIATE");
       try {
         if (!d.query("SELECT name FROM channels WHERE name=?").get(p.name)) { d.exec("ROLLBACK"); return { error: "not_found", detail: `no such channel: ${p.name}` }; }
         d.run("DELETE FROM channels WHERE name=?", [p.name]);
-        d.run(`INSERT INTO channel_tombstones(name,deleted_at) VALUES(?,?)
-               ON CONFLICT(name) DO UPDATE SET deleted_at = excluded.deleted_at
-               WHERE excluded.deleted_at > channel_tombstones.deleted_at`, [p.name, t]);
+        d.run(`INSERT INTO channel_tombstones(name,deleted_at,deleted_by) VALUES(?,?,?)
+               ON CONFLICT(name) DO UPDATE SET deleted_at = excluded.deleted_at, deleted_by = excluded.deleted_by
+               WHERE excluded.deleted_at > channel_tombstones.deleted_at`, [p.name, t, ctx.principal.agentId]);
         d.exec("COMMIT");
       } catch (e) { d.exec("ROLLBACK"); throw e; }
       return { value: { name: p.name, deleted: true } };
@@ -1530,8 +1540,11 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     // survive (claude Q2 monotonic shrink — the scar stops being visible once
     // someone sweeps it; the tombstone keeps the skeleton occupied either way).
     const tombs = new Set((d.query("SELECT name FROM channel_tombstones").all() as any[]).map((r) => r.name));
+    // NIT-1 (claude t_3fb757d5): a name in BOTH tables is hand-SQL residue —
+    // the LIVE row is authoritative, so its history must not be filtered to n:0.
+    const live = new Set((d.query("SELECT name FROM channels").all() as any[]).map((r) => r.name));
     const counts = (d.query("SELECT channel name, COUNT(*) n, MAX(created_at) last FROM messages GROUP BY channel").all() as any[])
-      .filter((c) => !tombs.has(c.name));
+      .filter((c) => !tombs.has(c.name) || live.has(c.name));
     const cmap = new Map<string, any>(counts.map((c) => [c.name, c]));
     for (const c of d.query("SELECT name, purpose FROM channels").all() as any[])
       if (!cmap.has(c.name)) cmap.set(c.name, { name: c.name, n: 0, last: null, purpose: c.purpose });

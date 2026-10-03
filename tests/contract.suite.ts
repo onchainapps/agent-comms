@@ -179,8 +179,10 @@ export function contractSuite(name: string, make: Factory) {
         expect(String((rv as any).detail)).toContain("e2xgame");
 
         // exact-name recreate REVIVES (tombstone cleared → listed again).
-        // Tombstone back-dated past the second boundary (group m-a precedent:
-        // same-second recreate is contention, not revival).
+        // (Backdating is no longer load-bearing — the same-second contention
+        // branch was cargo-culted and removed, claude t_3fb757d5 MINOR-1/Q5:
+        // events carry no channel column and nothing reads channel deleted_at
+        // except that branch. Kept as a harmless determinism pin.)
         (h as any).raw.testDb.run("UPDATE channel_tombstones SET deleted_at = datetime('now','-1 day') WHERE name='e2xgame'");
         const rev = await w.channelCreate({ name: "e2xgame" });
         expect(rev.error).toBeUndefined();
@@ -188,6 +190,27 @@ export function contractSuite(name: string, make: Factory) {
         const names2 = (((await root.channels()) as any).value ?? []).map((c: any) => c.name);
         expect(names2).toContain("e2xgame");
         expect((h as any).raw.testDb.query("SELECT 1 FROM channel_tombstones WHERE name='e2xgame'").get()).toBeNull();
+
+        // MAJOR-1 (claude t_3fb757d5 P1): variant live + canonical live (the
+        // pre-E2 coexistence state), retire variant, retire canonical, revive
+        // canonical (OK — only a LIVE sibling blocks a revive), revive variant
+        // (usage — live sibling again). No bricked skeleton.
+        expect((await w.channelCreate({ name: "e2-x-game2" })).error).toBeUndefined(); // variant first
+        (h as any).raw.testDb.run("INSERT INTO channels(name,purpose,created_at,created_by) VALUES('e2xgame2','',strftime('%Y-%m-%dT%H:%M:%SZ','now'),'e2x-w')"); // canonical, pre-E2 style
+        expect((await w.channelDelete({ name: "e2-x-game2" })).error).toBeUndefined(); // retire variant
+        expect((await w.channelDelete({ name: "e2xgame2" })).error).toBeUndefined(); // retire canonical too
+        const rev2 = await w.channelCreate({ name: "e2xgame2" }); // revive via own tombstone
+        expect(rev2.error).toBeUndefined();
+        expect((rev2 as any).value.created).toBe(true);
+        const rv2b = await w.channelCreate({ name: "e2_x_game2" }); // new spelling still fenced
+        expect(rv2b.error).toBe("usage");
+        expect((await w.channelCreate({ name: "e2-x-game2" })).error).toBe("usage"); // live sibling blocks variant revive
+        // tombstone attribution (claude MINOR-2): who retired it is answerable.
+        expect((await w.channelDelete({ name: "e2xgame2" })).error).toBeUndefined();
+        expect(((h as any).raw.testDb.query("SELECT deleted_by FROM channel_tombstones WHERE name='e2xgame2'").get() as any).deleted_by).toBe(w.agentId);
+
+        // NIT-3 (claude t_3fb757d5): non-creator typo ⇒ not_found, not forbidden.
+        expect((await w.channelDelete({ name: "e2x-nope-at-all" })).error).toBe("not_found");
 
         // general is undeletable; unknown lane is not_found; bad grammar usage.
         expect((await root.channelDelete({ name: "general" })).error).toBe("usage");
