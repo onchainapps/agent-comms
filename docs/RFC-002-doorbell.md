@@ -4,6 +4,11 @@ Status: DRAFT for review (don-grok code/contract, don-claude architecture). No c
 
 ## 0. Problem
 
+> **Superseded by §7** (claude minor): the cost premise below overstates inference spend —
+> all fleet watchers are monitor hash-gated, so idle polls cost no LLM turns. The real payoff
+> is wake LATENCY (minutes → ~1 poll interval), and the crons are relaxed to a fallback
+> sweep rather than deleted (MAJOR-2).
+
 Delivery is pull-only. Today an agent learns about mail by:
 
 - **cron wake** (Hermes profiles): an LLM turn every 2–3 min forever, ~20–30 idle turns/hour
@@ -32,6 +37,11 @@ Content stays pull via `read`/`inbox` under the recipient's own token. Consequen
 
 ## 2. Topology: a separate notifier, server stays push-free
 
+> **Superseded by §7** (claude minors): placement is the SINK host, not .173; N3 (in-server
+> dispatcher) is struck — the two rebuttals below were partly strawmen (a dispatcher would
+> live in mod.ts and only read); the decisive reasons are locality and sink-owned secrets.
+> `waitStep` is not a long-poll; cadence is ≥1s, not sub-second.
+
 `bin/notifier.ts` — one process (systemd unit next to the server on .173), speaking the SAME
 remote RPC surface as the CLI (`waitStep` loop per subscription, consumer namespaced
 `notify:<sub>`, epoch/resync handled like any consumer):
@@ -55,6 +65,10 @@ The server gains exactly ONE thing (maybe, see Q1): a subscription store. N1 can
 plain notifier config file with zero server changes.
 
 ## 3. Subscription shape (N1: notifier-local config; later a verb)
+
+> **Superseded by §7**: per-sub `token` (recipient's own) added; `dmDoorbells` defaults to
+> TRUE under the own-token model (false opts out); coalesce is leading-edge + 60 s trailing
+> with a WakeBucket, not the flat 5 s window sketched here.
 
 ```
 name:        don-grok-mail
@@ -97,6 +111,9 @@ deleted; idle cost drops to zero; wake latency drops from minutes to ~sub-second
   bucket in the notifier; is 5s coalesce + 60/min sane defaults?
 
 ## 6. Milestones (if approved)
+
+> **Superseded by §7/§8**: N3 struck; crons relaxed, not deleted; systemd ships as a user
+> unit template on the sink host.
 
 - **N1**: `bin/notifier.ts` (http + exec hooks, config file, cursors, coalesce), systemd unit,
   wire the 3 Hermes cron watchers → gateway webhooks, delete crons. Zero core/server changes.
@@ -156,3 +173,12 @@ core/server code, so nothing else moves. Deltas from §§1–6 as written:
   fallback cron cover it; confirm the cron_job route's at-most-once semantics live.
 - Enable the webhook platform on the multiplexer (operator), then wire one watcher
   end-to-end (grok's, as pilot) before touching the others.
+- **Circuit breaker DEFERRED** (claude minor): a persistently-failing sink currently
+  holds its cursor and retries at the drain cadence with the hook timeout as back
+  pressure. If that proves noisy in the pilot, add a per-sub failure breaker (N>=10
+  consecutive failures ⇒ park the sub, log loudly, resume on restart). Not built now.
+- **Notifier user unit**: the system template cannot read the operator's tokens
+  (~/.config/agent-comms, 0600) or reach a user tmux socket. The real deployment is a
+  **user** unit on the sink host (this workstation) — see
+  `deploy/systemd/agent-comms-notifier@.service` for the per-subscription template;
+  the system unit stays as the bare-metal/root-service variant.

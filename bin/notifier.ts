@@ -44,11 +44,16 @@
  *       { "name": "wake-pi", "for": "pi",
  *         "hook": { "kind": "exec", "argv": ["tmux","send-keys","-t","pi","check the bus","Enter"] } } ] }
  */
+import { createHmac } from "node:crypto";
 import { RpcBus } from "../src/rpc-bus.ts";
 import type { MsgRow } from "../src/bus.ts";
 import type { Session } from "../src/bus-iface.ts";
 
-type Pointer = { id: string; channel: string; thread: string; sender: string; to: string; type: string; subject: string; created_at: string };
+// Pointer fields are CLOSED (claude MAJOR-5): no subject — a route without a prompt
+// template dumps payload strings into the PROMPT position of an unattended turn, so
+// any addresser would get 200 free-text bytes of instruction. Identity + routing
+// fields only; content stays pull.
+type Pointer = { id: string; channel: string; thread: string; sender: string; to: string; type: string; created_at: string };
 type HttpHook = { kind: "http"; url: string; secret?: string };
 type ExecHook = { kind: "exec"; argv: [string, ...string[]] };
 export type Sub = {
@@ -76,18 +81,35 @@ export class WakeBucket {
 }
 
 export function toPointer(m: MsgRow): Pointer {
-  return { id: m.id, channel: m.channel, thread: m.thread, sender: m.sender, to: m.recipients, type: m.type, subject: m.subject, created_at: m.created_at };
+  return { id: m.id, channel: m.channel, thread: m.thread, sender: m.sender, to: m.recipients, type: m.type, created_at: m.created_at };
 }
 
-export async function fireHook(hook: HttpHook | ExecHook, sub: string, payload: { event: string; subscription: string; messages: Pointer[] }): Promise<void> {
+export async function fireHook(hook: HttpHook | ExecHook, sub: string, payload: { event: string; requestId: string; subscription: string; messages: Pointer[] }, log: (s: string) => void = () => {}): Promise<void> {
   if (hook.kind === "http") {
-    const res = await fetch(hook.url, {
-      method: "POST",
-      headers: { "content-type": "application/json", "user-agent": "agent-comms-notifier/1", ...(hook.secret ? { "x-comms-secret": hook.secret } : {}) },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(10_000),
-    });
+    // Hermes-gateway-compatible (claude MAJOR-4, checked against webhook.py):
+    //  - generic HMAC V2: X-Webhook-Signature-V2 = hex HMAC(secret, "<ts>.<body>"),
+    //    X-Webhook-Timestamp unix-seconds, replay window enforced server-side.
+    //  - X-Request-ID = delivery id ⇒ gateway idempotency dedupes re-rings (1 h TTL).
+    //  - top-level event_type: the gateway reads event_type/type — a bare `event`
+    //    field lands as "unknown" and a filtered route answers 200 "ignored".
+    const body = JSON.stringify({ event_type: payload.event, ...payload });
+    const ts = String(Math.floor(Date.now() / 1000));
+    const headers: Record<string, string> = {
+      "content-type": "application/json", "user-agent": "agent-comms-notifier/1",
+      "x-request-id": payload.requestId,
+    };
+    if (hook.secret) {
+      headers["x-webhook-timestamp"] = ts;
+      headers["x-webhook-signature-v2"] = createHmac("sha256", hook.secret).update(`${ts}.${body}`).digest("hex");
+    }
+    const res = await fetch(hook.url, { method: "POST", headers, body, signal: AbortSignal.timeout(10_000) });
     if (!res.ok) throw new Error(`http ${res.status}`);
+    // A 200 "ignored" means the route filtered the event out — success to us but the
+    // doorbell never fired. Loud, never silent (claude MAJOR-4b).
+    try {
+      const j = await res.json() as any;
+      if (j?.status === "ignored") log(`WARN sink answered ignored (${JSON.stringify(j).slice(0, 120)}) — route filter/secret mismatch? ring was NOT acted on`);
+    } catch { /* non-JSON sink: fine */ }
   } else {
     // exec: argv directly (NO shell — config is operator-owned; message bytes
     // never reach argv, they ride stdin as one JSON line; grok pin 6).
@@ -108,8 +130,9 @@ export async function fireHook(hook: HttpHook | ExecHook, sub: string, payload: 
 }
 
 /** One subscription loop. Returns on --once completion or throws on fatal. */
-export async function runSub(session: Session, sub: Sub, opts: { once?: boolean; log?: (s: string) => void } = {}): Promise<void> {
+export async function runSub(session: Session, sub: Sub, opts: { once?: boolean; log?: (s: string) => void; stop?: () => boolean } = {}): Promise<void> {
   const once = opts.once ?? false;
+  const stopped = opts.stop ?? (() => false);
   const log = opts.log ?? ((s: string) => console.log(`[${sub.name}] ${s}`));
   // E1 rule: the predicate variant MUST live in the consumer key — a noAll cursor
   // sharing the default row would skip rows the other view never rang for.
@@ -150,10 +173,13 @@ export async function runSub(session: Session, sub: Sub, opts: { once?: boolean;
     return true;
   };
 
-  /** ring the hook and (on mail success) commit. force bypasses bucket+window. */
+  /** ring the hook and (on mail success) commit. force bypasses bucket+window.
+   *  X-Request-ID is DETERMINISTIC per ring (last burst id; resync.<position>) so
+   *  the gateway's idempotency cache dedupes at-least-once retries (MAJOR-4c). */
   const ring = async (event: "comms.mail" | "comms.resync", msgs: Pointer[], force: boolean): Promise<boolean> => {
     if (!force && event === "comms.mail" && !bucket.take()) return false; // wake budget spent: hold (at-least-once)
-    try { await fireHook(sub.hook, sub.name, { event, subscription: sub.name, messages: msgs }); }
+    const requestId = event === "comms.resync" ? `resync.${committed}` : (msgs[msgs.length - 1]?.id ?? "");
+    try { await fireHook(sub.hook, sub.name, { event, requestId, subscription: sub.name, messages: msgs }, log); }
     catch (e) {
       log(`hook FAILED (${String(e).slice(0, 160)}) — cursor held at ${committed}; burst retried next drain`);
       return false;
@@ -169,6 +195,7 @@ export async function runSub(session: Session, sub: Sub, opts: { once?: boolean;
   };
 
   for (;;) {
+    if (stopped()) return;
     const w = await session.waitStep({ ...(sub.for ? { for: sub.for } : {}), consumer, since: scan || undefined, ...(sub.noAll ? { noAll: true } : {}) });
     if (w.error === "resync") { await recover(w.data); backoff = 500; continue; }
     if (w.error) {
@@ -199,15 +226,20 @@ export async function runSub(session: Session, sub: Sub, opts: { once?: boolean;
       headInit = false;
       if (!(await commitScan())) continue;
       log("head init: retained history skipped (subscription starts at head)");
-      if (resyncPending) {
-        resyncPending = false;
-        if (!(await ring("comms.resync", [], true))) await sleep(1000); // one ring, never a replay storm
-      }
-      if (once) return;
     } else if (advanced) {
-      // draining a backlog: ring at the memory bound only (grok: re-step on full pages)
+      // draining a backlog: ring at the memory bound only (grok: force-ring is
+      // a MEMORY exception and deliberately bypasses the wake bucket — §8).
       if (burst.size >= FLUSH_MAX_MSGS && !(await ring("comms.mail", [...burst.values()], true))) await sleep(1000);
-      if (pageJump || burst.size < FLUSH_MAX_MSGS) continue; // no sleep while the cursor moves
+      // grok pin 3: immediate re-step ONLY on a >=500 page jump. A partial page
+      // falls through to ring / empty-burst commit / sleep(1000) — the >=1s
+      // cadence protects the recipient's own read bucket from flood tight-loops.
+      if (pageJump) continue;
+    }
+    if (resyncPending && !headInit) {
+      // a failed resync ring RETRIES (pending cleared only on success) — once,
+      // deterministically named, so the sink dedupes if the first attempt landed.
+      if (await ring("comms.resync", [], true)) resyncPending = false;
+      else await sleep(1000);
     }
 
     if (once) { // cron-shaped run: drain-and-flush, bucket/window never hold back

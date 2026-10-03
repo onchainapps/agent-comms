@@ -62,12 +62,12 @@ describe("RFC-002 notifier (N1)", () => {
       await runSub(reader, sub, { once: true });
       expect(s.bursts.length).toBe(1);
       const msg = s.bursts[0].messages[0];
-      expect(msg.subject).toBe("new one");
       expect(msg.channel).toBe("general");
       expect(JSON.stringify(s.bursts[0])).not.toContain("SECRET-BODY");   // pointer-only
       expect(s.bursts[0]).not.toHaveProperty("body");
       expect(msg).not.toHaveProperty("body");
       expect(msg).not.toHaveProperty("file");
+      expect(msg).not.toHaveProperty("subject");  // MAJOR-5: closed field set — no free text into prompt position
       expect(s.bursts[0].event).toBe("comms.mail");
       // cursor advanced exactly once (at-least-once commit after hook)
       const c = await reader.cursorGet({ consumer: "notify.t1" });
@@ -150,8 +150,9 @@ describe("RFC-002 notifier (N1)", () => {
       expect(existsSync(out)).toBe(true);
       const got = JSON.parse(readFileSync(out, "utf8"));
       expect(got.length).toBe(1);
-      expect(got[0].subject).toBe("execme");
+      expect(got[0].id).toMatch(/^20/);
       expect(got[0]).not.toHaveProperty("body");
+      expect(got[0]).not.toHaveProperty("subject"); // MAJOR-5
     } finally { core.close(); rmSync(home, { recursive: true, force: true }); }
   });
 
@@ -238,5 +239,144 @@ describe("RFC-002 notifier (N1)", () => {
     expect(b.take(t0 + 600_001)).toBe(true);
     expect(b.take(t0 + 600_002)).toBe(true);
     expect(b.take(t0 + 600_003)).toBe(false);             // cap honored
+  });
+
+  // ---- verdict round 2 pins (comments 89/91) ----
+
+  test("http hook signs Hermes V2 and names deliveries (MAJOR-4)", async () => {
+    const { home, core, root, sender, reader } = await harness();
+    const { createHmac } = await import("node:crypto");
+    const secret = "nbf-test-secret";
+    const hits: any[] = [];
+    let badSig = 0;
+    const srv = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const raw = await req.text();
+        const ts = req.headers.get("x-webhook-timestamp") ?? "";
+        const sig = req.headers.get("x-webhook-signature-v2") ?? "";
+        const want = createHmac("sha256", secret).update(`${ts}.${raw}`).digest("hex");
+        if (!ts || sig !== want) { badSig++; return new Response("nope", { status: 401 }); }
+        hits.push({ body: JSON.parse(raw), rid: req.headers.get("x-request-id"), ts });
+        return Response.json({ status: "accepted" });
+      },
+    });
+    try {
+      const sub: Sub = { name: "t10", for: "nbf-reader", coalesceMs: 200, hook: { kind: "http", url: `http://127.0.0.1:${srv.port}/p/don-grok/webhooks/bus`, secret } };
+      await runSub(reader, sub, { once: true }); // head init (no ring, no sig needed)
+      await sender.post({ from: "nbf-sender", to: "nbf-reader", type: "note", subject: "signed one", body: "x" });
+      await runSub(reader, sub, { once: true });
+      expect(badSig).toBe(0);                       // V2 verifies the way webhook.py does
+      expect(hits.length).toBe(1);
+      expect(hits[0].body.event_type).toBe("comms.mail"); // top-level event_type (filtered routes must not "ignore")
+      expect(hits[0].rid).toMatch(/^20/);           // X-Request-ID = last burst id (idempotency)
+      srv.stop();
+    } catch (e) { srv.stop(); throw e; }
+    rmSync(home, { recursive: true, force: true }); core.close();
+  });
+
+  test("deterministic X-Request-ID dedupes an at-least-once retry (MAJOR-4c)", async () => {
+    const { home, core, root, sender, reader } = await harness();
+    const seen = new Set<string>();
+    const ids: string[] = [];
+    let n = 0;
+    const srv = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        await req.text();
+        const rid = req.headers.get("x-request-id") ?? "";
+        ids.push(rid);
+        if (rid && seen.has(rid)) return Response.json({ status: "duplicate" });
+        if (rid) seen.add(rid);
+        return (++n <= 1) ? new Response("flaky", { status: 500 }) : Response.json({ status: "accepted" });
+      },
+    });
+    try {
+      const sub: Sub = { name: "t11", for: "nbf-reader", hook: { kind: "http", url: `http://127.0.0.1:${srv.port}/x` } };
+      await runSub(reader, sub, { once: true }); // head init
+      await sender.post({ from: "nbf-sender", to: "nbf-reader", type: "note", body: "retry me" });
+      await runSub(reader, sub, { once: true }); // first attempt fails ⇒ cursor held
+      await runSub(reader, sub, { once: true }); // retry ⇒ SAME request id
+      expect(ids.length).toBe(2);
+      expect(ids[0]).toBe(ids[1]);
+      expect(ids[0]).toMatch(/^20/);
+      srv.stop();
+    } catch (e) { srv.stop(); throw e; }
+    rmSync(home, { recursive: true, force: true }); core.close();
+  });
+
+  test("multi-page head init: 3 pages (1299 events) ⇒ ZERO rings, cursor at head (MAJOR-3 regression pin)", async () => {
+    const { home, h, core, root, sender, reader } = await harness();
+    try {
+      // 620 noise posts = 1240 events + join events ⇒ >2 pages of 500
+      const other = ((await seedAgent(h, root, "nbf-noise", "worker")) as any).value.session as Session;
+      for (let i = 0; i < 620; i++) await other.post({ from: "nbf-noise", to: "nbf-noise", type: "note", body: "n" + i });
+      const s = sink();
+      const sub: Sub = { name: "t12", for: "nbf-reader", hook: { kind: "http", url: s.url } };
+      await runSub(reader, sub, { once: true });
+      expect(s.bursts.length).toBe(0); // no stale announce storm across page boundaries
+      const hw = ((core as any).eventsHighWater()) as number;
+      const c = ((await reader.cursorGet({ consumer: "notify.t12" })) as any).value;
+      expect(c.seq).toBe(hw);          // committed AT head, not mid-drain
+      // and fresh mail after head init still rings exactly once
+      await sender.post({ from: "nbf-sender", to: "nbf-reader", type: "note", body: "real mail" });
+      await runSub(reader, sub, { once: true });
+      expect(s.bursts.length).toBe(1);
+      expect(s.bursts[0].messages.length).toBe(1);
+      s.close();
+    } finally { core.close(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("sub-500 advance does NOT tight-loop: cadence >=1s between steps (grok pin 3)", async () => {
+    const { home, h, core, root, sender, reader } = await harness();
+    try {
+      const s = sink();
+      const sub: Sub = { name: "t13", for: "nbf-reader", hook: { kind: "http", url: s.url }, coalesceMs: 60_000 };
+      await runSub(reader, sub, { once: true }); // head init
+      const other = ((await seedAgent(h, root, "nbf-slow", "worker")) as any).value.session as Session;
+      for (let i = 0; i < 30; i++) await other.post({ from: "nbf-slow", to: "nbf-reader", type: "note", body: "s" + i });
+      // daemon mode: instrument the waitStep cadence through a proxy session
+      const times: number[] = [];
+      const proxy = new Proxy(reader, {
+        get(t, k) {
+          const v = (t as any)[k];
+          if (k === "waitStep") return (p: any) => { times.push(Date.now()); return v.call(t, p); };
+          return typeof v === "function" ? v.bind(t) : v;
+        },
+      });
+      let stopped = false;
+      const run = runSub(proxy, sub, { log: () => {}, stop: () => stopped });
+      await new Promise((r) => setTimeout(r, 3600)); // ~3 idle cadence ticks
+      stopped = true;
+      await run; // graceful exit at the next loop top
+      const gaps = times.slice(1).map((t, i) => t - times[i]);
+      // after catch-up, no gap below ~900ms (the old bug produced a 1ms re-step)
+      const tight = gaps.filter((g) => g < 900).length;
+      expect(tight).toBe(0);
+      expect(times.length).toBeGreaterThanOrEqual(3);
+      s.close();
+      core.close(); rmSync(home, { recursive: true, force: true });
+    } catch (e) { throw e; }
+  });
+
+  test("notifier uses ONLY cursorGet/cursorSet/inbox.wait (Q3 allowlist)", async () => {
+    const { home, core, root, sender, reader } = await harness();
+    try {
+      const calls: string[] = [];
+      const proxy = new Proxy(reader, {
+        get(t, k) {
+          const v = (t as any)[k];
+          if (typeof v === "function") return (...args: any[]) => { if (!["cursorGet", "cursorSet", "waitStep"].includes(String(k))) calls.push(String(k)); return v.apply(t, args); };
+          return v;
+        },
+      });
+      const s = sink();
+      const sub: Sub = { name: "t14", for: "nbf-reader", hook: { kind: "http", url: s.url } };
+      await runSub(proxy, sub, { once: true });
+      await sender.post({ from: "nbf-sender", to: "nbf-reader", type: "note", body: "x" });
+      await runSub(proxy, sub, { once: true });
+      expect(calls).toEqual([]);
+      s.close();
+    } finally { core.close(); rmSync(home, { recursive: true, force: true }); }
   });
 });

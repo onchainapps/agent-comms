@@ -1,0 +1,24 @@
+# RFC-002 N1 doorbell notifier — USER unit (the real deployment shape on the sink
+# host). Runs as the operator, reads operator-owned tokens (~/.config/agent-comms,
+# 0600) and reaches the user tmux socket + the loopback gateway. One instance per
+# config file: systemctl --user enable --now agent-comms-notifier@workstation
+# (reads ~/.config/agent-comms/notifier.<instance>.json).
+[Unit]
+Description=agent-comms delivery doorbell notifier (%i)
+Documentation=file:///opt/agent-comms/current/docs/RFC-002-doorbell.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.bun/bin/bun %h/src/agent-comms/bin/notifier.ts --config %h/.config/agent-comms/notifier.%i.json
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+# Deliberately NO ProtectHome/ProtectSystem=strict: the config + recipient tokens
+# and (for exec hooks) the user tmux socket all live under the operator's home.
+
+[Install]
+WantedBy=default.target
