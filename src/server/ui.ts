@@ -860,8 +860,12 @@ function renderMinted() {
   const cb = el("button", "mini", "copy"); cb.onclick = () => navigator.clipboard && navigator.clipboard.writeText(S.minted.token).then(() => { cb.textContent = "copied"; });
   const ci = el("button", "mini", "copy invite");
   ci.onclick = () => navigator.clipboard && navigator.clipboard.writeText(inviteText(S.minted)).then(() => { ci.textContent = "invite copied"; });
+  // RFC-003 N1b: a link the guest just pastes into chat — the fragment is
+  // stripped by the boot IIFE on arrival (replaceState BEFORE any fill).
+  const cl = el("button", "mini", "copy invite link");
+  cl.onclick = () => navigator.clipboard && navigator.clipboard.writeText(location.origin + "/#token=" + S.minted.token).then(() => { cl.textContent = "link copied"; });
   const dx = el("button", "mini", "dismiss"); dx.onclick = () => { S.minted = null; renderMinted(); };
-  d.appendChild(cb); d.appendChild(document.createTextNode(" ")); d.appendChild(ci); d.appendChild(document.createTextNode(" ")); d.appendChild(dx);
+  d.appendChild(cb); d.appendChild(document.createTextNode(" ")); d.appendChild(ci); d.appendChild(document.createTextNode(" ")); d.appendChild(cl); d.appendChild(document.createTextNode(" ")); d.appendChild(dx);
   const det = el("details"); const sm = el("summary"); sm.textContent = "preview invite text"; det.appendChild(sm);
   const pre = el("pre", "mono"); pre.textContent = inviteText(S.minted); det.appendChild(pre);
   d.appendChild(det);
@@ -872,7 +876,7 @@ async function renderTokenTable() {
   let tk; try { tk = await rpc("token.list", {}); } catch (e) { box.textContent = ""; box.appendChild(el("p", null, "token.list: " + e.message)); return; }
   const tbl = el("table");
   const trh = el("tr");
-  for (const c of ["#", "agent", "kind", "prefix", "label", "scopes", "last used", "state", ""]) trh.appendChild(el("th", null, c));
+  for (const c of ["#", "agent", "kind", "prefix", "label", "scopes", "lanes", "last used", "state", ""]) trh.appendChild(el("th", null, c));
   tbl.appendChild(trh);
   for (const t of tk.tokens) {
     const tr = el("tr");
@@ -882,6 +886,8 @@ async function renderTokenTable() {
     tr.appendChild(el("td", "mono", t.prefix));
     tr.appendChild(el("td", null, t.label || "—"));
     tr.appendChild(el("td", "mono", (t.scopes || []).join(",")));
+    // RFC-003: lanes chip — scoped seats show their closed list; unrestricted stays blank
+    tr.appendChild(el("td", "mono", Array.isArray(t.lanes) && t.lanes.length ? t.lanes.join(",") : "—"));
     tr.appendChild(el("td", "mono", t.last_used || "—"));
     tr.appendChild(el("td", t.revoked_at ? "rev" : "", t.revoked_at ? "revoked" : "live"));
     const td = el("td");
@@ -916,6 +922,11 @@ function buildAdmin() {
   for (const s of SC) { const l = el("label", "ck"); const c = el("input"); c.type = "checkbox"; l.appendChild(c); l.appendChild(document.createTextNode(s)); row2.appendChild(l); cks[s] = c; }
   const fc = el("label", "ck"); const fcb = el("input"); fcb.type = "checkbox"; fc.appendChild(fcb); fc.appendChild(document.createTextNode("force (bootstrap guard)")); row2.appendChild(fc);
   f.appendChild(row2);
+  // RFC-003 N1b: lanes input — comma-separated closed list; the server's
+  // mint validation (live-at-mint, fail-closed) answers verbatim in the err div.
+  const row3 = el("div", "row"); row3.style.marginTop = "8px";
+  const ln = el("input"); ln.placeholder = "lanes (comma-separated; empty = unrestricted)"; ln.style.flex = "1"; ln.style.minWidth = "200px"; row3.appendChild(ln);
+  f.appendChild(row3);
   const go = el("button", null, "create"); go.style.marginTop = "8px"; f.appendChild(go);
   const err = el("div", "rev"); f.appendChild(err);
   go.onclick = async () => {
@@ -925,11 +936,12 @@ function buildAdmin() {
     if (lab.value.trim()) p.label = lab.value.trim();
     const sel = SC.filter((s) => cks[s].checked);
     if (sel.length) p.scopes = sel;
+    if (ln.value.trim()) p.lanes = ln.value.split(",").map((s) => s.trim()).filter(Boolean);
     if (fcb.checked) p.force = true;
     try {
       const r = await rpc("token.create", p);
-      S.minted = { token: r.token, prefix: r.prefix, agent: r.agentId, label: p.label, scopes: r.scopes };
-      ag.value = ""; lab.value = ""; for (const s of SC) cks[s].checked = false; fcb.checked = false;
+      S.minted = { token: r.token, prefix: r.prefix, agent: r.agentId, label: p.label, scopes: r.scopes, lanes: r.lanes };
+      ag.value = ""; lab.value = ""; for (const s of SC) cks[s].checked = false; fcb.checked = false; if (ln) ln.value = "";
       renderMinted(); renderTokenTable();
     } catch (e) { err.textContent = "create failed: " + e.message; }
   };
@@ -938,6 +950,14 @@ function buildAdmin() {
 
 /* ---------- start: probe an existing session cookie ---------- */
 (async () => {
+  // RFC-003 N1b: invite prefill — a copy-invite-link URL ends in /#token=ac_...
+  // The fragment never crosses the wire, but the URL bar and session history
+  // DO keep it — strip it with replaceState BEFORE anything else runs (a
+  // token left in history is not "shown once"), then fill + focus. NEVER
+  // auto-submit: the human decides when the credential is spent.
+  const fm = /[#&]token=(ac_[A-Za-z0-9_-]{16,})/.exec(location.hash);
+  const inviteTok = fm ? fm[1] : null;
+  if (fm) history.replaceState(null, "", location.pathname + location.search);
   // one raw call: 401 ⇒ show the login card; 200 ⇒ identity from x-comms-*
   // (§7: identity rides the first response's headers — zero extra RPC).
   try {
@@ -947,8 +967,13 @@ function buildAdmin() {
       // browsers (Chrome over plain HTTP) can still boot: probe the saved
       // token as bearer; if it authenticates, boot in bearer mode silently.
       const saved = localStorage.getItem("comms-token");
+      if (inviteTok && !saved) {
+        // fresh invite on a clean device: prefill, don't persist, don't submit
+        $("tok").value = inviteTok; $("tok").focus();
+        return;
+      }
       if (saved) {
-        $("tok").value = saved; $("remember").checked = true;
+        $("tok").value = inviteTok || saved; $("remember").checked = true;
         try {
           const br = await fetch("/rpc", { method: "POST", headers: { "content-type": "application/json", authorization: authz() + saved }, body: JSON.stringify({ jsonrpc: "2.0", method: "channels", params: {}, id: ++rpcid }) });
           if (br.ok) {

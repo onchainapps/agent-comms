@@ -440,6 +440,29 @@ describe("M4 web UI (§8)", () => {
     expect(UI_HTML.includes('if (!S.scopes.includes("post:as")) $("cpost").disabled = true;')).toBe(false);
   });
 
+  test("RFC-003 N1b pins: invite prefill strips the fragment BEFORE filling and NEVER auto-submits; invite link + lanes chip exist", () => {
+    // the fragment parse and the replaceState must both live in the boot IIFE,
+    // and replaceState must come BEFORE the first fill (a token left in URL
+    // bar + history is not "shown once").
+    const boot = /\/\* ---------- start: probe an existing session cookie ---------- \*\/[\s\S]*$/.exec(UI_HTML)![0];
+    const strip = boot.indexOf("history.replaceState");
+    const fill = boot.indexOf('$("tok").value = inviteTok');
+    expect(strip).toBeGreaterThan(-1);
+    expect(fill).toBeGreaterThan(-1);
+    expect(strip).toBeLessThan(fill);
+    // shape-check: ac_ + >=16 chars only — garbage fragments never touch the field
+    expect(boot).toContain("/[#&]token=(ac_[A-Za-z0-9_-]{16,})/.exec(location.hash)");
+    // NEVER auto-submit: the prefill path must not click Login or call login
+    const prefillPath = boot.slice(fill, boot.indexOf("return;", fill));
+    expect(prefillPath.includes("click()")).toBe(false);
+    expect(prefillPath.includes("login")).toBe(false);
+    // copy invite link builds origin + /#token= (same fragment grammar)
+    expect(UI_HTML).toContain('location.origin + "/#token=" + S.minted.token');
+    // lanes chip in the token table + lanes input in the mint form
+    expect(UI_HTML).toContain('"lanes", "last used"');
+    expect(UI_HTML).toContain("p.lanes = ln.value.split(");
+  });
+
   test("RFC-003 pin 11 (invite half): the invite text states the lane grant — a scoped guest must know its world", () => {
     // the LANES line rides in the invite block, keyed off m.lanes (array ⇒ csv,
     // null/empty ⇒ explicit unrestricted wording — never a silent omission)
