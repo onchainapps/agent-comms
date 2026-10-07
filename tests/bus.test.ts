@@ -161,7 +161,7 @@ describe("tokens (§4/§5)", () => {
   test("server principal WITHOUT tokens:admin cannot mint (P11)", () => {
     const home = tmp();
     const bus = srv(home);
-    const ctx = serverCtx("pleb", []);
+    const ctx = serverCtx("pleb", null, []);
     bus.testDb.run("INSERT INTO agents(id,role,last_seen) VALUES('pleb','p','2026-01-01T00:00:00Z')");
     expect(bus.tokenCreate(ctx, { agent: "x", scopes: [] }).error).toBe("forbidden"); // M9: valid cred lacking scope ⇒ -32002
     bus.close(); rmSync(home, { recursive: true, force: true });
@@ -186,8 +186,8 @@ describe("idempotency (§6)", () => {
     // bootstrap via a LOCAL opener (§5: bootstrap is local-only), then the
     // server-mode principal uses its own token scopes
     const bootHome = bus; // same DB; mint through the server with an admin ctx
-    bootHome.tokenCreate(serverCtx("cli1", ["tokens:admin"]), { agent: "cli1", admin: true });
-    const ctx = serverCtx("cli1", ["read:all", "post:as", "tokens:admin", "agents:admin"]);
+    bootHome.tokenCreate(serverCtx("cli1", null, ["tokens:admin"]), { agent: "cli1", admin: true });
+    const ctx = serverCtx("cli1", null, ["read:all", "post:as", "tokens:admin", "agents:admin"]);
     const p1 = bus.post(ctx, { from: "cli1", to: "x", type: "note", body: "b", subject: "s", idempotencyKey: "k1" });
     expect(p1.error).toBeUndefined();
     const p2 = bus.post(ctx, { from: "cli1", to: "x", type: "note", body: "b", subject: "s", idempotencyKey: "k1" });
@@ -246,7 +246,7 @@ describe("history handoff (§6 nit + finding 8)", () => {
   test("newest page, cursor=last delivered, no hole on handoff", () => {
     const home = tmp();
     const bus = srv(home);
-    const ctx = serverCtx("don", ["read:all"]);
+    const ctx = serverCtx("don", null, ["read:all"]);
     bus.testDb.run("INSERT INTO agents(id,role,last_seen) VALUES('don','d','2026-01-01T00:00:00Z')");
     const h0 = bus.history(ctx, {});
     for (let i = 0; i < 5; i++) bus.post(ctx, { from: "don", to: "other", type: "note", body: `m${i}` });
@@ -264,14 +264,14 @@ describe("history handoff (§6 nit + finding 8)", () => {
   test("history requires read:all in server mode", () => {
     const home = tmp();
     const bus = srv(home);
-    expect(bus.history(serverCtx("x", []), {}).error).toBe("forbidden");
+    expect(bus.history(serverCtx("x", null, []), {}).error).toBe("forbidden");
     bus.close(); rmSync(home, { recursive: true, force: true });
   });
 
   test("history internal-Res catch is live and rollback-guarded (claude round-5 m1)", () => {
     const home = tmp();
     const bus = srv(home);
-    const ctx = serverCtx("don", ["read:all"]);
+    const ctx = serverCtx("don", null, ["read:all"]);
     bus.testDb.run("INSERT INTO agents(id,role,last_seen) VALUES('don','d','2026-01-01T00:00:00Z')");
     bus.post(ctx, { from: "don", to: "other", type: "note", body: "x" });
     // Force the catch: drop meta.epoch so the in-txn epoch() read throws (claude Q4).
@@ -335,11 +335,11 @@ describe("rename (§4 transactional)", () => {
     const home = tmp();
     const bus = srv(home);
     bus.testDb.run("INSERT INTO agents(id,role,last_seen) VALUES('old','lab','2026-01-01T00:00:00Z')");
-    const ctx = serverCtx("old", ["post:as", "read:all", "tokens:admin", "agents:admin"]);
+    const ctx = serverCtx("old", null, ["post:as", "read:all", "tokens:admin", "agents:admin"]);
     const p = bus.post(ctx, { from: "old", to: "other", type: "note", body: "b" });
     const mid = (p as any).value.id;
     bus.testDb.run("INSERT INTO reads(agent,msg,read_at) VALUES('old',?,'now')", [mid]);
-    bus.tokenCreate(serverCtx("old", ["tokens:admin", "read:all"]), { agent: "old", scopes: ["read:all"] });
+    bus.tokenCreate(serverCtx("old", null, ["tokens:admin", "read:all"]), { agent: "old", scopes: ["read:all"] });
     bus.cursorSet("old", "cli", bus.epoch(), 5);
     const r = bus.rename(ctx, { agent: "old", to: "new" });
     expect(r.error).toBeUndefined();

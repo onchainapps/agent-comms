@@ -1045,6 +1045,222 @@ export function contractSuite(name: string, make: Factory) {
       });
     });
 
+    // ══════════ RFC-003 lane-scoped seats (rev-1 §6 pin list 1–11) ══════════
+    const lanesSess = async (h: BusHandle, root: Session, id: string, lanes: string[], scopes: string[] = []) => {
+      const tc = await root.tokenCreate({ agent: id, scopes: scopes as any, lanes });
+      expect(tc.error).toBeUndefined();
+      const s = (h as any).session({ token: (tc as any).value.token }) as Session;
+      const j = await s.joinAgent({ agent: id, role: "guest" });
+      expect(j.error).toBeUndefined();
+      return s;
+    };
+
+    test("RFC-003 1: default shape — lanes omitted/null ⇒ unrestricted; invalid shapes are usage; tokenVerify carries the Set", async () => {
+      await withBus(async (h, root) => {
+        const g = await root.tokenCreate({ agent: "r3g", scopes: ["read:all"] });
+        for (let i = 0; i < 32; i++) await root.channelCreate({ name: "lane" + i }); // lanes exist at mint (claude M3)
+        expect((g as any).value.lanes).toBeNull();
+        expect((await root.tokenCreate({ agent: "r3a", lanes: "notanarray" as any })).error).toBe("usage"); // D2: Array.isArray FIRST
+        expect((await root.tokenCreate({ agent: "r3b", lanes: [] })).error).toBe("usage");                 // claude B1: [] rejected
+        expect((await root.tokenCreate({ agent: "r3c", lanes: [1, "general"] as any })).error).toBe("usage"); // typeof before regex
+        expect((await root.tokenCreate({ agent: "r3d", lanes: ["Has Spaces!"] })).error).toBe("usage");
+        expect((await root.tokenCreate({ agent: "r3e", lanes: Array.from({ length: 33 }, (_, i) => "l" + i) })).error).toBe("usage"); // cap 32
+        expect((await root.tokenCreate({ agent: "r3f", lanes: Array.from({ length: 32 }, (_, i) => "lane" + i) })).error).toBeUndefined();
+        // pin 11: tokenVerify returns the lane Set on the principal; the CLI-less
+        // raw surface proves it without the HTTP layer:
+        const raw = (h as any).raw;
+        const tv = raw.tokenVerify("r3f" + "-nope"); // wrong secret ⇒ error, shape stays Res
+        expect(!!tv.error).toBe(true);
+        const tok = await root.tokenCreate({ agent: "r3g2", lanes: ["general"] });
+        const tv2 = raw.tokenVerify((tok as any).value.token) as any;
+        expect([...tv2.value.lanes].sort()).toEqual(["general"]);
+      });
+    });
+
+    test("RFC-003 2: mint fail-closed — lane must be LIVE (near-dup names the sibling); scoped principal cannot mint; admin scopes rejected with lanes", async () => {
+      await withBus(async (h, root) => {
+        await root.channelCreate({ name: "arena" });
+        expect((await root.tokenCreate({ agent: "r3m1", lanes: ["ghostlane"] })).error).toBe("usage"); // R2: live at mint
+        expect((await root.tokenCreate({ agent: "r3m0", lanes: ["ARENA"] })).error).toBe("usage"); // invalid FORM
+        const nd = await root.tokenCreate({ agent: "r3m2", lanes: ["a-rena"] }); // chanNorm("a-rena")=="arena" ⇒ near-dup
+        expect(nd.error).toBe("usage");
+        expect(String((nd as any).detail)).toContain("arena"); // minter is unrestricted ⇒ may name the sibling
+        expect((await root.tokenCreate({ agent: "r3m3", lanes: ["general"], scopes: ["tokens:admin"] as any })).error).toBe("usage"); // claude M4
+        expect((await root.tokenCreate({ agent: "r3m4", lanes: ["general"], scopes: ["agents:admin"] as any })).error).toBe("usage");
+        const seat = await lanesSess(h, root, "r3seat", ["general"]);
+        expect((await seat.tokenCreate({ agent: "r3kid" })).error).toBe("forbidden"); // grok M2 belt
+        expect((await seat.tokenList()).error).toBe("forbidden");
+        expect((await seat.tokenRevoke({ id: 1 })).error).toBe("forbidden");
+      });
+    });
+
+    test("RFC-003 3: NULL/''/corrupt column — legacy token byte-identical, empty sees nothing, corrupt fails CLOSED", async () => {
+      await withBus(async (h, root) => {
+        await root.channelCreate({ name: "plaza" });
+        await root.post({ from: "root", to: "*", type: "note", body: "hello plaza", channel: "plaza" });
+        const legacy = await root.tokenCreate({ agent: "r3legacy", scopes: ["read:all"] });
+        let ls = (h as any).session({ token: (legacy as any).value.token }) as Session;
+        await ls.joinAgent({ agent: "r3legacy", role: "op" });
+        expect(((await ls.history({ channel: "plaza" })) as any).value.rows.length).toBe(1); // NULL = byte-identical
+        // hand-written column writes (the ONLY writers of '' are migrations/tests).
+        // wrapSession snapshots the token row ⇒ REBUILD the session per column state.
+        const rdb = (h as any).raw;
+        const resess = async () => {
+          const s2 = (h as any).session({ token: (legacy as any).value.token }) as Session;
+          await s2.joinAgent({ agent: "r3legacy", role: "op" });
+          return s2;
+        };
+        // empty grant ⇒ sees nothing: channels() has no plaza, history is empty
+        rdb.testDb.run("UPDATE tokens SET lanes='' WHERE agent_id='r3legacy'");
+        ls = await resess();
+        expect(((await ls.history({ channel: "plaza" })) as any).value.rows.length).toBe(0);
+        expect(((await ls.channels()) as any).value.some((c: any) => c.name === "plaza")).toBe(false);
+        // corrupt ⇒ deny-all, NEVER unrestricted
+        rdb.testDb.run("UPDATE tokens SET lanes='???~~~' WHERE agent_id='r3legacy'");
+        ls = await resess();
+        expect(((await ls.history({ channel: "plaza" })) as any).value.rows.length).toBe(0);
+        expect(((await ls.channels()) as any).value.some((c: any) => c.name === "plaza")).toBe(false);
+        // restore to unrestricted ⇒ the downgraded-DB shape (column absent ⇒ NULL)
+        rdb.testDb.run("UPDATE tokens SET lanes=NULL WHERE agent_id='r3legacy'");
+        ls = await resess();
+        expect(((await ls.history({ channel: "plaza" })) as any).value.rows.length).toBe(1);
+      });
+    });
+
+    test("RFC-003 4: scoped invisibility across every surface — inbox/channels/read/receipts/status not_found, threadOf drops, join unresolved ignores foreign lanes (grok M1)", async () => {
+      await withBus(async (h, root) => {
+        await root.channelCreate({ name: "secret" });
+        const hid = ((await root.post({ from: "root", to: "r3g4", type: "ask", body: "hidden mail", channel: "secret" })) as any).value.id;
+        const pub = ((await root.post({ from: "root", to: "*", type: "note", body: "public noise", channel: "general" })) as any).value.id;
+        const seat = await lanesSess(h, root, "r3g4", ["general"]);
+        expect(((await seat.inbox({ agent: "r3g4" })) as any).value.rows.length).toBe(0); // ask in a hidden lane
+        expect(((await seat.read({ agent: "r3g4", id: hid })) as any).error).toBe("not_found");
+        expect((await seat.receipts(hid) as any).error).toBe("not_found");
+        expect(((await seat.setStatus({ agent: "r3g4", id: hid, state: "done" })) as any).error).toBe("not_found");
+        expect(((await seat.threadOf(hid)) as any).error).toBe("not_found"); // ALL rows hidden ⇒ not_found (drop semantics)
+        expect(((await seat.channels()) as any).value.some((c: any) => c.name === "secret")).toBe(false);
+        const ch = await seat.channels();
+        expect((ch as any).value.some((c: any) => c.name === "general")).toBe(true);
+        // threadOf DROP when only part is hidden: thread root in general, reply smuggled into secret via explicit thread
+        await root.post({ from: "root", to: "*", type: "reply", body: "reply in hidden lane", channel: "secret", thread: pub });
+        const th = (await seat.threadOf(pub)) as any;
+        expect(th.error).toBeUndefined();
+        expect(th.value.rows.every((r: any) => r.channel === "general")).toBe(true);
+        // grok M1: foreign-lane volume must not leak through join unresolved
+        const j0 = await seat.joinAgent({ agent: "r3g4", role: "guest" });
+        const base = (j0 as any).value.unresolved;
+        await root.post({ from: "root", to: "r3g4", type: "ask", body: "another hidden ask", channel: "secret" });
+        const j1 = await seat.joinAgent({ agent: "r3g4", role: "guest" });
+        expect((j1 as any).value.unresolved).toBe(base); // the ask lives in an invisible lane ⇒ invisible volume
+      });
+    });
+
+    test("RFC-003 5: history lane predicate in BOTH branches BEFORE LIMIT; read:all does not bypass; since-paging never livelocks", async () => {
+      await withBus(async (h, root) => {
+        await root.channelCreate({ name: "foreign" });
+        for (let i = 0; i < 3; i++) await root.post({ from: "root", to: "*", type: "note", body: "f" + i, channel: "foreign" });
+        const inl = ((await root.post({ from: "root", to: "*", type: "note", body: "mine", channel: "general" })) as any).value.id;
+        const seat = await lanesSess(h, root, "r3h5", ["general"], ["read:all"]); // read:all must NOT bypass lanes
+        const snap = (await seat.history({ channel: "foreign" })) as any;
+        expect(snap.value.rows.length).toBe(0);
+        let since = snap.value.cursor, pages = 0;
+        for (;;) { const hp = (await seat.history({ since })) as any; pages++; expect(hp.value.rows.every((r: any) => r.channel !== "foreign")).toBe(true); if (!hp.value.hasMore) break; since = hp.value.cursor; expect(pages).toBeLessThan(10); } // no livelock: cursor advances through foreign rows
+        const g = (await seat.history({ channel: "general" })) as any;
+        expect(g.value.rows.map((r: any) => r.id)).toContain(inl);
+      });
+    });
+
+    test("RFC-003 6: post gate on the RESOLVED channel — default→general, thread/re inheritance, out-of-list and in-list-missing uniform forbidden, usage wins, scoped dm sugar refused, no revive through the back door", async () => {
+      await withBus(async (h, root) => {
+        await root.channelCreate({ name: "tmp" });
+        const inRoot = ((await root.post({ from: "root", to: "*", type: "note", body: "anchor", channel: "general" })) as any).value.id;
+        const seat = await lanesSess(h, root, "r3p6", ["general"]);
+        expect(((await seat.post({ from: "r3p6", to: "*", type: "note", body: "default" })) as any).value.channel).toBe("general");
+        const out = await seat.post({ from: "r3p6", to: "*", type: "note", body: "x", channel: "foreign6" });
+        const missing = await seat.post({ from: "r3p6", to: "*", type: "note", body: "x", channel: "tmp" }); // in-list, not granted... granted? NO — lanes=[general]; tmp NOT granted here
+        expect(out.error).toBe("forbidden");
+        expect(missing.error).toBe("forbidden");
+        expect((out as any).detail).toBe((missing as any).detail.replace("tmp", "foreign6")); // uniform template ⇒ oracle-free
+        // re/thread INHERIT a foreign channel ⇒ the gate runs on the RESOLVED value (grok B3)
+        const fr = await seat.post({ from: "r3p6", to: "*", type: "reply", body: "x", re: inRoot, channel: "foreign6" });
+        expect(fr.error).toBe("forbidden"); // explicit foreign channel still refused post-resolution
+        const inh = await seat.post({ from: "r3p6", to: "*", type: "reply", body: "x", re: inRoot });
+        expect((inh as any).value.channel).toBe("general"); // inherited general ⇒ allowed
+        expect((await seat.post({ from: "r3p6", to: "*", type: "note", body: "x", channel: 123 as any })).error).toBe("usage"); // usage BEFORE the gate
+        // `to` == peer (m6 rule); peer is a real AGENT so dmGate passes and the
+        // refusal must come from the LANE gate (dmPending), not the dm gate.
+        const dm6 = await seat.post({ from: "r3p6", to: "root", type: "note", body: "x", dm: "root" });
+        expect(dm6.error).toBe("forbidden"); // scoped seats never CREATE a dm lane
+        expect(String((dm6 as any).detail)).toContain("lane-scoped");
+        expect((await seat.post({ from: "r3p6", to: "nosuchpeer", type: "note", body: "x", dm: "nosuchpeer" })).error).toBe("not_found"); // dmGate wins over the lane gate
+        // unrestricted revives through the back door exactly as before (byte-identical)
+        await root.channelDelete({ name: "tmp" });
+        const rev = await root.post({ from: "root", to: "*", type: "note", body: "revive", channel: "tmp" });
+        expect((rev as any).value.channel).toBe("tmp");
+      });
+    });
+
+    test("RFC-003 7: channel.create in-list materialize / out-of-list uniform forbidden / hidden sibling unnamed; channel.delete + rename scoped-forbidden", async () => {
+      await withBus(async (h, root) => {
+        await root.channelCreate({ name: "planned" });
+        const seat = await lanesSess(h, root, "r3c7", ["planned", "general"]); // LIVE at mint (R2)
+        expect((await seat.channelCreate({ name: "planned" }) as any).value.created).toBe(false); // already live ⇒ idempotent
+        await root.channelDelete({ name: "planned" });                          // operator retires
+        expect((await seat.channelCreate({ name: "planned" }) as any).value.created).toBe(true); // blessed materialize (listed lane)
+        const o1 = await seat.channelCreate({ name: "elsewhere" });
+        const o2 = await seat.channelCreate({ name: "ghost7" });
+        expect(o1.error).toBe("forbidden"); expect(o2.error).toBe("forbidden");
+        expect((o1 as any).detail).toBe((o2 as any).detail.replace("ghost7", "elsewhere")); // uniform shape, no oracle
+        // dup with a HIDDEN sibling: near-dup of foreign7 (live, outside lanes) — must NOT name it (grok B5)
+        await root.channelCreate({ name: "foreign7" });
+        const dup = await seat.channelCreate({ name: "foreign_7" }); // chanNorm("foreign_7")=="foreign7", hidden from the seat
+        expect(dup.error).toBe("forbidden"); // hidden sibling ⇒ uniform out-of-list error, never a named usage
+        expect(String((dup as any).detail)).not.toContain("foreign7");
+        // a near-dup of a VISIBLE lane still answers out-of-list: the lane gate
+        // runs BEFORE the dup scan (fail-closed beats helpfulness) — a seat can
+        // never hold a lane that is a near-dup of another (mint refuses, pin 2).
+        // unrestricted keeps the named pointer byte-identically
+        const dupU = await root.channelCreate({ name: "foreign-7" }); // chanNorm("foreign-7")=="foreign7" — exact twin
+        expect(dupU.error).toBe("usage");
+        expect(String((dupU as any).detail)).toContain("foreign7");
+        // lifecycle: scoped forbidden BEFORE existence, uniform
+        const d1 = await seat.channelDelete({ name: "planned" });
+        const d2 = await seat.channelDelete({ name: "nope7" });
+        expect(d1.error).toBe("forbidden"); expect(d2.error).toBe("forbidden");
+        expect((d2 as any).detail).toBe((d1 as any).detail.replace("planned", "nope7")); // uniform, no oracle
+        expect((await root.channelDelete({ name: "planned" })).error).toBeUndefined(); // operator still can
+        expect((await seat.rename({ agent: "r3c7", to: "r3c7b" })).error).toBe("forbidden"); // claude M4
+        expect((await root.rename({ agent: "r3c7", to: "r3c7c" })).error).toBeUndefined();
+      });
+    });
+
+    test("RFC-003 10: cursor isolation — scoped watch never touches the unrestricted sibling row; forged :L consumers rejected; rotation with the same lanes keeps position", async () => {
+      await withBus(async (h, root) => {
+        const un = await seedAgent(h, root, "r3w", "w");
+        const unS = (un as any).value.session as Session;
+        const seat = await lanesSess(h, root, "r3w", ["general"]); // SAME agent id, second token (D1: per-token)
+        await root.post({ from: "root", to: "r3w", type: "note", body: "w1", channel: "general" });
+        const a = await seat.waitStep({ for: "r3w", consumer: "cli" }); // scoped pages (sees w1 in its lane)
+        expect(a.error).toBeUndefined();
+        expect(((a as any).value.messages as any[]).length).toBe(1);
+        expect((await seat.cursorSet({ consumer: "cli", cursor: (a as any).value.cursor })).error).toBeUndefined(); // commit OWN row
+        expect(((await unS.cursorGet({ consumer: "cli" })) as any).value.seq).toBe(0); // sibling untouched
+        const b = await unS.waitStep({ for: "r3w", consumer: "cli" });
+        expect(b.error).toBeUndefined();
+        expect((await unS.cursorSet({ consumer: "cli", cursor: (b as any).value.cursor })).error).toBeUndefined();
+        expect(((await seat.cursorGet({ consumer: "cli" })) as any).value.seq).toBe(Number((a as any).value.cursor.split(".")[1])); // seat row = its own position
+        expect(((await unS.cursorGet({ consumer: "cli" })) as any).value.seq).toBe(Number((b as any).value.cursor.split(".")[1]));
+        // forged suffixed names rejected pre-DB (':' outside CONSUMER_RE — no smuggling)
+        expect((await seat.cursorGet({ consumer: "cli:Ldeadbeef0000" })).error).toBe("usage");
+        expect((await seat.cursorSet({ consumer: "cli:Ldeadbeef0000", cursor: (a as any).value.cursor })).error).toBe("usage");
+        // rotation with the SAME lanes ⇒ same lane-hash ⇒ position survives (D1)
+        const rot = await root.tokenCreate({ agent: "r3w", lanes: ["general"] });
+        const seat2 = (h as any).session({ token: (rot as any).value.token }) as Session;
+        await seat2.joinAgent({ agent: "r3w", role: "w" });
+        expect(((await seat2.cursorGet({ consumer: "cli" })) as any).value.seq).toBe(Number((a as any).value.cursor.split(".")[1]));
+      });
+    });
+
     test("local-root principal in server handle ⇒ internal (finding B1 runtime backstop)", async () => {
       await withBus(async (h) => {
         // simulate a transport that forgot to strip a forged localRoot flag

@@ -17,7 +17,7 @@ server.setStatus(rootCtx, { agent: "mallory", id: "x", state: "done" });
 server.post({ principal: { agentId: "m", kind: "agent", scopes: [], localRoot: true }, actor: "m" }, { from: "m", to: "x", type: "note", body: "b" });
 
 // a plain server ctx IS accepted (positive control — must NOT error):
-server.setStatus({ principal: { agentId: "m", kind: "agent", scopes: [] }, actor: "m" }, { agent: "m", id: "x", state: "done" });
+server.setStatus({ principal: { agentId: "m", kind: "agent", scopes: [], lanes: null }, actor: "m" }, { agent: "m", id: "x", state: "done" });
 
 // H1..H3 (round-2 M1): the handle seam must be mode-typed too — a local core
 // is NOT a server core, and a local ctx is NOT wrappable over a server bus.

@@ -134,6 +134,7 @@ export function startServer(opts: ServerOpts): RunningServer {
   type Sub = {
     push(frame: string): void; close(): void; refresh(): void; resync(epoch: string, floor: number): void;
     scope: string; agentId: string; scopes: Scope[]; tokenId: number;
+    lanes: Set<string> | null; // RFC-003: SSE frame filtering follows the token row
     seq: number; epoch: string; alive: boolean;
     sid: string | null; // cookie-authed stream ⇒ dies with its session (logout/expiry)
   };
@@ -191,7 +192,7 @@ export function startServer(opts: ServerOpts): RunningServer {
     }
   }
 
-  const principalOf = (s: Sub) => ({ principal: { agentId: s.agentId, kind: "agent" as const, scopes: s.scopes }, actor: s.agentId });
+  const principalOf = (s: Sub) => ({ principal: { agentId: s.agentId, kind: "agent" as const, scopes: s.scopes, lanes: s.lanes }, actor: s.agentId });
 
   function frameFor(s: Sub, e: { seq: number; kind: string; msg_id: string | null; agent_id: string | null }): string | null {
     const idLine = `id: ${s.epoch}.${e.seq}\n`;
@@ -234,7 +235,7 @@ export function startServer(opts: ServerOpts): RunningServer {
   }
 
   // ---------- auth (§5: principal from the token ROW, every request) ----------
-  type Authed = { session: Session; tokenId: number; agentId: string; scopes: Scope[]; via: "bearer" | "cookie" };
+  type Authed = { session: Session; tokenId: number; agentId: string; scopes: Scope[]; lanes: Set<string> | null; via: "bearer" | "cookie" };
   type AuthFail = { err: ReturnType<typeof rpcErr>; http: number; retryAfter?: number };
   /** claude M2 m: auth-scheme is case-insensitive (RFC 9110 §11.1) — a
    *  `bearer x` header was silently treated as NO credential, which then took
@@ -256,8 +257,8 @@ export function startServer(opts: ServerOpts): RunningServer {
   function fromRow(tokenId: number, via: Authed["via"]): { ok: Authed } | AuthFail {
     const t = core.tokenById(tokenId);
     if (!t || !t.live) return UNAUTH("unknown or revoked token");
-    const session = wrapSession(core, serverCtx(t.agentId, t.scopes, t.kind));
-    return { ok: { session, tokenId, agentId: t.agentId, scopes: t.scopes, via } };
+    const session = wrapSession(core, serverCtx(t.agentId, t.lanes, t.scopes, t.kind));
+    return { ok: { session, tokenId, agentId: t.agentId, scopes: t.scopes, lanes: t.lanes, via } };
   }
   /** §9: unauthenticated 401s are metered per IP and the bucket is CHECKED
    *  BEFORE the HMAC (RFC letter — an exhausted IP never reaches the hash),
@@ -277,7 +278,7 @@ export function startServer(opts: ServerOpts): RunningServer {
       if (tok.length > LIM.maxAuth) return fail(UNAUTH("Authorization too long"));
       const v = core.tokenVerify(tok);
       if (v.error) return fail({ err: busToRpc(v), http: 401 });
-      return { ok: { session: wrapSession(core, serverCtx(v.value.agentId, v.value.scopes, v.value.kind)), tokenId: v.value.tokenId, agentId: v.value.agentId, scopes: v.value.scopes, via: "bearer" } };
+      return { ok: { session: wrapSession(core, serverCtx(v.value.agentId, v.value.lanes, v.value.scopes, v.value.kind)), tokenId: v.value.tokenId, agentId: v.value.agentId, scopes: v.value.scopes, lanes: v.value.lanes, via: "bearer" } };
     }
     if (sid !== null) {
       const s = sessions.get(sid);
@@ -328,7 +329,7 @@ export function startServer(opts: ServerOpts): RunningServer {
       case "inbox.wait": return call(session.waitStep({ for: p.for, consumer: p.consumer, since: p.since, noAll: p.noAll === true }));
       case "cursor.get": return call(session.cursorGet({ consumer: p.consumer }));
       case "cursor.set": return call(session.cursorSet({ consumer: String(p.consumer ?? ""), cursor: String(p.cursor ?? ""), force: p.force }));
-      case "token.create": return call(session.tokenCreate({ agent: String(p.agent ?? ""), kind: p.kind, label: p.label, scopes: p.scopes, admin: p.admin, force: p.force }));
+      case "token.create": return call(session.tokenCreate({ agent: String(p.agent ?? ""), kind: p.kind, label: p.label, scopes: p.scopes, admin: p.admin, force: p.force, lanes: p.lanes }));
       case "token.list": return call(session.tokenList());
       case "token.revoke": return call(session.tokenRevoke({ id: Number(p.id) }));
       case "group.create": return call(session.groupCreate({ name: String(p.name ?? ""), agent: p.agent }));
@@ -417,7 +418,7 @@ export function startServer(opts: ServerOpts): RunningServer {
       }
       const now = Date.now();
       sessions.set(sid, { tokenId: v.value.tokenId, created: now, seen: now });
-      return json(200, { jsonrpc: "2.0", result: { agentId: v.value.agentId, scopes: v.value.scopes }, id },
+      return json(200, { jsonrpc: "2.0", result: { agentId: v.value.agentId, scopes: v.value.scopes, lanes: v.value.lanes === null ? null : [...v.value.lanes] }, id },
         { "set-cookie": `comms_session=${sid}; Path=/; Max-Age=${Math.floor(LIM.sessionMaxMs / 1000)}; ${cookieFlags}` });
     }
 
@@ -517,7 +518,7 @@ export function startServer(opts: ServerOpts): RunningServer {
       if ("err" in a) return new Response(String(a.err.data?.detail ?? "unauthorized"), { status: a.http, headers: a.retryAfter ? { "retry-after": String(a.retryAfter) } : {} });
       who = a.ok;
     }
-    const { tokenId, agentId, scopes } = who;
+    const { tokenId, agentId, scopes, lanes } = who;
     const streamSid = who.via === "cookie" ? cookieSid(req) : null;
 
     // validate EVERYTHING before taking a stream slot (claude M2: a 400 on a
@@ -553,7 +554,7 @@ export function startServer(opts: ServerOpts): RunningServer {
     let ping: ReturnType<typeof setInterval> | null = null;
     let ctrl: ReadableStreamDefaultController | null = null;
     const sub: Sub = {
-      scope, agentId, scopes, tokenId, seq: from, epoch: ep, alive: true, sid: streamSid,
+      scope, agentId, scopes, lanes, tokenId, seq: from, epoch: ep, alive: true, sid: streamSid,
       push: (f) => {
         if (!ctrl || detached) return;
         // bounded server-side queue: a stalled reader must not grow memory
@@ -575,7 +576,9 @@ export function startServer(opts: ServerOpts): RunningServer {
           sub.close();
           return;
         }
-        sub.agentId = t.agentId; sub.scopes = t.scopes;
+        // RFC-003: lanes refresh WITH scopes — a rotate-mid-stream must not
+        // keep a stale lane grant alive on an open socket.
+        sub.agentId = t.agentId; sub.scopes = t.scopes; sub.lanes = t.lanes;
       },
       resync(epoch: string, floor: number) {
         sub.push(`event: resync\ndata: ${JSON.stringify({ resync: true, epoch, floor })}\n\n`);
@@ -669,7 +672,7 @@ export function startServer(opts: ServerOpts): RunningServer {
         const t = bucketFor(a.ok.tokenId, "raw").take(); // read bucket
         if (!t.ok) return json(429, { jsonrpc: "2.0", error: rpcErr(-32004, "rate limited", { busError: "rate_limited", detail: "rate limit exceeded" }), id: null }, { "retry-after": String(Math.max(1, Math.ceil(t.retryAfterMs / 1000))) });
         const msg = core.messageByFile(chan, file);
-        if (!msg || !core.canSeeChannel(serverCtx(a.ok.agentId, a.ok.scopes), msg.channel))
+        if (!msg || !core.canSeeChannel(serverCtx(a.ok.agentId, a.ok.lanes, a.ok.scopes), msg.channel))
           return json(404, { jsonrpc: "2.0", error: rpcErr(-32003, "not found"), id: null });
         const abs = join(core.MSG_DIR, chan, file);
         let real: string | null = null;

@@ -42,7 +42,12 @@ export function validScope(s: string): s is Scope {
 
 export type PrincipalBase = { agentId: string; kind: "agent" | "human"; scopes: Scope[] };
 export type LocalPrincipal = PrincipalBase & { localRoot?: true };
-export type ServerPrincipal = PrincipalBase & { localRoot?: undefined };
+// RFC-003 (claude M2): lanes is a REQUIRED field on the server principal — an
+// optional param meant /raw and every hand-built ctx silently served the
+// unrestricted view. REQUIRED makes tsc enumerate every constructor.
+// null = unrestricted (byte-identical legacy behavior); Set = closed lane list
+// (an EMPTY set sees/touches nothing — the '' column, fail-closed).
+export type ServerPrincipal = PrincipalBase & { localRoot?: undefined; lanes: Set<string> | null };
 export type Principal<M extends Mode> = M extends "server" ? ServerPrincipal : LocalPrincipal;
 
 /** Opaque transport credential (finding 10a): what a client presents; the
@@ -126,6 +131,35 @@ export const csv = (str?: string | null) => (str ?? "").split(",").map((x) => x.
 
 export const normalizeScopes = (scopes: Iterable<string>): string =>
   [...new Set([...scopes].map((s) => s.trim()).filter(Boolean))].sort().join(",");
+
+/** RFC-003 R1 (grok B4 / claude B1): the lanes column parser. NULL (absent
+ *  column value) = unrestricted — every pre-RFC token keeps byte-identical
+ *  behavior. '' = the EMPTY grant (sees nothing) — a distinct third state the
+ *  scopes parser cannot express (there '' means no scopes AND parses back to
+ *  []). FAIL-CLOSED: a non-empty column whose entries are ALL invalid parses
+ *  to [] (deny-all), never to unrestricted. NEVER reuse normalizeScopes/csv
+ *  blindly on this column. */
+/** RFC-003 R3 (claude M5): cursor-key derivation. Unrestricted principals keep
+ *  the (agent_id, consumer) row byte-identically; scoped principals get a
+ *  server-derived lane-hash suffix — ':' is outside CONSUMER_RE so clients
+ *  cannot forge the suffixed form, and rotation with the same lane list keeps
+ *  the seat's position (grok M3's token-id form lost it on every rotate). */
+export function cursorKeyFor(lanes: Set<string> | null | undefined, consumer: string): string {
+  if (lanes === null || lanes === undefined) return consumer;
+  const h = createHash("sha256").update([...lanes].sort().join(",")).digest("hex").slice(0, 12);
+  return `${consumer}:L${h}`;
+}
+/** principal.lanes without generics gymnastics — local principals have no
+ *  lanes field (see-all quirk), which maps to null = unrestricted. */
+export const postLanesOf = (ctx: { principal: object }): Set<string> | null =>
+  ((ctx.principal as Partial<ServerPrincipal>).lanes ?? null);
+
+export const parseLanesColumn = (raw: string | null | undefined): string[] | null => {
+  if (raw === null || raw === undefined) return null;
+  if (raw === "") return [];
+  const kept = [...new Set(raw.split(",").filter((s) => s.length > 0 && validChannelName(s)))].sort();
+  return kept; // non-empty column, zero valid entries ⇒ [] ⇒ deny-all
+};
 
 export function canonicalJson(v: unknown): string {
   if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
@@ -224,8 +258,8 @@ interface ServerOnly {
   rename: (ctx: Ctx<"server">, p: { agent: string; to: string; fingerprint?: string | null }) => Res<{ announced: MsgRow }>;
   history: (ctx: Ctx<"server">, p: { channel?: string | null; limit?: number; since?: string }) => Res<{ rows: MsgRow[]; hasMore: boolean; cursor: string }>;
   waitStep: (ctx: Ctx<"server">, p: { for?: string; consumer?: string; since?: string; noAll?: boolean }) => Res<{ messages: MsgRow[]; cursor: string; done: boolean }>;
-  tokenCreate: (ctx: Ctx<"server">, p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean }) => Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string }>;
-  tokenList: (ctx: Ctx<"server">) => Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; created_at: string; last_used: string; revoked_at: string | null }[] }>;
+  tokenCreate: (ctx: Ctx<"server">, p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean; lanes?: string[] }) => Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string; lanes: string[] | null }>;
+  tokenList: (ctx: Ctx<"server">) => Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; lanes: string[] | null; created_at: string; last_used: string; revoked_at: string | null }[] }>;
   tokenRevoke: (ctx: Ctx<"server">, p: { id: number }) => Res<{ revoked: boolean }>;
   groupCreate: (ctx: Ctx<"server">, p: { name: string; agent?: string }) => Res<{ name: string; created: boolean }>;
   channelCreate: (ctx: Ctx<"server">, p: { name: string; purpose?: string }) => Res<{ name: string; created: boolean }>;
@@ -288,6 +322,14 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   }
   if (!acols.some((c) => c.name === "kind"))
     d.exec("ALTER TABLE agents ADD COLUMN kind TEXT DEFAULT 'agent'");
+  // RFC-003 R1 (grok B4): same additive pattern for the lane column. Existing
+  // rows land NULL = unrestricted, so every pre-RFC token keeps byte-identical
+  // behavior (pin: a downgraded DB still posts to general and reads public).
+  {
+    const tokcols = d.query("PRAGMA table_info(tokens)").all() as any[];
+    if (tokcols.length && !tokcols.some((c) => c.name === "lanes"))
+      d.exec("ALTER TABLE tokens ADD COLUMN lanes TEXT"); // nullable, NO default
+  }
 
   d.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_fp ON agents(fingerprint) WHERE fingerprint IS NOT NULL;
@@ -300,7 +342,8 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       scopes TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL,
       last_used TEXT NOT NULL,
-      revoked_at TEXT
+      revoked_at TEXT,
+      lanes TEXT                    -- RFC-003 R1: NULL=unrestricted, ''=sees-nothing, else canonical sorted CSV
     );
     CREATE TABLE IF NOT EXISTS events(
       seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -523,9 +566,14 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   // (c) a post to a LIVE lane touches channel_tombstones ZERO times (the old
   // ensureChannel deleted the tombstone on every public post — an autocommit
   // write-lock on the hot path and the mechanism of the back-door bypass).
-  function channelEnsureInTxn(name: string, by: string, purpose = ""): { created: boolean } | BusError {
+  // RFC-003 (grok B5): `lanes` = the CALLER's lane set (null = unrestricted).
+  // A collision detail must not name a sibling the caller cannot see — that
+  // would be an existence oracle through the error string.
+  function channelEnsureInTxn(name: string, by: string, purpose = "", lanes?: Set<string> | null): { created: boolean } | BusError {
     if (d.query("SELECT 1 FROM channels WHERE name=?").get(name)) return { created: false };
     const dup = channelDup(name);
+    if (dup && lanes && !lanes.has(dup.name))
+      return { error: "usage", detail: `channel '${name}' collides with an existing or retired lane (near-duplicate — choose a distinct name)` };
     if (dup) return { error: "usage", detail: dup.retired
       ? `channel '${name}' collides with retired lane '${dup.name}' (near-duplicate of a deleted channel — choose a distinct name)`
       : `channel '${name}' already exists as '${dup.name}' (near-duplicate — post to the existing name, or choose a distinct one)` };
@@ -574,6 +622,15 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       return { error: "usage", detail: `invalid channel name: ${p.name} (ID_RE; ':' and '~' excluded)` };
     if (p.purpose !== undefined && typeof p.purpose !== "string")
       return { error: "usage", detail: `purpose must be a string (got ${typeof p.purpose})` };
+    // RFC-003 R2 (grok B5): a scoped seat may create ONLY a listed lane that is
+    // currently missing (the operator opted in by listing it). Out-of-list is a
+    // UNIFORM forbidden regardless of row existence — no existence oracle —
+    // and it runs BEFORE the live-row short-circuit, which would otherwise
+    // answer {created:false} for a hidden live lane (oracle) vs forbidden for a
+    // hidden missing one.
+    const ccLanes = postLanesOf(ctx);
+    if (ccLanes !== null && !ccLanes.has(p.name))
+      return { error: "forbidden", detail: `lane-scoped token: ${p.name} is not an available lane (not granted, or not live)` };
     if (d.query("SELECT 1 FROM channels WHERE name=?").get(p.name)) return { value: { name: p.name, created: false } };
     // grok E2 m-tx: check+insert in ONE txn (house pattern, groupEnsure) — the
     // window is unreachable under the single-writer server but two local
@@ -584,7 +641,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       try {
         // E2.x re-fold (grok finding 2): the blessed path runs the SAME shared
         // core as the post back door — one shape, one txn, no drift.
-        const en = channelEnsureInTxn(p.name, ctx.principal.agentId, p.purpose ?? "");
+        const en = channelEnsureInTxn(p.name, ctx.principal.agentId, p.purpose ?? "", ccLanes);
         if ("error" in en) { d.exec("ROLLBACK"); return en; }
         created = en.created;
         d.exec("COMMIT");
@@ -607,6 +664,12 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (typeof p.name !== "string" || !ID_RE.test(p.name)) return { error: "usage", detail: `invalid channel name: ${p.name}` };
     if (p.name === "general") return { error: "usage", detail: "the general lane is seeded and cannot be deleted" };
+    // RFC-003 R2 (claude M4): lifecycle is operator-side. Uniform forbidden
+    // BEFORE the existence read — a scoped seat must not learn whether a lane
+    // exists by probing delete, and under D1 it would PASS the creator check
+    // for lanes its agent minted through its unrestricted token.
+    if (postLanesOf(ctx) !== null)
+      return { error: "forbidden", detail: `lane-scoped token: ${p.name} cannot be deleted by a scoped seat (not granted, or not live)` };
     // E2.x re-fold (grok t_0cfd1b84 finding 2/3 + claude NIT-3): existence AND
     // the creator-or-admin gate are re-read INSIDE BEGIN IMMEDIATE — missing →
     // not_found for EVERY principal (public lanes are listed; no oracle to
@@ -694,6 +757,11 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
    *  consulted. Local mode = host is root of trust ⇒ see-all (pinned quirk). */
   function canSeeChannel(ctx: AnyCtx, channel: string): boolean {
     if (mode === "local") return true; // quirk pin: local sees all (G5/G7)
+    // RFC-003: lane scoping gates EVERY lane (public included) and must run
+    // BEFORE the public early-out — after it, every public lane bypasses.
+    // read:all does NOT satisfy lanes (same doctrine as the DM gate).
+    const lanes = (ctx.principal as ServerPrincipal).lanes;
+    if (lanes !== null && lanes !== undefined && !lanes.has(channel)) return false;
     if (!DM_SHAPED_RE.test(channel)) return true;
     if (hasScope(ctx, "read:dm")) return true;
     return d.query("SELECT 1 FROM channel_members WHERE channel=? AND agent_id=?").get(channel, ctx.principal.agentId) !== null;
@@ -1113,12 +1181,17 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     // verbatim (golden parity).
     let unresolved: number;
     if (mode === "server") {
+      // RFC-003 (grok M1): the subtraction also covers messages in lanes a
+      // scoped seat cannot see — foreign-lane volume must not leak through
+      // join unresolved (pin: post into a foreign lane changes nothing here).
+      const hiddenLanes = (ctx.principal as ServerPrincipal).lanes;
       unresolved = (d.query(
         "SELECT COUNT(*) c FROM messages WHERE status IN ('open','acked','in_progress') AND sender!=?",
       ).get(p.agent) as any).c
         - (d.query(
-          "SELECT COUNT(*) c FROM messages WHERE status IN ('open','acked','in_progress') AND sender!=? AND channel GLOB 'dm~*' AND NOT EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel=messages.channel AND cm.agent_id=?) AND ? != 1",
-        ).get(p.agent, p.agent, hasScope(ctx, "read:dm") ? 1 : 0) as any).c;
+          "SELECT COUNT(*) c FROM messages WHERE status IN ('open','acked','in_progress') AND sender!=? AND ((channel GLOB 'dm~*' AND NOT EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel=messages.channel AND cm.agent_id=?) AND ? != 1) OR (? = 1 AND NOT EXISTS (SELECT 1 FROM json_each(?) j WHERE j.value = messages.channel)))",
+        ).get(p.agent, p.agent, hasScope(ctx, "read:dm") ? 1 : 0,
+             hiddenLanes ? 1 : 0, hiddenLanes ? JSON.stringify([...hiddenLanes]) : "[]") as any).c;
     } else {
       unresolved = (d.query(
         "SELECT COUNT(*) c FROM messages WHERE status IN ('open','acked','in_progress') AND sender!=?",
@@ -1350,6 +1423,20 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       // and a committed revival even if the message txn later failed. A post
       // to a LIVE lane touches channel_tombstones zero times (grok finding 4).
     }
+    // RFC-003 (grok B3 / claude M3): the lane gate runs on the RESOLVED
+    // channel — after dm sugar, thread/re inheritance, stored DM labels and
+    // the || "general" default (rev-0's gate at the raw param missed all of
+    // them). Scoped seats NEVER create or revive through the post back door:
+    // out-of-list and in-list-but-missing are the SAME uniform, request-derived
+    // answer (no existence oracle), and dmPending (creation inside the txn)
+    // is refused the same way. Usage still wins on shape errors — invalid
+    // names never reach here (canSee/usage above).
+    const postLanes = (ctx.principal as ServerPrincipal).lanes;
+    if (postLanes !== null && postLanes !== undefined) {
+      const laneLive = channel !== null && (channel === "general" || !!d.query("SELECT 1 FROM channels WHERE name=?").get(channel)); // truthy: bun .get() is undefined/null on miss
+      if (dmPending || channel === null || !postLanes.has(channel) || !laneLive)
+        return { error: "forbidden", detail: `lane-scoped token: ${requestedChannel ?? channel ?? "general"} is not an available lane (not granted, or not live)` };
+    }
     const mid = newId(sender.split("-")[0]);
     // M5 (round 2): thread is DERIVED from the final id — recomputed on every
     // collision retry; an explicit p.thread always wins and never retargets.
@@ -1574,6 +1661,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (!p.agent || !p.to) return { error: "usage", detail: "error: rename requires --agent <old> --to <new>" };
     if (!ID_RE.test(p.agent) || !ID_RE.test(p.to)) return { error: "usage", detail: "invalid id" };
+    // RFC-003 (claude M4): a rename announces into general and moves history
+    // out from under a lane grant — lifecycle is the operator's job.
+    if ((ctx.principal as ServerPrincipal).lanes !== null && (ctx.principal as ServerPrincipal).lanes !== undefined)
+      return { error: "forbidden", detail: "a lane-scoped token cannot rename agents (identity lifecycle is operator-side)" };
     const old = d.query("SELECT * FROM agents WHERE id=?").get(p.agent) as any;
     if (!old) return { error: "not_found", detail: `error: no such agent '${p.agent}'` };
     if (isRootCtx(ctx) || mode === "server") {
@@ -1658,9 +1749,14 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
 
   // ---------- server-mode token ops (§5) ----------
 
-  function tokenCreate(ctx: Ctx<M>, p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean }): Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string }> {
+  function tokenCreate(ctx: Ctx<M>, p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean; lanes?: string[] }): Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string; lanes: string[] | null }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (!ID_RE.test(p.agent)) return { error: "usage", detail: `invalid agent id: ${p.agent}` };
+    // RFC-003 R2 belt (grok M2): a scoped principal must not mint at all —
+    // tokenCreate is transitively root, and a lanes-less child would be a
+    // bus-wide escape from the operator's grant.
+    if ((ctx.principal as ServerPrincipal).lanes !== null && (ctx.principal as ServerPrincipal).lanes !== undefined)
+      return { error: "forbidden", detail: "a lane-scoped token cannot mint tokens" };
     const kind = p.kind ?? "agent";
     const rootCtx = isRootCtx(ctx);
     // §5: token.create requires tokens:admin (local root is the bootstrap path).
@@ -1683,6 +1779,40 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     // contradiction of §5 and is removed). Minting tokens:admin itself is still
     // gated by the bootstrap guard below.
     const norm = normalizeScopes(scopes);
+    // ---- RFC-003: lane grant validation (D2: Array FIRST, typeof BEFORE any
+    // regex, exact names, cap; claude B1: [] rejected; M4: admin scopes are
+    // boundary-crossing and mutually exclusive with a lane grant) ----
+    let lanesCsv: string | null = null;
+    if (p.lanes !== undefined) {
+      if (!Array.isArray(p.lanes)) return { error: "usage", detail: `lanes must be an array of channel names (got ${typeof p.lanes})` };
+      if (p.lanes.length === 0) return { error: "usage", detail: "lanes: [] mints a seat that sees nothing — pass at least one lane (or omit lanes for an unrestricted token)" };
+      const seen = new Set<string>();
+      for (const l of p.lanes) {
+        if (typeof l !== "string") return { error: "usage", detail: `lane entries must be strings (got ${typeof l})` };
+        if (!validChannelName(l)) return { error: "usage", detail: `invalid lane name: ${JSON.stringify(l)}` };
+        seen.add(l);
+      }
+      if (seen.size > 32) return { error: "usage", detail: "lane cap is 32 per token" };
+      if (seen.has("general") === false && seen.size === 0) return { error: "usage", detail: "lanes: empty grant" };
+      if (norm.split(",").includes("tokens:admin") || norm.split(",").includes("agents:admin"))
+        return { error: "usage", detail: "lanes and tokens:admin/agents:admin are mutually exclusive (an admin token is bus-wide by definition)" };
+      // R2: every granted PUBLIC lane must exist LIVE at mint (no hidden
+      // revival through the minter). DM lanes must exist as a stored pair —
+      // the minter's membership is not required (read:dm seats are auditors).
+      for (const l of [...seen].sort()) {
+        if (d.query("SELECT 1 FROM channels WHERE name=?").get(l)) continue;
+        const dmM = DM_RE.exec(l);
+        if (dmM) {
+          const [lo, hi] = dmM[1] < dmM[2] ? [dmM[1], dmM[2]] : [dmM[2], dmM[1]];
+          if (lo === hi || !dmChannelForPair(lo, hi))
+            return { error: "usage", detail: `lane ${l} is not a live lane (no DM exists for that pair — DM lanes name an EXISTING pair)` };
+          continue;
+        }
+        const dup = channelDup(l); // JS near-dup scan (live channels + tombstones) — the E2.x truth, no SQL column
+        return { error: "usage", detail: `lane ${l} does not exist${dup ? ` (near-duplicate of ${dup.retired ? "retired lane" : "live lane"} ${dup.name})` : " — create it first, then mint"}` };
+      }
+      lanesCsv = [...seen].sort().join(",");
+    }
     const bytes = seams.rng(32);
     const token = "ac_" + b64url(bytes);
     const prefix = token.slice(3, 15);
@@ -1720,10 +1850,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
         // the row's kind wins; minting a second token never rewrites identity.
         d.run("INSERT OR IGNORE INTO agents(id,role,caps,pid,joined_at,last_seen,meta,kind) VALUES(?,?,?,?,?,?,?,?)",
           [p.agent, p.agent, "", null, t, t, "{}", kind]);
-        const r = d.run("INSERT INTO tokens(prefix,agent_id,salt,key_hash,scopes,created_at,last_used) VALUES(?,?,?,?,?,?,?)",
-          [prefix, p.agent, salt, keyHash, norm, t, t]);
+        const r = d.run("INSERT INTO tokens(prefix,agent_id,salt,key_hash,scopes,created_at,last_used,lanes) VALUES(?,?,?,?,?,?,?,?)",
+          [prefix, p.agent, salt, keyHash, norm, t, t, lanesCsv]);
         d.exec("COMMIT");
-        return { value: { id: Number(r.lastInsertRowid), token, prefix, agentId: p.agent, scopes: norm } };
+        return { value: { id: Number(r.lastInsertRowid), token, prefix, agentId: p.agent, scopes: norm, lanes: lanesCsv === null ? null : lanesCsv.split(",") } };
       } catch (e) { d.exec("ROLLBACK"); throw e; }
     } catch (e: any) {
       if (String(e?.message ?? e).includes("UNIQUE")) return { error: "conflict", detail: "prefix collision (60-bit; retry)" };
@@ -1731,7 +1861,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     }
   }
 
-  function tokenVerify(token: string): Res<{ agentId: string; scopes: Scope[]; kind: "agent" | "human"; tokenId: number }> {
+  function tokenVerify(token: string): Res<{ agentId: string; scopes: Scope[]; kind: "agent" | "human"; tokenId: number; lanes: Set<string> | null }> {
     if (!token.startsWith("ac_") || token.length < 20) return { error: "unauthorized", detail: "malformed token" };
     const prefix = token.slice(3, 15);
     const row = d.query("SELECT * FROM tokens WHERE prefix=? AND revoked_at IS NULL").get(prefix) as any;
@@ -1744,29 +1874,35 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     if (digest.length !== row.key_hash.length || !timingSafeEqual(digest, Buffer.from(row.key_hash)))
       return { error: "unauthorized", detail: "unknown or revoked token" }; // claude M2 n: ONE detail — "bad token" vs "unknown" was a prefix-existence oracle
     const kind = ((d.query("SELECT kind FROM agents WHERE id=?").get(row.agent_id) as any)?.kind ?? "agent") as "agent" | "human";
-    return { value: { agentId: row.agent_id, scopes: normalizeScopes(csv(row.scopes)).split(",").filter(validScope) as Scope[], kind, tokenId: row.id } }; // finding 20: tokenId; legacy 8-name rows: unknown tokens are inert (M8)
+    // RFC-003: lanes ride the principal (null = unrestricted; parseLanesColumn
+    // fails CLOSED on a corrupt non-empty column).
+    const lanesCsv = parseLanesColumn(row.lanes ?? null);
+    return { value: { agentId: row.agent_id, scopes: normalizeScopes(csv(row.scopes)).split(",").filter(validScope) as Scope[], kind, tokenId: row.id,
+      lanes: lanesCsv === null ? null : new Set(lanesCsv) } }; // finding 20: tokenId; legacy 8-name rows: unknown tokens are inert (M8)
   }
 
   /** Re-resolve a principal from the token ROW by id (§5: every request /
    *  every SSE tick / every cookie request). `live` is the SAME predicate
    *  tokenVerify applies minus the HMAC: not revoked AND agent_id not retired
    *  (B1-legacy one-way door) — callers must not re-derive it. */
-  function tokenById(id: number): { agentId: string; scopes: Scope[]; kind: "agent" | "human"; revoked: boolean; retired: boolean; live: boolean } | null {
-    const row = d.query("SELECT agent_id, scopes, revoked_at FROM tokens WHERE id=?").get(id) as any;
+  function tokenById(id: number): { agentId: string; scopes: Scope[]; kind: "agent" | "human"; lanes: Set<string> | null; revoked: boolean; retired: boolean; live: boolean } | null {
+    const row = d.query("SELECT agent_id, scopes, revoked_at, lanes FROM tokens WHERE id=?").get(id) as any;
     if (!row) return null;
     const retired = d.query("SELECT 1 FROM agent_retired WHERE id=?").get(row.agent_id) !== null;
     const kind = ((d.query("SELECT kind FROM agents WHERE id=?").get(row.agent_id) as any)?.kind ?? "agent") as "agent" | "human";
     const revoked = row.revoked_at !== null;
-    return { agentId: row.agent_id, scopes: normalizeScopes(csv(row.scopes)).split(",").filter(validScope) as Scope[], kind, revoked, retired, live: !revoked && !retired };
+    const lc = parseLanesColumn(row.lanes ?? null); // RFC-003
+    return { agentId: row.agent_id, scopes: normalizeScopes(csv(row.scopes)).split(",").filter(validScope) as Scope[], kind, lanes: lc === null ? null : new Set(lc), revoked, retired, live: !revoked && !retired };
   }
 
-  function tokenList(ctx: Ctx<M>): Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; created_at: string; last_used: string; revoked_at: string | null }[] }> {
+  function tokenList(ctx: Ctx<M>): Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; lanes: string[] | null; created_at: string; last_used: string; revoked_at: string | null }[] }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (!isRootCtx(ctx) && !ctx.principal.scopes.includes("tokens:admin"))
       return { error: "forbidden", detail: "token.list requires tokens:admin" }; // M9
     // m1 (round 2): kind lives on agents, not tokens — JOIN for it.
     const rows = d.query("SELECT t.*, a.kind AS agent_kind FROM tokens t LEFT JOIN agents a ON a.id=t.agent_id ORDER BY t.id").all() as any[];
-    return { value: { tokens: rows.map((r) => ({ id: r.id, agentId: r.agent_id, kind: r.agent_kind ?? "agent", prefix: r.prefix, scopes: normalizeScopes(csv(r.scopes)).split(",").filter(validScope) as Scope[], created_at: r.created_at, last_used: r.last_used, revoked_at: r.revoked_at })) } };
+    // RFC-003: lanes surface for the dashboard chip + the LANES invite line.
+    return { value: { tokens: rows.map((r) => ({ id: r.id, agentId: r.agent_id, kind: r.agent_kind ?? "agent", prefix: r.prefix, scopes: normalizeScopes(csv(r.scopes)).split(",").filter(validScope) as Scope[], lanes: parseLanesColumn(r.lanes ?? null), created_at: r.created_at, last_used: r.last_used, revoked_at: r.revoked_at })) } };
   }
 
   function tokenRevoke(ctx: Ctx<M>, p: { id: number }): Res<{ revoked: boolean }> {
@@ -1817,8 +1953,12 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
   // `watch --channel <long dm>` exit 2 on its own generated consumer.
   const CONSUMER_RE = /^[a-z0-9._#@~-]{1,128}$/;
   const CONSUMER_BAD: Res<never> = { error: "usage", detail: "consumer must match [a-z0-9._#@~-]{1,128}" };
-  function cursorGet(agentId: string, consumer: string): Res<{ epoch: string; seq: number }> {
+  // RFC-003 R3: RAW consumer is validated first (a client cannot smuggle the
+  // ':L<hex>' suffix — ':' is outside CONSUMER_RE), THEN the lane-hash suffix is
+  // applied. Unrestricted principals (lanes null/undefined) keep the raw key.
+  function cursorGet(agentId: string, consumer: string, lanes?: Set<string> | null): Res<{ epoch: string; seq: number }> {
     if (!CONSUMER_RE.test(consumer)) return CONSUMER_BAD;
+    consumer = cursorKeyFor(lanes, consumer);
     const e = epochSafe();
     if (e === null) return { error: "internal", detail: "meta.epoch missing (corrupt DB)" };
     const row = cursorRaw(agentId, consumer);
@@ -1830,8 +1970,9 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     return { value: { epoch: e, seq: row.seq } };
   }
 
-  function cursorSet(agentId: string, consumer: string, ep: string, seq: number, force = false): Res<null> {
+  function cursorSet(agentId: string, consumer: string, ep: string, seq: number, force = false, lanes?: Set<string> | null): Res<null> {
     if (!CONSUMER_RE.test(consumer)) return CONSUMER_BAD;
+    consumer = cursorKeyFor(lanes, consumer); // RFC-003 R3 (raw validated first)
     if (!Number.isFinite(seq) || !/^[0-9a-f]{8,64}$/.test(ep))
       return { error: "usage", detail: "cursor must be <hex-epoch>.<int-seq>" };
     const e = epochSafe();
@@ -1902,6 +2043,13 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       const ep = epochSafe();
       if (ep === null) throw new Error("meta.epoch missing (corrupt DB)");
       const dm = hasScope(ctx, "read:dm") ? 1 : 0;
+      // RFC-003 (grok B1 / claude M1): the lane predicate rides IN THE WHERE of
+      // BOTH branches, BEFORE LIMIT (a post-LIMIT filter livelocks the since-
+      // page exactly like the DM predicate did). read:all does NOT bypass it.
+      const histLanes = postLanesOf(ctx);
+      const laneFlag = histLanes ? 0 : 1; // unrestricted ⇒ `1 = 1` bypass; scoped ⇒ 0 + EXISTS on the list
+      const laneJson = histLanes ? JSON.stringify([...histLanes]) : "[]";
+      const laneSql = `(1 = ? OR EXISTS (SELECT 1 FROM json_each(?) j WHERE j.value = m.channel))`;
       if (!ascending) {
         // N2 (round 3): SNAPSHOT pages over MESSAGES (§6 "history returns
         // messages, not events") — events are retention-bounded and absent for
@@ -1910,11 +2058,11 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
         // G2 (grok B1 pin): canSee is the ROW PREDICATE here, in BOTH modes —
         // read:all alone does NOT satisfy canSee; DM omniview = read:all AND
         // read:dm. Predicate in WHERE, never a post-LIMIT filter.
-        const visSql = `(m.channel NOT GLOB 'dm~*' OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel = m.channel AND cm.agent_id = ?) OR ? = 1)`;
+        const visSql = `(m.channel NOT GLOB 'dm~*' OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel = m.channel AND cm.agent_id = ?) OR ? = 1) AND ${laneSql}`;
         const q = chan
           ? d.query(`SELECT m.* FROM messages m WHERE m.channel=? AND ${visSql} ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?`)
           : d.query(`SELECT m.* FROM messages m WHERE ${visSql} ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?`);
-        const got = (chan ? q.all(chan, ctx.principal.agentId, dm, limit + 1) : q.all(ctx.principal.agentId, dm, limit + 1)) as MsgRow[];
+        const got = (chan ? q.all(chan, ctx.principal.agentId, dm, laneFlag, laneJson, limit + 1) : q.all(ctx.principal.agentId, dm, laneFlag, laneJson, limit + 1)) as MsgRow[];
         const hw = Math.max((d.query("SELECT coalesce(max(seq),0) m FROM events").get() as any).m as number, gcFloor());
         d.exec("COMMIT");
         const rows = got.slice(0, limit).reverse();
@@ -1924,9 +2072,9 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       // G2 m-d: same predicate in the WHERE BEFORE LIMIT — a post-LIMIT JS
       // filter livelocks when a whole page is hidden (cursor never advances).
       const evs = (chan
-        ? d.query(`SELECT e.seq,e.msg_id FROM events e JOIN messages m ON m.id=e.msg_id WHERE e.kind='msg' AND e.seq>? AND m.channel=? AND (m.channel NOT GLOB 'dm~*' OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel=m.channel AND cm.agent_id=?) OR ?=1) ORDER BY e.seq ${dir} LIMIT ?`)
-        : d.query(`SELECT e.seq,e.msg_id FROM events e JOIN messages m ON m.id=e.msg_id WHERE e.kind='msg' AND e.seq>? AND (m.channel NOT GLOB 'dm~*' OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel=m.channel AND cm.agent_id=?) OR ?=1) ORDER BY e.seq ${dir} LIMIT ?`)) as any;
-      const got = (chan ? evs.all(seqFrom, chan, ctx.principal.agentId, dm, limit + 1) : evs.all(seqFrom, ctx.principal.agentId, dm, limit + 1)) as { seq: number; msg_id: string }[];
+        ? d.query(`SELECT e.seq,e.msg_id FROM events e JOIN messages m ON m.id=e.msg_id WHERE e.kind='msg' AND e.seq>? AND m.channel=? AND (m.channel NOT GLOB 'dm~*' OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel=m.channel AND cm.agent_id=?) OR ?=1) AND ${laneSql} ORDER BY e.seq ${dir} LIMIT ?`)
+        : d.query(`SELECT e.seq,e.msg_id FROM events e JOIN messages m ON m.id=e.msg_id WHERE e.kind='msg' AND e.seq>? AND (m.channel NOT GLOB 'dm~*' OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel=m.channel AND cm.agent_id=?) OR ?=1) AND ${laneSql} ORDER BY e.seq ${dir} LIMIT ?`)) as any;
+      const got = (chan ? evs.all(seqFrom, chan, ctx.principal.agentId, dm, laneFlag, laneJson, limit + 1) : evs.all(seqFrom, ctx.principal.agentId, dm, laneFlag, laneJson, limit + 1)) as { seq: number; msg_id: string }[];
       const hasMore = got.length > limit;
       const page = ascending ? got.slice(0, limit) : got.slice(0, limit).reverse();
       const rows = page.map((e) => d.query("SELECT * FROM messages WHERE id=?").get(e.msg_id) as MsgRow).filter(Boolean);
@@ -1969,7 +2117,10 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       // signal, not a silent reset to seq 0 — rotateEpoch zeroes gc_floor, so
       // the floor check alone can never fire after rotation. Epoch mismatch
       // is the same resync path as a below-retention cursor (§6/§9).
-      const row = cursorRaw(ctx.principal.agentId, consumer);
+      // RFC-003 R3: scoped seats read a lane-hash-suffixed row — a watch from
+      // a scoped token can never advance (or be starved by) the unrestricted
+      // sibling's consumer row. Same lanes ⇒ same key ⇒ rotation keeps position.
+      const row = cursorRaw(ctx.principal.agentId, cursorKeyFor(postLanesOf(ctx), consumer));
       if (row && row.epoch !== ep)
         return { error: "resync", detail: "cursor epoch stale (epoch rotated)", data: { resync: true, epoch: ep, floor: gcFloor() } };
       seq = row?.seq ?? 0;
@@ -2101,6 +2252,9 @@ function b64url(b: Uint8Array) {
 export function localCtx(actor: string): Ctx<"local"> {
   return { principal: { agentId: actor, kind: "agent", scopes: [...ALL_SCOPES], localRoot: true }, actor };
 }
-export function serverCtx(agentId: string, scopes: Scope[] = [], kind: "agent" | "human" = "agent", cred?: Cred): Ctx<"server"> {
-  return { principal: { agentId, kind, scopes }, actor: agentId, cred };
+// RFC-003 (claude M2): lanes is REQUIRED — an optional param meant /raw and
+// every hand-built ctx silently served the unrestricted view. REQUIRED makes
+// tsc enumerate every constructor. null = unrestricted (legacy behavior).
+export function serverCtx(agentId: string, lanes: Set<string> | null, scopes: Scope[] = [], kind: "agent" | "human" = "agent", cred?: Cred): Ctx<"server"> {
+  return { principal: { agentId, kind, scopes, lanes }, actor: agentId, cred };
 }

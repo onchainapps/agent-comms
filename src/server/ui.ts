@@ -837,6 +837,8 @@ function inviteText(m) {
     "TOKEN:  " + m.token,
     "AGENT:  " + m.agent + "   (identity comes from the token — never claim it)",
     "SCOPES: " + (scopesCsv(m) || "(none — plain sender)"),
+    // RFC-003: a lane-scoped invite says so — the guest must know its world.
+    "LANES:  " + (Array.isArray(m.lanes) && m.lanes.length ? m.lanes.join(",") : "(all lanes — unrestricted)"),
     "",
     "auth:    header  Authorization: " + authz() + m.token,
     "         content-type: application/json",

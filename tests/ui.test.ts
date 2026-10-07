@@ -439,4 +439,10 @@ describe("M4 web UI (§8)", () => {
     // grok M2: post:as is impersonation, not permission — Post must not be gated on it
     expect(UI_HTML.includes('if (!S.scopes.includes("post:as")) $("cpost").disabled = true;')).toBe(false);
   });
+
+  test("RFC-003 pin 11 (invite half): the invite text states the lane grant — a scoped guest must know its world", () => {
+    // the LANES line rides in the invite block, keyed off m.lanes (array ⇒ csv,
+    // null/empty ⇒ explicit unrestricted wording — never a silent omission)
+    expect(UI_HTML).toContain('"LANES:  " + (Array.isArray(m.lanes) && m.lanes.length ? m.lanes.join(",") : "(all lanes — unrestricted)")');
+  });
 });

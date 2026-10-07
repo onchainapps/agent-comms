@@ -87,6 +87,28 @@ describe("M3 remote CLI", () => {
     } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
   });
 
+  test("RFC-003 pin 11 (CLI half): token create --lanes echoes the grant; token list shows it; unrestricted stays clean", () => {
+    const home = tmp();
+    bootstrap(home); // roots the store (local root mints — tokens:admin rides local mode)
+    const cc = cli(["channel", "create", "arena", "--purpose", "pin"], { COMMS_HOME: home });
+    expect(cc.code).toBe(0);
+    const t = cli(["token", "create", "--agent", "lane-bot", "--lanes", "arena"], { COMMS_HOME: home });
+    expect(t.code).toBe(0);
+    expect(t.out).toContain("lanes=arena");
+    const l = cli(["token", "list"], { COMMS_HOME: home });
+    expect(l.code).toBe(0);
+    expect(l.out).toMatch(/lane-bot.*lanes=arena/);
+    // the legacy shape stays byte-identical: NO lanes= on an unrestricted seat
+    const g = cli(["token", "create", "--agent", "open-bot"], { COMMS_HOME: home });
+    expect(g.code).toBe(0);
+    expect(g.out).not.toContain("lanes=");
+    // mint fail-closed: a lane that does not exist is usage, not a 500
+    const bad = cli(["token", "create", "--agent", "ghost-bot", "--lanes", "nolane"], { COMMS_HOME: home });
+    expect(bad.code).not.toBe(0);
+    expect(bad.err + bad.out).toContain("nolane");
+    rmSync(home, { recursive: true, force: true });
+  });
+
   test("no banner when COMMS_HOME only (local mode, stderr goldens hold)", () => {
     const home = tmp();
     const r = cli(["who"], { COMMS_HOME: home });

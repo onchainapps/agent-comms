@@ -408,10 +408,13 @@ async function cmdToken(a: Args) {
     case "create": {
       if (!a.agent) { console.error("error: token create requires --agent"); process.exit(2); }
       const scopes = a.scopes ? String(a.scopes).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
+      // RFC-003: --lanes a,b mints a lane-scoped seat (D2 shape errors are the
+      // server's job — the CLI passes the parsed list and lets usage answer).
+      const lanes = a.lanes === undefined ? undefined : String(a.lanes).split(",").map((s) => s.trim()).filter(Boolean);
       const v = unwrap(await CALL("tokenCreate", a.agent, {
-        agent: a.agent, kind: a.kind, label: a.label, scopes, admin: !!a.admin, force: !!a.force,
+        agent: a.agent, kind: a.kind, label: a.label, scopes, admin: !!a.admin, force: !!a.force, lanes,
       }));
-      console.log(`token for ${v.agentId} (kind=${a.kind ?? "agent"}, scopes=${v.scopes}):`);
+      console.log(`token for ${v.agentId} (kind=${a.kind ?? "agent"}, scopes=${v.scopes}${v.lanes ? `, lanes=${v.lanes.join(",")}` : ""}):`);
       console.log(`  ${v.token}`);
       console.log(`  prefix=${v.prefix} id=${v.id} — shown ONCE; store it now.`);
       if (!REMOTE) console.log("  (local bootstrap — the host is root; server mode requires tokens:admin)");
@@ -421,7 +424,7 @@ async function cmdToken(a: Args) {
       const v = unwrap(await CALL("tokenList", a.agent ?? "", {}));
       if (!v.tokens.length) { console.log("(no tokens)"); return; }
       for (const t of v.tokens)
-        console.log(`  #${String(t.id).padStart(3)} ${String(t.agentId).padEnd(16)} ${String(t.kind).padEnd(5)} prefix=${t.prefix} scopes=${t.scopes.join(",")}${t.revoked_at ? ` REVOKED@${t.revoked_at}` : ""} last=${t.last_used ?? "?"}`);
+        console.log(`  #${String(t.id).padStart(3)} ${String(t.agentId).padEnd(16)} ${String(t.kind).padEnd(5)} prefix=${t.prefix} scopes=${t.scopes.join(",")}${t.lanes ? ` lanes=${t.lanes.join(",")}` : ""}${t.revoked_at ? ` REVOKED@${t.revoked_at}` : ""} last=${t.last_used ?? "?"}`);
       return;
     }
     case "revoke": {
@@ -432,7 +435,7 @@ async function cmdToken(a: Args) {
       return;
     }
     default:
-      console.error("usage: token create --agent <id> [--kind agent|human] [--scopes a,b] [--admin] [--force] [--label L] | token list | token revoke --id <N>");
+      console.error("usage: token create --agent <id> [--kind agent|human] [--scopes a,b] [--lanes a,b] [--admin] [--force] [--label L] | token list | token revoke --id <N>");
       process.exit(2);
   }
 }
@@ -610,7 +613,8 @@ commands: join | rename | who | post | dm | dms | inbox | read | thread | receip
 transport: COMMS_URL+COMMS_TOKEN ⇒ remote · --local forces direct · else COMMS_HOME direct (§7)
 group: group create|join|leave|list|show|delete <name> [--agent who] · post --to group:<name>
 channel: channel create <name> [--purpose text] — blessed lane creation; post --channel <new> still creates but a near-duplicate (case/-/_) is refused. channel delete <name> — creator or agents:admin; messages stay, lane retires. Cap: 64 created lanes per agent (delete to free room).
-token: token create --agent <id> [--kind human] [--scopes a,b] [--admin] [--force] | token list | token revoke --id N
+token: token create --agent <id> [--kind human] [--scopes a,b] [--lanes a,b] [--admin] [--force] | token list | token revoke --id N
+--lanes a,b (RFC-003): lane-scoped seat — sees/posts ONLY those lanes; lanes must exist at mint; omitted = unrestricted (legacy).
 watch --all (remote) pages history since-cursors: public rows are visible to every token; dm~ rows need membership or read:dm (ruling c).
 watch --no-all (E1) drops the @all broadcast arm: only id/role/group-addressed mail prints (auditor watch; consumer-namespaced cursor).
 run 'bun comms.ts <cmd> --help-ish' — see header of this file for full usage.`;

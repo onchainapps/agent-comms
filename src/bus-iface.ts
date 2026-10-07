@@ -27,8 +27,8 @@ export interface Session {
   waitStep(p: { for?: string; consumer?: string; since?: string; noAll?: boolean }): Promise<Res<{ messages: MsgRow[]; cursor: string; done: boolean }>>;
   cursorGet(p: { consumer?: string }): Promise<Res<{ epoch: string; seq: number }>>;
   cursorSet(p: { consumer: string; cursor: string; force?: boolean }): Promise<Res<null>>;
-  tokenCreate(p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean }): Promise<Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string }>>;
-  tokenList(): Promise<Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; created_at: string; last_used: string; revoked_at: string | null }[] }>>;
+  tokenCreate(p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean; lanes?: string[] }): Promise<Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string; lanes: string[] | null }>>;
+  tokenList(): Promise<Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; lanes: string[] | null; created_at: string; last_used: string; revoked_at: string | null }[] }>>;
   tokenRevoke(p: { id: number }): Promise<Res<{ revoked: boolean }>>;
   groupCreate(p: { name: string; agent?: string }): Promise<Res<{ name: string; created: boolean }>>;
   channelCreate(p: { name: string; purpose?: string }): Promise<Res<{ name: string; created: boolean }>>;
@@ -82,11 +82,13 @@ function wrapSessionImpl<M extends Mode>(bus: Bus<M>, ctx: Ctx<M>): Session {
     rename: (p) => a(bus.rename(c, p)),
     history: (p) => a(bus.history(c, p)),
     waitStep: (p) => a(bus.waitStep(c, p)),
-    cursorGet: (p) => a(bus.cursorGet(ctx.principal.agentId, p.consumer ?? "default")),
+    // RFC-003 R3: the lane-hash suffix is applied inside the core AFTER raw
+    // validation — the principal's lanes ride along, never a client string.
+    cursorGet: (p) => a(bus.cursorGet(ctx.principal.agentId, p.consumer ?? "default", (ctx.principal as { lanes?: Set<string> | null }).lanes)),
     cursorSet: (p) => {
       const m = /^([0-9a-f]{8,64})\.(\d+)$/.exec(p.cursor);
       if (!m) return Promise.resolve({ error: "usage" as const, detail: "cursor must be <epoch>.<seq>" });
-      return a(bus.cursorSet(ctx.principal.agentId, p.consumer, m[1], Number(m[2]), p.force));
+      return a(bus.cursorSet(ctx.principal.agentId, p.consumer, m[1], Number(m[2]), p.force, (ctx.principal as { lanes?: Set<string> | null }).lanes));
     },
     tokenCreate: (p) => a(bus.tokenCreate(c, p)),
     tokenList: () => a(bus.tokenList(c)),
@@ -115,7 +117,7 @@ export class LocalBus implements BusHandle {
     if (!("token" in cred)) return { error: "unauthorized", detail: "session cookie not supported on a local bus" };
     const v = this.core.tokenVerify(cred.token);
     if (v.error) return v;
-    return { value: wrapSession(this.core, serverCtx(v.value.agentId, v.value.scopes, v.value.kind, cred)) };
+    return { value: wrapSession(this.core, serverCtx(v.value.agentId, v.value.lanes, v.value.scopes, v.value.kind, cred)) };
   }
   session(cred?: Cred): Session {
     if (!cred) return wrapSession(this.core, localCtx("local"));
@@ -137,7 +139,7 @@ export function serverHandle(core: Bus<"server">): BusHandle & { raw: Bus<"serve
     if (!("token" in cred)) return { error: "unauthorized", detail: "server sessions require a token credential" };
     const v = core.tokenVerify(cred.token);
     if (v.error) return v;
-    return { value: wrapSession(core, serverCtx(v.value.agentId, v.value.scopes, v.value.kind, cred)) };
+    return { value: wrapSession(core, serverCtx(v.value.agentId, v.value.lanes, v.value.scopes, v.value.kind, cred)) };
   };
   return {
     mode: "server" as const,
