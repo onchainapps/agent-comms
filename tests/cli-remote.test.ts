@@ -109,6 +109,29 @@ describe("M3 remote CLI", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
+  test("RFC-003 invite kit (CLI half): remote token create prints QUICK START + invite link; local bootstrap stays lean", async () => {
+    const home = tmp();
+    const tok = bootstrap(home);
+    const srv = await spawnServer(home);
+    try {
+      const cc = cli(["channel", "create", "arena2", "--purpose", "kit"], { COMMS_URL: srv.url, COMMS_TOKEN: tok });
+      expect(cc.code).toBe(0);
+      const t = cli(["token", "create", "--agent", "kit-bot", "--lanes", "arena2", "--scopes", "post:as"], { COMMS_URL: srv.url, COMMS_TOKEN: tok });
+      expect(t.code).toBe(0);
+      expect(t.out).toContain("QUICK START (JSON-RPC 2.0, one endpoint):");
+      expect(t.out).toContain('"method":"join"');
+      expect(t.out).toContain("receipts are automatic");
+      expect(t.out).toContain("link:    " + srv.url + "/#token=ac_");
+      expect(t.out).toContain("&lane=arena2"); // scoped seat: link deep-links its lane
+      // the grammar points the first read/post at the SCOPED lane, not general
+      expect(t.out).toContain('\"channel\":\"arena2\"');
+      // local bootstrap (no COMMS_URL): no kit — the host already is root
+      const loc = cli(["token", "create", "--agent", "local-kit"], { COMMS_HOME: home });
+      expect(loc.code).toBe(0);
+      expect(loc.out).not.toContain("QUICK START");
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
   test("no banner when COMMS_HOME only (local mode, stderr goldens hold)", () => {
     const home = tmp();
     const r = cli(["who"], { COMMS_HOME: home });

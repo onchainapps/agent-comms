@@ -463,6 +463,26 @@ describe("M4 web UI (§8)", () => {
     expect(UI_HTML).toContain("p.lanes = ln.value.split(");
   });
 
+  test("RFC-003 invite kit: instructions for a machine agent + #lane= deep-link (specific-channel invites land the guest in its lane)", () => {
+    // 1. the invite text is a QUICK START, not just credentials: join/inbox/
+    //    history/post grammar inline, receipts note, and a link line.
+    expect(UI_HTML).toContain("QUICK START (JSON-RPC 2.0, one endpoint):");
+    expect(UI_HTML).toContain('1 join:   POST /rpc {"jsonrpc":"2.0","id":1,"method":"join"');
+    expect(UI_HTML).toContain("receipts are automatic: ACK/DONE reply with the id of the message you handled.");
+    expect(UI_HTML).toContain('location.origin + "/#token=" + m.token + (Array.isArray(m.lanes) && m.lanes.length ? "&lane=" + m.lanes[0] : "")');
+    // 2. scoped invites point the grammar at THEIR lane, not always general
+    expect(UI_HTML).toContain('m.lanes[0] : "general"');
+    // 3. boot parses #lane= with the EXACT channel-name class and consumes it
+    //    after boot() only if the seat can see it (link is a hint, lanes are truth)
+    const boot = /\/\* ---------- start: probe an existing session cookie ---------- \*\/[\s\S]*$/.exec(UI_HTML)![0];
+    expect(boot).toContain("/[#&]lane=([a-z0-9][a-z0-9-]{0,63})/.exec(location.hash)");
+    expect(boot).toContain("if (fm || lm) history.replaceState");
+    const jump = /function jumpInviteLane\(\) \{[\s\S]*?\n\}/.exec(UI_HTML)![0];
+    expect(jump).toContain("S.chans.some((c) => c.name === L)");
+    expect(jump).toContain("inviteLane = null"); // one-shot: a reload must not re-steal the view
+    expect(UI_HTML).toContain("jumpInviteLane(); // RFC-003 invite kit");
+  });
+
   test("RFC-003 pin 11 (invite half): the invite text states the lane grant — a scoped guest must know its world", () => {
     // the LANES line rides in the invite block, keyed off m.lanes (array ⇒ csv,
     // null/empty ⇒ explicit unrestricted wording — never a silent omission)

@@ -291,6 +291,7 @@ async function boot() {
   const cursor = await loadHistory();
   openStream(cursor);
   refreshUnread();
+  jumpInviteLane(); // RFC-003 invite kit: #lane= deep-link (no-op unless the link set it)
 }
 $("go").onclick = async () => {
   $("lerr").textContent = "";
@@ -422,6 +423,14 @@ $("markread").onclick = async () => {
 };
 
 /* ---------- message panes ---------- */
+function jumpInviteLane() {
+  // One-shot: after boot(), land the guest on the invite's lane if the seat
+  // can actually see it (a stale/mis-typed #lane= silently degrades to the
+  // default view — the guest's lane list is the truth, never the link).
+  if (!inviteLane) return;
+  const L = inviteLane; inviteLane = null;
+  if (S.chans.some((c) => c.name === L)) select(L, /^dm~/.test(L) ? "dm" : "chan");
+}
 function select(name, kind) {
   S.sel = name; S.selKind = kind;
   markGen++; // SYNCHRONOUS: invalidates any inbox(unread) snapshot in flight
@@ -842,7 +851,15 @@ function inviteText(m) {
     "",
     "auth:    header  Authorization: " + authz() + m.token,
     "         content-type: application/json",
-    'first:   POST /rpc {"jsonrpc":"2.0","id":1,"method":"join","params":{"role":"…"}}',
+    "",
+    "QUICK START (JSON-RPC 2.0, one endpoint):",
+    '  1 join:   POST /rpc {"jsonrpc":"2.0","id":1,"method":"join","params":{"role":"one-line description of who you are"}}',
+    '  2 inbox:  POST /rpc {"jsonrpc":"2.0","id":2,"method":"inbox","params":{}}   (add "wait":20 to long-poll)',
+    '  3 read:   POST /rpc {"jsonrpc":"2.0","id":3,"method":"history","params":{"channel":"' + (Array.isArray(m.lanes) && m.lanes.length ? m.lanes[0] : "general") + '"}}',
+    '  4 post:   POST /rpc {"jsonrpc":"2.0","id":4,"method":"post","params":{"from":"' + m.agent + '","to":["<agent-id>"],"channel":"' + (Array.isArray(m.lanes) && m.lanes.length ? m.lanes[0] : "general") + '","body":"your message","type":"note"}}',
+    "  receipts are automatic: ACK/DONE reply with the id of the message you handled.",
+    "",
+    "link:    " + location.origin + "/#token=" + m.token + (Array.isArray(m.lanes) && m.lanes.length ? "&lane=" + m.lanes[0] : "") + "   (dashboard prefill — paste into a browser)",
     'docs:    README "Remote mode" · deploy/RUNBOOK.md · RFC-001 §5–§7',
     "note:    token is shown ONCE — store it; revoke in Admin any time.",
     "────────────────────────────────────────────────",
@@ -863,7 +880,7 @@ function renderMinted() {
   // RFC-003 N1b: a link the guest just pastes into chat — the fragment is
   // stripped by the boot IIFE on arrival (replaceState BEFORE any fill).
   const cl = el("button", "mini", "copy invite link");
-  cl.onclick = () => navigator.clipboard && navigator.clipboard.writeText(location.origin + "/#token=" + S.minted.token).then(() => { cl.textContent = "link copied"; });
+  cl.onclick = () => navigator.clipboard && navigator.clipboard.writeText(location.origin + "/#token=" + S.minted.token + (Array.isArray(S.minted.lanes) && S.minted.lanes.length ? "&lane=" + S.minted.lanes[0] : "")).then(() => { cl.textContent = "link copied"; });
   const dx = el("button", "mini", "dismiss"); dx.onclick = () => { S.minted = null; renderMinted(); };
   d.appendChild(cb); d.appendChild(document.createTextNode(" ")); d.appendChild(ci); d.appendChild(document.createTextNode(" ")); d.appendChild(cl); d.appendChild(document.createTextNode(" ")); d.appendChild(dx);
   const det = el("details"); const sm = el("summary"); sm.textContent = "preview invite text"; det.appendChild(sm);
@@ -948,6 +965,7 @@ function buildAdmin() {
   box.appendChild(f);
 }
 
+let inviteLane = null; // RFC-003 invite kit: #lane= deep-link target, consumed once after login
 /* ---------- start: probe an existing session cookie ---------- */
 (async () => {
   // RFC-003 N1b: invite prefill — a copy-invite-link URL ends in /#token=ac_...
@@ -957,7 +975,12 @@ function buildAdmin() {
   // auto-submit: the human decides when the credential is spent.
   const fm = /[#&]token=(ac_[A-Za-z0-9_-]{16,})/.exec(location.hash);
   const inviteTok = fm ? fm[1] : null;
-  if (fm) history.replaceState(null, "", location.pathname + location.search);
+  // #lane=<name>: deep-link straight into the seat's lane after login (an
+  // invite to a SPECIFIC channel lands the guest where it belongs). Channel
+  // names are [a-z0-9-] only, so the class is exact — no smuggled junk.
+  const lm = /[#&]lane=([a-z0-9][a-z0-9-]{0,63})/.exec(location.hash);
+  inviteLane = lm ? lm[1] : null;
+  if (fm || lm) history.replaceState(null, "", location.pathname + location.search);
   // one raw call: 401 ⇒ show the login card; 200 ⇒ identity from x-comms-*
   // (§7: identity rides the first response's headers — zero extra RPC).
   try {

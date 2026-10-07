@@ -418,6 +418,31 @@ async function cmdToken(a: Args) {
       console.log(`  ${v.token}`);
       console.log(`  prefix=${v.prefix} id=${v.id} — shown ONCE; store it now.`);
       if (!REMOTE) console.log("  (local bootstrap — the host is root; server mode requires tokens:admin)");
+      // RFC-003 invite kit: hand this block to the agent — identity from the
+      // token, JSON-RPC grammar inline, lane-scoped seats name their lane.
+      // Needs a base URL to be useful, so it only prints in remote mode.
+      if (REMOTE && process.env.COMMS_URL) {
+        const base = process.env.COMMS_URL.replace(/\/+$/, "");
+        const lane0 = v.lanes && v.lanes.length ? v.lanes[0] : "general";
+        console.log("");
+        console.log("── agent-comms invite ─────────────────────────");
+        console.log(`URL:    ${base}`);
+        console.log(`TOKEN:  ${v.token}`);
+        console.log(`AGENT:  ${v.agentId}   (identity comes from the token — never claim it)`);
+        console.log(`SCOPES: ${v.scopes || "(none — plain sender)"}`);
+        console.log(`LANES:  ${v.lanes && v.lanes.length ? v.lanes.join(",") : "(all lanes — unrestricted)"}`);
+        console.log("");
+        console.log("QUICK START (JSON-RPC 2.0, one endpoint):");
+        console.log(`  1 join:   POST ${base}/rpc {"jsonrpc":"2.0","id":1,"method":"join","params":{"role":"one-line description of who you are"}}`);
+        console.log(`  2 inbox:  POST ${base}/rpc {"jsonrpc":"2.0","id":2,"method":"inbox","params":{}}   (add "wait":20 to long-poll)`);
+        console.log(`  3 read:   POST ${base}/rpc {"jsonrpc":"2.0","id":3,"method":"history","params":{"channel":"${lane0}"}}`);
+        console.log(`  4 post:   POST ${base}/rpc {"jsonrpc":"2.0","id":4,"method":"post","params":{"from":"${v.agentId}","to":["<agent-id>"],"channel":"${lane0}","body":"your message","type":"note"}}`);
+        console.log("  receipts are automatic: ACK/DONE reply with the id of the message you handled.");
+        console.log("");
+        console.log(`link:    ${base}/#token=${v.token}${v.lanes && v.lanes.length ? "&lane=" + v.lanes[0] : ""}   (dashboard prefill — paste into a browser)`);
+        console.log("note:    token is shown ONCE — store it; revoke with: token revoke --id " + v.id);
+        console.log("────────────────────────────────────────────────");
+      }
       return;
     }
     case "list": {
