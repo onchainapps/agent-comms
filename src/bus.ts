@@ -154,6 +154,17 @@ export function cursorKeyFor(lanes: Set<string> | null | undefined, consumer: st
 export const postLanesOf = (ctx: { principal: object }): Set<string> | null =>
   ((ctx.principal as Partial<ServerPrincipal>).lanes ?? null);
 
+/** RFC-003 r3 (claude m1): THE one lanes accessor. Local mode keeps the
+ *  see-all quirk (undefined → null = unrestricted). In SERVER mode a missing
+ *  lanes field is a constructor bug and must FAIL CLOSED — an empty grant
+ *  sees nothing — never fail open to unrestricted like `?? null` did. Every
+ *  lane gate in the bus routes through here; the 4 ad-hoc r2 idioms are gone. */
+export const lanesOf = (mode: Mode, principal: object): Set<string> | null => {
+  const l = (principal as Partial<ServerPrincipal>).lanes;
+  if (l !== undefined) return l;
+  return mode === "local" ? null : new Set<string>();
+};
+
 export const parseLanesColumn = (raw: string | null | undefined): string[] | null => {
   if (raw === null || raw === undefined) return null;
   if (raw === "") return [];
@@ -622,15 +633,19 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       return { error: "usage", detail: `invalid channel name: ${p.name} (ID_RE; ':' and '~' excluded)` };
     if (p.purpose !== undefined && typeof p.purpose !== "string")
       return { error: "usage", detail: `purpose must be a string (got ${typeof p.purpose})` };
-    // RFC-003 R2 (grok B5): a scoped seat may create ONLY a listed lane that is
-    // currently missing (the operator opted in by listing it). Out-of-list is a
-    // UNIFORM forbidden regardless of row existence — no existence oracle —
-    // and it runs BEFORE the live-row short-circuit, which would otherwise
-    // answer {created:false} for a hidden live lane (oracle) vs forbidden for a
-    // hidden missing one.
-    const ccLanes = postLanesOf(ctx);
-    if (ccLanes !== null && !ccLanes.has(p.name))
-      return { error: "forbidden", detail: `lane-scoped token: ${p.name} is not an available lane (not granted, or not live)` };
+    // RFC-003 R2 (grok B5) + r3 MAJOR-1 (claude P2, ruling 1 upheld): a
+    // scoped seat NEVER creates. Lanes are LIVE AT MINT, so "in-list but
+    // missing" only ever exists after a deliberate operator delete — let the
+    // seat create then would let a seat that cannot DELETE un-DELETE (freezing
+    // a lane for guests would be impossible). In-list AND live answers
+    // {created:false}; everything else is the SAME uniform forbidden, before
+    // the existence read for out-of-list (no oracle either way).
+    const ccLanes = lanesOf(mode, ctx.principal);
+    if (ccLanes !== null) {
+      if (!ccLanes.has(p.name) || !d.query("SELECT 1 FROM channels WHERE name=?").get(p.name))
+        return { error: "forbidden", detail: `lane-scoped token: ${p.name} is not an available lane (not granted, or not live)` };
+      return { value: { name: p.name, created: false } };
+    }
     if (d.query("SELECT 1 FROM channels WHERE name=?").get(p.name)) return { value: { name: p.name, created: false } };
     // grok E2 m-tx: check+insert in ONE txn (house pattern, groupEnsure) — the
     // window is unreachable under the single-writer server but two local
@@ -668,7 +683,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     // BEFORE the existence read — a scoped seat must not learn whether a lane
     // exists by probing delete, and under D1 it would PASS the creator check
     // for lanes its agent minted through its unrestricted token.
-    if (postLanesOf(ctx) !== null)
+    if (lanesOf(mode, ctx.principal) !== null)
       return { error: "forbidden", detail: `lane-scoped token: ${p.name} cannot be deleted by a scoped seat (not granted, or not live)` };
     // E2.x re-fold (grok t_0cfd1b84 finding 2/3 + claude NIT-3): existence AND
     // the creator-or-admin gate are re-read INSIDE BEGIN IMMEDIATE — missing →
@@ -760,8 +775,8 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     // RFC-003: lane scoping gates EVERY lane (public included) and must run
     // BEFORE the public early-out — after it, every public lane bypasses.
     // read:all does NOT satisfy lanes (same doctrine as the DM gate).
-    const lanes = (ctx.principal as ServerPrincipal).lanes;
-    if (lanes !== null && lanes !== undefined && !lanes.has(channel)) return false;
+    const lanes = lanesOf(mode, ctx.principal);
+    if (lanes !== null && !lanes.has(channel)) return false;
     if (!DM_SHAPED_RE.test(channel)) return true;
     if (hasScope(ctx, "read:dm")) return true;
     return d.query("SELECT 1 FROM channel_members WHERE channel=? AND agent_id=?").get(channel, ctx.principal.agentId) !== null;
@@ -1184,7 +1199,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       // RFC-003 (grok M1): the subtraction also covers messages in lanes a
       // scoped seat cannot see — foreign-lane volume must not leak through
       // join unresolved (pin: post into a foreign lane changes nothing here).
-      const hiddenLanes = (ctx.principal as ServerPrincipal).lanes;
+      const hiddenLanes = lanesOf(mode, ctx.principal);
       unresolved = (d.query(
         "SELECT COUNT(*) c FROM messages WHERE status IN ('open','acked','in_progress') AND sender!=?",
       ).get(p.agent) as any).c
@@ -1266,12 +1281,24 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
         // dm:carol must conflict per §6).
         ...(p.dm !== undefined && p.dm !== null ? { dm: p.dm } : {}),
       }));
-      idem = { key, hash };
+      // r3 B1+MAJOR-2 (grok/claude): the key namespace is LANES-SCOPED
+      // (cursorKeyFor — ':' is outside the key grammar, siblings with
+      // different grants never share rows; raw key is length-checked above)
+      // and a replay hit is canSee-GATED BEFORE the hash comparison: an
+      // invisible stored row answers a uniform not_found whose detail names
+      // none of id/channel/file/thread (invisible == missing; `file` embeds
+      // the channel, so field-scrubbing the response would not be enough).
+      // A hash mismatch on an INVISIBLE row must not answer conflict — that
+      // confirms the hidden row.
+      const idemKey = cursorKeyFor(lanesOf(mode, ctx.principal), key);
+      idem = { key: idemKey, hash };
       const prev = d.query("SELECT msg_id, req_hash FROM idempotency WHERE agent_id=? AND key=?")
-        .get(ctx.principal.agentId, key) as any;
+        .get(ctx.principal.agentId, idemKey) as any;
       if (prev) {
-        if (prev.req_hash !== hash) return { error: "conflict", detail: "idempotency key reused with different params" };
         const m = d.query("SELECT id, thread, channel, file FROM messages WHERE id=?").get(prev.msg_id) as any;
+        if (m && !canSeeChannel(ctx, m.channel))
+          return { error: "not_found", detail: "idempotency key in use on a lane this seat cannot see" };
+        if (prev.req_hash !== hash) return { error: "conflict", detail: "idempotency key reused with different params" };
         return m ? { value: m } : { error: "conflict", detail: "idempotency row points at missing message" };
       }
     }
@@ -1431,8 +1458,8 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     // answer (no existence oracle), and dmPending (creation inside the txn)
     // is refused the same way. Usage still wins on shape errors — invalid
     // names never reach here (canSee/usage above).
-    const postLanes = (ctx.principal as ServerPrincipal).lanes;
-    if (postLanes !== null && postLanes !== undefined) {
+    const postLanes = lanesOf(mode, ctx.principal);
+    if (postLanes !== null) {
       const laneLive = channel !== null && (channel === "general" || !!d.query("SELECT 1 FROM channels WHERE name=?").get(channel)); // truthy: bun .get() is undefined/null on miss
       if (dmPending || channel === null || !postLanes.has(channel) || !laneLive)
         return { error: "forbidden", detail: `lane-scoped token: ${requestedChannel ?? channel ?? "general"} is not an available lane (not granted, or not live)` };
@@ -1663,7 +1690,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     if (!ID_RE.test(p.agent) || !ID_RE.test(p.to)) return { error: "usage", detail: "invalid id" };
     // RFC-003 (claude M4): a rename announces into general and moves history
     // out from under a lane grant — lifecycle is the operator's job.
-    if ((ctx.principal as ServerPrincipal).lanes !== null && (ctx.principal as ServerPrincipal).lanes !== undefined)
+    if (lanesOf(mode, ctx.principal) !== null)
       return { error: "forbidden", detail: "a lane-scoped token cannot rename agents (identity lifecycle is operator-side)" };
     const old = d.query("SELECT * FROM agents WHERE id=?").get(p.agent) as any;
     if (!old) return { error: "not_found", detail: `error: no such agent '${p.agent}'` };
@@ -1755,7 +1782,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     // RFC-003 R2 belt (grok M2): a scoped principal must not mint at all —
     // tokenCreate is transitively root, and a lanes-less child would be a
     // bus-wide escape from the operator's grant.
-    if ((ctx.principal as ServerPrincipal).lanes !== null && (ctx.principal as ServerPrincipal).lanes !== undefined)
+    if (lanesOf(mode, ctx.principal) !== null)
       return { error: "forbidden", detail: "a lane-scoped token cannot mint tokens" };
     const kind = p.kind ?? "agent";
     const rootCtx = isRootCtx(ctx);
@@ -1793,19 +1820,31 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
         seen.add(l);
       }
       if (seen.size > 32) return { error: "usage", detail: "lane cap is 32 per token" };
-      if (seen.has("general") === false && seen.size === 0) return { error: "usage", detail: "lanes: empty grant" };
       if (norm.split(",").includes("tokens:admin") || norm.split(",").includes("agents:admin"))
         return { error: "usage", detail: "lanes and tokens:admin/agents:admin are mutually exclusive (an admin token is bus-wide by definition)" };
       // R2: every granted PUBLIC lane must exist LIVE at mint (no hidden
       // revival through the minter). DM lanes must exist as a stored pair —
       // the minter's membership is not required (read:dm seats are auditors).
       for (const l of [...seen].sort()) {
-        if (d.query("SELECT 1 FROM channels WHERE name=?").get(l)) continue;
         const dmM = DM_RE.exec(l);
+        // dm-shaped entries ALWAYS route through the pair lookup, even when a
+        // row with this exact spelling exists: the stored pair name is the
+        // truth (a renamed label or ~n-suffixed alias can canSee-miss later).
+        if (!dmM && d.query("SELECT 1 FROM channels WHERE name=?").get(l)) continue;
         if (dmM) {
           const [lo, hi] = dmM[1] < dmM[2] ? [dmM[1], dmM[2]] : [dmM[2], dmM[1]];
-          if (lo === hi || !dmChannelForPair(lo, hi))
+          const hit = lo === hi ? null : dmChannelForPair(lo, hi);
+          if (!hit)
             return { error: "usage", detail: `lane ${l} is not a live lane (no DM exists for that pair — DM lanes name an EXISTING pair)` };
+          // r3 MAJOR-3 (claude P1): store the STORED pair name, never the
+          // spelling the minter typed — a reversed or ~n-suffixed label would
+          // otherwise canSee-miss the real channel (dead grant). Membership
+          // gate: the seat's AGENT (not the minter) must be a party, unless
+          // the token carries read:dm (auditor seats read every DM they can
+          // see; lanes still narrows which ones).
+          if (hit !== l) seen.delete(l), seen.add(hit);
+          if (!scopes.includes("read:dm") && !d.query("SELECT 1 FROM channel_members WHERE channel=? AND agent_id=?").get(hit, p.agent))
+            return { error: "usage", detail: `lane ${hit}: agent '${p.agent}' is not a party of that DM (mint needs a party seat or the read:dm scope)` };
           continue;
         }
         const dup = channelDup(l); // JS near-dup scan (live channels + tombstones) — the E2.x truth, no SQL column
@@ -1899,6 +1938,11 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (!isRootCtx(ctx) && !ctx.principal.scopes.includes("tokens:admin"))
       return { error: "forbidden", detail: "token.list requires tokens:admin" }; // M9
+    // r3 m5 (claude): belt, not just transitivity — a scoped seat never lists
+    // the whole fleet, even if a future mint path ever let lanes + admin
+    // scopes coexist (rev-1 §2.5 says it out loud; now the code does too).
+    if (lanesOf(mode, ctx.principal) !== null)
+      return { error: "forbidden", detail: "a lane-scoped token cannot list tokens" };
     // m1 (round 2): kind lives on agents, not tokens — JOIN for it.
     const rows = d.query("SELECT t.*, a.kind AS agent_kind FROM tokens t LEFT JOIN agents a ON a.id=t.agent_id ORDER BY t.id").all() as any[];
     // RFC-003: lanes surface for the dashboard chip + the LANES invite line.
@@ -1909,6 +1953,8 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (!isRootCtx(ctx) && !ctx.principal.scopes.includes("tokens:admin"))
       return { error: "forbidden", detail: "token.revoke requires tokens:admin" }; // M9
+    if (lanesOf(mode, ctx.principal) !== null) // r3 m5 belt (see token.list)
+      return { error: "forbidden", detail: "a lane-scoped token cannot revoke tokens" };
     const r = d.run("UPDATE tokens SET revoked_at=? WHERE id=? AND revoked_at IS NULL", [nowIso(), p.id]);
     if (r.changes === 0) return { error: "not_found", detail: `no active token ${p.id}` };
     return { value: { revoked: true } };
@@ -2046,7 +2092,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       // RFC-003 (grok B1 / claude M1): the lane predicate rides IN THE WHERE of
       // BOTH branches, BEFORE LIMIT (a post-LIMIT filter livelocks the since-
       // page exactly like the DM predicate did). read:all does NOT bypass it.
-      const histLanes = postLanesOf(ctx);
+      const histLanes = lanesOf(mode, ctx.principal);
       const laneFlag = histLanes ? 0 : 1; // unrestricted ⇒ `1 = 1` bypass; scoped ⇒ 0 + EXISTS on the list
       const laneJson = histLanes ? JSON.stringify([...histLanes]) : "[]";
       const laneSql = `(1 = ? OR EXISTS (SELECT 1 FROM json_each(?) j WHERE j.value = m.channel))`;
@@ -2120,7 +2166,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       // RFC-003 R3: scoped seats read a lane-hash-suffixed row — a watch from
       // a scoped token can never advance (or be starved by) the unrestricted
       // sibling's consumer row. Same lanes ⇒ same key ⇒ rotation keeps position.
-      const row = cursorRaw(ctx.principal.agentId, cursorKeyFor(postLanesOf(ctx), consumer));
+      const row = cursorRaw(ctx.principal.agentId, cursorKeyFor(lanesOf(mode, ctx.principal), consumer));
       if (row && row.epoch !== ep)
         return { error: "resync", detail: "cursor epoch stale (epoch rotated)", data: { resync: true, epoch: ep, floor: gcFloor() } };
       seq = row?.seq ?? 0;

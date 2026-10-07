@@ -1193,6 +1193,15 @@ export function contractSuite(name: string, make: Factory) {
         expect(dm6.error).toBe("forbidden"); // scoped seats never CREATE a dm lane
         expect(String((dm6 as any).detail)).toContain("lane-scoped");
         expect((await seat.post({ from: "r3p6", to: "nosuchpeer", type: "note", body: "x", dm: "nosuchpeer" })).error).toBe("not_found"); // dmGate wins over the lane gate
+        // r3 m4 (claude): in-list-MISSING through the post back door — grant
+        // tmp, operator deletes, the seat may NOT un-delete by posting.
+        await root.channelCreate({ name: "tmp6d" });
+        const seat6d = await lanesSess(h, root, "r3p6d", ["general", "tmp6d"]);
+        await root.channelDelete({ name: "tmp6d" });
+        const noRev = await seat6d.post({ from: "r3p6d", to: "*", type: "note", body: "x", channel: "tmp6d" });
+        expect(noRev.error).toBe("forbidden"); // back door is closed for scoped seats
+        expect(((await root.post({ from: "root", to: "*", type: "note", body: "revive", channel: "tmp6d" })) as any).value.channel).toBe("tmp6d"); // operator revives
+        await root.channelDelete({ name: "tmp6d" });
         // unrestricted revives through the back door exactly as before (byte-identical)
         await root.channelDelete({ name: "tmp" });
         const rev = await root.post({ from: "root", to: "*", type: "note", body: "revive", channel: "tmp" });
@@ -1206,11 +1215,16 @@ export function contractSuite(name: string, make: Factory) {
         const seat = await lanesSess(h, root, "r3c7", ["planned", "general"]); // LIVE at mint (R2)
         expect((await seat.channelCreate({ name: "planned" }) as any).value.created).toBe(false); // already live ⇒ idempotent
         await root.channelDelete({ name: "planned" });                          // operator retires
-        expect((await seat.channelCreate({ name: "planned" }) as any).value.created).toBe(true); // blessed materialize (listed lane)
+        // r3 MAJOR-1 (claude P2, grok ruling 1): in-list-missing is ALWAYS a
+        // revival (lanes are live at mint) — scoped seats never un-delete.
+        const rev7 = await seat.channelCreate({ name: "planned" });
+        expect(rev7.error).toBe("forbidden");
         const o1 = await seat.channelCreate({ name: "elsewhere" });
         const o2 = await seat.channelCreate({ name: "ghost7" });
         expect(o1.error).toBe("forbidden"); expect(o2.error).toBe("forbidden");
-        expect((o1 as any).detail).toBe((o2 as any).detail.replace("ghost7", "elsewhere")); // uniform shape, no oracle
+        expect((o1 as any).detail).toBe((o2 as any).detail.replace("ghost7", "elsewhere")); // uniform template ⇒ oracle-free
+        expect((rev7 as any).detail).toBe((o1 as any).detail.replace("elsewhere", "planned")); // revive == out-of-list, oracle-free
+        expect(((await root.channelCreate({ name: "planned" })) as any).value.created).toBe(true); // operator still revives
         // dup with a HIDDEN sibling: near-dup of foreign7 (live, outside lanes) — must NOT name it (grok B5)
         await root.channelCreate({ name: "foreign7" });
         const dup = await seat.channelCreate({ name: "foreign_7" }); // chanNorm("foreign_7")=="foreign7", hidden from the seat
@@ -1231,6 +1245,91 @@ export function contractSuite(name: string, make: Factory) {
         expect((await root.channelDelete({ name: "planned" })).error).toBeUndefined(); // operator still can
         expect((await seat.rename({ agent: "r3c7", to: "r3c7b" })).error).toBe("forbidden"); // claude M4
         expect((await root.rename({ agent: "r3c7", to: "r3c7c" })).error).toBeUndefined();
+      });
+    });
+
+    // r3 B1+MAJOR-2 (grok/claude): idempotency replay must respect lanes on
+    // BOTH axes — the key namespace is lanes-scoped (sibling tokens never
+    // collide), and a replay hit on an INVISIBLE row answers uniform
+    // not_found naming none of id/channel/file/thread.
+    test("RFC-003 12: idempotency replay is lane-blind — invisible hit ⇒ uniform not_found before hash check; key namespace lanes-scoped; visible replay byte-identical", async () => {
+      await withBus(async (h, root) => {
+        await root.channelCreate({ name: "secret12" });
+        const un = await seedAgent(h, root, "r3i12", "w");
+        const unS = (un as any).value.session as Session;
+        const seat = await lanesSess(h, root, "r3i12", ["general"]); // sibling token, same agent (D1)
+        // grok's probe shape: an anchor in a SECRET lane + a THREAD-INHERITED
+        // post that never names the lane — the request hash has channel:null,
+        // so the replay path (which runs before the resolved-channel gate) was
+        // the ONLY way the leak happened. Same key, same agent, scoped sibling.
+        const anchor = await root.post({ from: "root", to: "*", type: "note", body: "anchor", channel: "secret12" });
+        const sp = await unS.post({ from: "r3i12", to: "root", type: "reply", body: "s", thread: (anchor as any).value.id, idempotencyKey: "sk12" });
+        expect((sp as any).value.channel).toBe("secret12"); // inherited, no explicit channel
+        // scoped sibling replays the SAME params+key: pre-r3 leaked {id,
+        // channel:"secret12", file}; now invisible == missing, no names.
+        const leak = await seat.post({ from: "r3i12", to: "root", type: "reply", body: "s", thread: (anchor as any).value.id, idempotencyKey: "sk12" });
+        expect(leak.error).toBe("not_found"); // anchor invisible ⇒ fresh post would be not_found too
+        const d = String((leak as any).detail);
+        expect(d).not.toContain("secret12");
+        expect(d).not.toContain((sp as any).value.id);
+        // hash mismatch on an INVISIBLE row must NOT answer conflict
+        const mism = await seat.post({ from: "r3i12", to: "root", type: "reply", body: "CHANGED", thread: (anchor as any).value.id, idempotencyKey: "sk12" });
+        expect(mism.error).toBe("not_found");
+        // key namespace is lanes-scoped: same key+params in a VISIBLE lane
+        // must NOT conflict with the hidden row (pre-r3: cross-token conflict).
+        const vp = await seat.post({ from: "r3i12", to: "root", type: "note", body: "v", channel: "general", idempotencyKey: "sk12" });
+        expect((vp as any).error).toBeUndefined();
+        // visible replay stays byte-identical: replay of vp returns the same id
+        const vp2 = await seat.post({ from: "r3i12", to: "root", type: "note", body: "v", channel: "general", idempotencyKey: "sk12" });
+        expect((vp2 as any).value.id).toBe((vp as any).value.id);
+        expect((vp2 as any).value.channel).toBe("general");
+      });
+    });
+
+    // r3 MAJOR-3 (claude P1): DM lane entries canonicalize to the STORED pair
+    // name and require the seat's agent to be a party (or read:dm).
+    test("RFC-003 13: dm lane mint — stored pair name wins over typed spelling; non-party refused; read:dm auditor accepted; phantom pair refused", async () => {
+      await withBus(async (h, root) => {
+        const a = await seedAgent(h, root, "r3dm1", "w");
+        const b = await seedAgent(h, root, "r3dm2", "w");
+        await seedAgent(h, root, "r3dm3", "w"); // auditor candidate must exist pre-mint
+        const aS = (a as any).value.session as Session;
+        const dm = await aS.post({ from: "r3dm1", to: "r3dm2", type: "note", body: "hi", dm: "r3dm2" });
+        expect((dm as any).error).toBeUndefined();
+        const stored = (dm as any).value.channel; // dm~r3dm1~r3dm2 (sorted)
+        const reversed = "dm~r3dm2~r3dm1";
+        // reversed spelling canonicalizes to the stored name
+        const t1 = await root.tokenCreate({ agent: "r3dm1", lanes: ["general", reversed] });
+        expect((t1 as any).error).toBeUndefined();
+        expect((t1 as any).value.lanes).toEqual([stored, "general"].sort());
+        // non-party without read:dm is refused (dead grant otherwise)
+        const t2 = await root.tokenCreate({ agent: "r3dm3", lanes: ["general", stored] });
+        expect(t2.error).toBe("usage");
+        expect(String((t2 as any).detail)).toContain("not a party");
+        // auditor with read:dm is accepted
+        const t3 = await root.tokenCreate({ agent: "r3dm3", lanes: [stored], scopes: ["read:dm"] as any });
+        expect((t3 as any).error).toBeUndefined();
+        // phantom pair refused
+        expect((await root.tokenCreate({ agent: "r3dm1", lanes: ["dm~r3dm1~nosuch"] })).error).toBe("usage");
+        // a seat minted with the canonical name actually SEES the lane
+        const seat = (h as any).session({ token: (t1 as any).value.token }) as Session;
+        const hist = await seat.history({ channel: stored });
+        expect((hist as any).error).toBeUndefined();
+      });
+    });
+
+    // r3 m5 (claude): the scoped list/revoke belt is CODE, not only
+    // transitivity (no mint path makes the combo, but the gate answers too).
+    test("RFC-003 14: scoped list/revoke belt + m3 deny-all renders distinct from unrestricted in tokenList", async () => {
+      await withBus(async (h, root) => {
+        const seat = await lanesSess(h, root, "r3b14", ["general"]);
+        expect((await seat.tokenList()).error).toBe("forbidden");
+        expect((await seat.tokenRevoke({ id: 1 })).error).toBe("forbidden");
+        const deny = await root.tokenCreate({ agent: "r3b14c", lanes: ["general"] }); // sanity mint
+        expect((deny as any).error).toBeUndefined();
+        const rows = (((await root.tokenList()) as any).value.tokens) as any[];
+        const mine = rows.find((t) => t.agentId === "r3b14c");
+        expect(Array.isArray(mine.lanes)).toBe(true);
       });
     });
 

@@ -414,7 +414,7 @@ async function cmdToken(a: Args) {
       const v = unwrap(await CALL("tokenCreate", a.agent, {
         agent: a.agent, kind: a.kind, label: a.label, scopes, admin: !!a.admin, force: !!a.force, lanes,
       }));
-      console.log(`token for ${v.agentId} (kind=${a.kind ?? "agent"}, scopes=${v.scopes}${v.lanes ? `, lanes=${v.lanes.join(",")}` : ""}):`);
+      console.log(`token for ${v.agentId} (kind=${a.kind ?? "agent"}, scopes=${v.scopes}${v.lanes === undefined || v.lanes === null ? "" : `, lanes=${v.lanes.length ? v.lanes.join(",") : "(none — deny-all, sees nothing)"}`}):`); // m3 (claude r3): unrestricted stays byte-identical (no lanes= field); deny-all is explicit
       console.log(`  ${v.token}`);
       console.log(`  prefix=${v.prefix} id=${v.id} — shown ONCE; store it now.`);
       if (!REMOTE) console.log("  (local bootstrap — the host is root; server mode requires tokens:admin)");
@@ -449,7 +449,7 @@ async function cmdToken(a: Args) {
       const v = unwrap(await CALL("tokenList", a.agent ?? "", {}));
       if (!v.tokens.length) { console.log("(no tokens)"); return; }
       for (const t of v.tokens)
-        console.log(`  #${String(t.id).padStart(3)} ${String(t.agentId).padEnd(16)} ${String(t.kind).padEnd(5)} prefix=${t.prefix} scopes=${t.scopes.join(",")}${t.lanes ? ` lanes=${t.lanes.join(",")}` : ""}${t.revoked_at ? ` REVOKED@${t.revoked_at}` : ""} last=${t.last_used ?? "?"}`);
+        console.log(`  #${String(t.id).padStart(3)} ${String(t.agentId).padEnd(16)} ${String(t.kind).padEnd(5)} prefix=${t.prefix} scopes=${t.scopes.join(",")}${t.lanes === undefined || t.lanes === null ? "" : ` lanes=${t.lanes.length ? t.lanes.join(",") : "(none — deny-all)"}`}${t.revoked_at ? ` REVOKED@${t.revoked_at}` : ""} last=${t.last_used ?? "?"}`);
       return;
     }
     case "revoke": {

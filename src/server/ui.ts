@@ -904,7 +904,8 @@ async function renderTokenTable() {
     tr.appendChild(el("td", null, t.label || "—"));
     tr.appendChild(el("td", "mono", (t.scopes || []).join(",")));
     // RFC-003: lanes chip — scoped seats show their closed list; unrestricted stays blank
-    tr.appendChild(el("td", "mono", Array.isArray(t.lanes) && t.lanes.length ? t.lanes.join(",") : "—"));
+    // r3 m3 (claude): deny-all [] and unrestricted null must not share a glyph
+    tr.appendChild(el("td", "mono", t.lanes === null ? "—" : (Array.isArray(t.lanes) && t.lanes.length ? t.lanes.join(",") : "∅ none")));
     tr.appendChild(el("td", "mono", t.last_used || "—"));
     tr.appendChild(el("td", t.revoked_at ? "rev" : "", t.revoked_at ? "revoked" : "live"));
     const td = el("td");
@@ -981,6 +982,14 @@ let inviteLane = null; // RFC-003 invite kit: #lane= deep-link target, consumed 
   const lm = /[#&]lane=([a-z0-9][a-z0-9-]{0,63})/.exec(location.hash);
   inviteLane = lm ? lm[1] : null;
   if (fm || lm) history.replaceState(null, "", location.pathname + location.search);
+  // r3 (grok ruling 3 / claude m2): AN INVITE ALWAYS WINS — checked BEFORE
+  // any session/saved probe. A live cookie or remembered token must not
+  // silently boot the old identity while a fresh credential sits in the URL
+  // (it was about to be stripped, so the human would never see it spent).
+  // Prefill + focus, remember stays UNCHECKED (a login click with the box
+  // off never persists the invite), and nothing auto-submits: the human
+  // decides when the credential is spent.
+  if (inviteTok) { $("tok").value = inviteTok; $("tok").focus(); return; }
   // one raw call: 401 ⇒ show the login card; 200 ⇒ identity from x-comms-*
   // (§7: identity rides the first response's headers — zero extra RPC).
   try {
@@ -990,13 +999,8 @@ let inviteLane = null; // RFC-003 invite kit: #lane= deep-link target, consumed 
       // browsers (Chrome over plain HTTP) can still boot: probe the saved
       // token as bearer; if it authenticates, boot in bearer mode silently.
       const saved = localStorage.getItem("comms-token");
-      if (inviteTok && !saved) {
-        // fresh invite on a clean device: prefill, don't persist, don't submit
-        $("tok").value = inviteTok; $("tok").focus();
-        return;
-      }
       if (saved) {
-        $("tok").value = inviteTok || saved; $("remember").checked = true;
+        $("tok").value = saved; $("remember").checked = true;
         try {
           const br = await fetch("/rpc", { method: "POST", headers: { "content-type": "application/json", authorization: authz() + saved }, body: JSON.stringify({ jsonrpc: "2.0", method: "channels", params: {}, id: ++rpcid }) });
           if (br.ok) {

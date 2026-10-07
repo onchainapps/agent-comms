@@ -67,12 +67,15 @@ fail-closed model, with ONE blessed exception.
   runs before existence-dependent error classes). A scoped seat NEVER creates or
   revives through the post back door; `dmPending` + lanes → `forbidden` (no DM
   auto-mint).
-- `channel.create`: out-of-list → `forbidden`, uniform detail regardless of row
-  existence (grok B5: no oracle). In-list ∧ missing → ALLOWED (this is the one
-  blessed materialize/revive — the operator opted in by listing it, grok B5).
-  In-list ∧ live → today's `{created:false}`. `channelDup` detail: if the colliding
-  sibling is OUTSIDE the caller's list, the usage detail is generic (must not name
-  the hidden lane — grok B5's error-string leak).
+- `channel.create` (rev-2, claude P2 struck the materialize exception): a
+  scoped seat NEVER creates. Out-of-list → `forbidden`, uniform detail
+  regardless of row existence (grok B5: no oracle). In-list ∧ MISSING → the
+  SAME uniform `forbidden` — lanes are live at mint, so listed-but-missing only
+  ever exists after a deliberate operator delete, and a seat that cannot delete
+  must not un-delete (freeze-means-freeze, claude MAJOR-1; grok ruling 1
+  upheld). In-list ∧ live → `{created:false}`. `channelDup` detail: if the
+  colliding sibling is OUTSIDE the caller's list, the usage detail is generic
+  (must not name the hidden lane — grok B5's error-string leak).
 - `channel.delete`: any scoped seat → `forbidden`, uniform, BEFORE the existence
   read. Lifecycle is the operator's job (claude M4: under D1 the seat would pass
   the creator check for lanes its agent made via its GLOBAL token).
@@ -131,7 +134,8 @@ does not bypass.
   `post:as` are lane-bounded ⇒ allowed.
 - belt-and-suspenders (grok M2): `token.create` / `token.list` / `token.revoke`
   from any principal with `lanes !== null` → `forbidden` (a scoped mint of
-  `{lanes: absent}` would be a bus-wide escape).
+  `{lanes: absent}` would be a bus-wide escape). Rev-2: the list/revoke belt is
+  IN CODE (claude m5), pinned by contract pin 14 — no longer transitivity-only.
 - public lanes: must exist live; near-dup detail names the sibling.
 - DM lanes: pair-resolved to the STORED name (canonicalized, ~n-stripped);
   unknown pair → usage; the token's agent must be a MEMBER of that DM pair or
@@ -240,9 +244,10 @@ error shapes), server-mode cores only (local see-all would false-pass):
    forbidden unless resolved name ∈lanes ∧ live; in-list-missing → forbidden
    (no create); out-of-list → forbidden; uniform detail, no oracle; usage still
    wins for bad shapes (non-string before regex).
-7. channel.create: out-of-list forbidden uniform; in-list materialize allowed;
-   dup detail does not name a hidden sibling. channel.delete scoped forbidden
-   uniform. rename scoped forbidden.
+7. channel.create: out-of-list forbidden uniform; in-list-missing forbidden
+   SAME uniform (rev-2: revive belongs to the operator); in-list-live
+   {created:false}; dup detail does not name a hidden sibling. channel.delete
+   scoped forbidden uniform. rename scoped forbidden.
 8. join unresolved ignores foreign lanes.
 9. mint: `tokens:admin`+lanes and `agents:admin`+lanes rejected usage; scoped
    principal cannot token.create/list/revoke; cap 32; `lanes:"notanarray"` usage;
@@ -252,6 +257,18 @@ error shapes), server-mode cores only (local see-all would false-pass):
     `cli` row; same-lanes rotated token keeps position; unrestricted keys
     byte-identical; forged `x:L…` consumer names rejected (outside CONSUMER_RE).
 11. tokenVerify returns lanes; Set on principal; invite text + CLI LANES line.
+12. (rev-2, grok B1 + claude MAJOR-2) idempotency is lane-scoped on BOTH axes:
+    the stored key is `cursorKeyFor(lanes, rawKey)` — sibling tokens with
+    different grants never collide (raw key length-checked first); a replay hit
+    on an INVISIBLE row answers `not_found` BEFORE the hash comparison, detail
+    naming none of id/channel/file/thread (`file` embeds the channel, so
+    scrubbing fields is not enough); hash mismatch on an invisible row must not
+    answer conflict. Visible replay stays byte-identical.
+13. (rev-2, claude MAJOR-3) DM lane mint stores the PAIR-RESOLVED name, not the
+    typed spelling; non-party seat without `read:dm` → usage; `read:dm` auditor
+    accepted; phantom pair refused.
+14. (rev-2, claude m5) token.list / token.revoke answer forbidden for ANY
+    principal with lanes — code belt, not only mint-path transitivity.
 
 **N1b (UI, separate commit, same milestone):** §4 invite prefill (logged-out
 path, fragment stripped, no auto-submit), copy-invite-link, lanes chip; pins

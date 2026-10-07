@@ -648,6 +648,57 @@ describe("M2 review pins (claude)", () => {
     } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
   });
 
+  // r3 grok M2: RFC pin 5 on the HTTP transport — lanes must reach /raw and
+  // SSE principalOf; a principalOf edit that drops lanes fails HERE, not only
+  // in the in-process contract suite.
+  test("RFC-003 pin 5 (HTTP): scoped seat gets 404 on a foreign-lane /raw file and zero foreign SSE frames; owner still 200", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0, limits: { tailerMs: 40 } });
+    try {
+      const rpc2 = new RpcBus(srv.url, tok);
+      const root = rpc2.session({ token: tok });
+      expect((await root.channelCreate({ name: "pin5secret" })).error).toBeUndefined();
+      const sec = await root.post({ from: "root", to: "*", type: "note", body: "secret body", channel: "pin5secret" });
+      expect((sec as any).error).toBeUndefined();
+      const secFile = String((sec as any).value.file).split("/").pop()!;
+      const g = await root.post({ from: "root", to: "*", type: "note", body: "visible", channel: "general" });
+      const gFile = String((g as any).value.file).split("/").pop()!;
+      const sc = await root.tokenCreate({ agent: "pin5-guest", lanes: ["general"], scopes: ["read:all"] as any });
+      const sTok = (sc as any).value.token;
+      await rpc2.session({ token: sTok }).joinAgent({ agent: "pin5-guest", role: "guest" });
+      // /raw: foreign-lane file is 404/-32003 (same body as a missing lane); own-lane is 200
+      const foreign = await fetch(`${srv.url}/raw/messages/pin5secret/${secFile}`, { headers: { authorization: `Bearer ${sTok}` } });
+      const fb: any = await foreign.json().catch(() => null);
+      expect([foreign.status, fb?.error?.code].join()).toBe("404,-32003");
+      const own = await fetch(`${srv.url}/raw/messages/general/${gFile}`, { headers: { authorization: `Bearer ${sTok}` } });
+      expect(own.status).toBe(200);
+      const owner = await fetch(`${srv.url}/raw/messages/pin5secret/${secFile}`, { headers: { authorization: `Bearer ${tok}` } });
+      expect(owner.status).toBe(200);
+      // SSE scope=all as the scoped seat: post AFTER opening the stream —
+      // the general frame flows (id present), the secret frame never does.
+      const ctrl = new AbortController();
+      const res = await fetch(`${srv.url}/stream?scope=all`, { headers: { authorization: `Bearer ${sTok}` }, signal: ctrl.signal });
+      expect(res.status).toBe(200);
+      const reader = res.body!.getReader(); const dec = new TextDecoder();
+      const hello = dec.decode((await reader.read()).value); // frames start at hello (global high-water)
+      expect(hello).toContain("event: hello");
+      const sGen = await root.post({ from: "root", to: "*", type: "note", body: "flows", channel: "general" });
+      const sSec = await root.post({ from: "root", to: "*", type: "note", body: "stays", channel: "pin5secret" });
+      const frames: string[] = [];
+      const t0 = Date.now();
+      while (Date.now() - t0 < 5000) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        frames.push(dec.decode(value));
+        if (frames.join("").includes((sGen as any).value.id)) break;
+      }
+      ctrl.abort();
+      const joined = frames.join("");
+      expect(joined).toContain((sGen as any).value.id); // own lane flows
+      expect(joined).not.toContain((sSec as any).value.id); // foreign lane never flows
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
   // ---------- §7 GET /raw/messages/<channel>/<file> ----------
   test("§7 /raw: mirror bytes served to addressee; 401 without cred; traversal + regex rejected pre-join", async () => {
     const home = tmp(); const tok = bootstrap(home);
