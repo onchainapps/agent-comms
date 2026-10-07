@@ -155,6 +155,9 @@ describe("M3 remote CLI", () => {
       expect(j.code).toBe(0);
       expect(j.err).toContain("transport=remote:");
       expect(j.out).toContain("joined: m3-bot");
+      // SELF-BOOTSTRAP pin: remote join prints the server-computed welcome kit
+      expect(j.out).toContain("WELCOME m3-bot");
+      expect(j.out).toContain("receipts are duty");
 
       const p = cli(["post", "--from", "m3-bot", "--to", "root", "--type", "note", "--subject", "hi", "--body", "remote hello"], { COMMS_URL: srv.url, COMMS_TOKEN: botTok });
       expect(p.code).toBe(0);
@@ -373,6 +376,7 @@ describe("M3 remote CLI", () => {
       const j = run(["join", "--agent", "shimprobe", "--role", "r"]);
       expect(j.code).toBe(0);
       expect(j.out).toContain("joined: shimprobe"); // exit 0 with EMPTY stdout was the bug
+      expect(j.out).not.toContain("WELCOME"); // LOCAL mode stays byte-identical (golden parity)
       expect(run(["who"]).out).toContain("shimprobe");
       expect(run(["nonsense-verb"]).code).toBe(2); // HELP path reached ⇒ main() ran
     } finally { rmSync(home, { recursive: true, force: true }); }

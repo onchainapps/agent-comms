@@ -13,7 +13,7 @@ import { openBus, localCtx, serverCtx, type Bus, type Ctx, type Mode, type MsgRo
 
 export interface Session {
   readonly agentId: string;
-  joinAgent(p: { agent: string; role: string; caps?: string; fingerprint?: string | null }): Promise<Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number }>>;
+  joinAgent(p: { agent: string; role: string; caps?: string; fingerprint?: string | null }): Promise<Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number; welcome: string }>>;
   listAgents(activeOnly: boolean): Promise<Res<AgentRow[]>>;
   post(p: { from: string; to: string; type: string; subject?: string; body: string; thread?: string | null; re?: string | null; tags?: string; channel?: string | null; as?: string | null; idempotencyKey?: string | null; dm?: string | null }): Promise<Res<{ id: string; channel: string; thread: string; file: string }>>;
   inbox(p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean; noAll?: boolean }): Promise<Res<{ rows: MsgRow[]; unreadIds: string[] }>>;

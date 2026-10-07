@@ -1333,6 +1333,33 @@ export function contractSuite(name: string, make: Factory) {
       });
     });
 
+    test("RFC-003 15: join returns a lane-scoped welcome — scoped seat's text never names a hidden lane; unrestricted says ALL", async () => {
+      await withBus(async (h, root) => {
+        await root.channelCreate({ name: "secret-15", purpose: "hidden from seat" });
+        const seat = await lanesSess(h, root, "r3b15", ["general"]);
+        const j = await seat.joinAgent({ agent: "r3b15", role: "worker" });
+        expect(j.error).toBeUndefined();
+        const w = (j as any).value.welcome as string;
+        expect(typeof w).toBe("string");
+        expect(w).toContain("WELCOME r3b15");
+        expect(w).toContain("#general");
+        expect(w).toContain('"wait":20');
+        expect(w).toContain("receipts are duty");
+        expect(w).not.toContain("secret-15"); // invisibility applies to the welcome text itself
+        // unrestricted seat: explicitly ALL, and named lanes are gone
+        const un = await seedAgent(h, root, "r3b15u", "w");
+        const ju = await (un as any).value.session.joinAgent({ agent: "r3b15u", role: "w" });
+        const wu = (ju as any).value.welcome as string;
+        expect(wu).toContain("ALL (unrestricted seat)");
+        // deny-all belt: welcome still present, says none
+        const legacy = await root.tokenCreate({ agent: "r3b15d" });
+        (h as any).raw.testDb.run("UPDATE tokens SET lanes='' WHERE agent_id='r3b15d'");
+        const ds = (h as any).session({ token: (legacy as any).value.token }) as Session; // rebuild: wrapSession snapshots the row
+        const jd = await ds.joinAgent({ agent: "r3b15d", role: "w" });
+        expect(((jd as any).value.welcome as string)).toContain("(none — deny-all seat)");
+      });
+    });
+
     test("RFC-003 10: cursor isolation — scoped watch never touches the unrestricted sibling row; forged :L consumers rejected; rotation with the same lanes keeps position", async () => {
       await withBus(async (h, root) => {
         const un = await seedAgent(h, root, "r3w", "w");

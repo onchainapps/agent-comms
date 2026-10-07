@@ -232,6 +232,10 @@ async function cmdJoin(a: Args) {
   console.log(`joined: ${a.agent} (role=${a.role}, caps=${a.caps || "-"}${a.group ? `, group=${a.group}` : ""}, ${REMOTE ? "remote — identity from token" : fp ? `fp=${String(fp).slice(0, 8)}…` : "fp=UNSET — identity unprotected, set COMMS_FINGERPRINT"})`);
   await printWho(true);
   console.log(`\n${v.unresolved} unresolved message(s) in flight. Run: bun comms.ts inbox --for ${a.agent} --open`);
+  // SELF-BOOTSTRAP: server-computed quick start (lane-scoped). REMOTE-only so
+  // local golden transcripts stay byte-identical; a fresh agent that got only
+  // a token still learns the protocol on first join.
+  if (REMOTE && v.welcome) console.log("\n" + v.welcome);
 }
 
 async function cmdPost(a: Args) {

@@ -174,6 +174,17 @@ subtraction with the same lane predicate (a scoped caller subtracts messages in
 lanes it cannot see). Pin: posting in a foreign lane does not change a scoped
 seat's `join unresolved`.
 
+2.8b **join `welcome` (self-bootstrap, mike ask 2026-10-07).** `joinAgent`'s
+result gains a `welcome: string` — a per-token quick start (join is now the
+first call a bare token makes, and it must not need human-pasted instructions).
+The lane line is computed from `lanesOf()`: unrestricted -> `ALL (unrestricted
+seat)`, scoped -> sorted `#lane` list (a scoped seat's text NEVER names a
+hidden lane; pin 15), deny-all -> `(none - deny-all seat)`. The default post
+channel picks `general` when visible, else the first sorted lane. The endpoint
+is a placeholder (`your /rpc endpoint`) because the bus cannot know its own
+externally reachable URL behind nginx. CLI prints it ONLY in REMOTE mode (local
+golden transcripts stay byte-identical; pinned).
+
 2.9 **Inherited, pinned-against-regression (grok pin 11):** `setStatus` and
 `dm.members` keep `not_found` via canSee; `threadOf` keeps today's semantics —
 foreign rows DROP, `not_found` only when ZERO visible rows. Do NOT "fix" that
@@ -248,7 +259,8 @@ error shapes), server-mode cores only (local see-all would false-pass):
    SAME uniform (rev-2: revive belongs to the operator); in-list-live
    {created:false}; dup detail does not name a hidden sibling. channel.delete
    scoped forbidden uniform. rename scoped forbidden.
-8. join unresolved ignores foreign lanes.
+8. join unresolved ignores foreign lanes; join welcome text never names a
+   hidden lane and CLI prints it remote-only (pin 15 + cli pins).
 9. mint: `tokens:admin`+lanes and `agents:admin`+lanes rejected usage; scoped
    principal cannot token.create/list/revoke; cap 32; `lanes:"notanarray"` usage;
    `lanes:[]` usage; DM lane needs membership-or-`read:dm`; public lane must be

@@ -258,7 +258,7 @@ interface ServerOnly {
   // property (arrow) syntax, NOT method syntax: strictFunctionTypes is only
   // contravariant for properties — method params are bivariant and would let
   // a Ctx<"local"> slip back in (probe-verified).
-  joinAgent: (ctx: Ctx<"server">, p: { agent: string; role: string; caps?: string; fingerprint?: string | null }) => Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number }>;
+  joinAgent: (ctx: Ctx<"server">, p: { agent: string; role: string; caps?: string; fingerprint?: string | null }) => Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number; welcome: string }>;
   post: (ctx: Ctx<"server">, p: { from: string; to: string; type: string; subject?: string; body: string; thread?: string | null; re?: string | null; tags?: string; channel?: string | null; as?: string | null; idempotencyKey?: string | null; dm?: string | null }) => Res<{ id: string; channel: string; thread: string; file: string }>;
   inbox: (ctx: Ctx<"server">, p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean; noAll?: boolean }) => Res<{ rows: MsgRow[]; unreadIds: Set<string> }>;
   read: (ctx: Ctx<"server">, p: { agent: string; id: string }) => Res<MsgRow & { receipts: Receipts }>;
@@ -1118,7 +1118,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     return null;
   }
 
-  function joinAgent(ctx: Ctx<M>, p: { agent: string; role: string; caps?: string; fingerprint?: string | null }): Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number }> {
+  function joinAgent(ctx: Ctx<M>, p: { agent: string; role: string; caps?: string; fingerprint?: string | null }): Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number; welcome: string }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (!p.agent || !p.role) return { error: "usage", detail: "error: join requires --agent and --role" };
     if (!ID_RE.test(p.agent)) return { error: "usage", detail: `invalid agent id: ${p.agent}` };
@@ -1212,7 +1212,24 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
         "SELECT COUNT(*) c FROM messages WHERE status IN ('open','acked','in_progress') AND sender!=?",
       ).get(p.agent) as any).c;
     }
-    return { value: { agent: row, active: listAgents(true), unresolved } };
+    // SELF-BOOTSTRAP (mike 2026-10-07): a bare token with no human-pasted
+    // instructions still learns the protocol on first join. Computed from
+    // lanesOf() so a scoped seat never sees hidden lane NAMES (invisibility
+    // applies to the welcome text itself); endpoint is a placeholder — the
+    // bus cannot know its own externally reachable URL behind nginx.
+    const wl = lanesOf(mode, ctx.principal);
+    const laneLine = wl === null ? "ALL (unrestricted seat)" : wl.size ? [...wl].sort().map((x) => "#" + x).join(", ") : "(none — deny-all seat)";
+    const home = wl !== null && wl.has("general") ? "general" : wl && wl.size ? [...wl].sort()[0] : "general";
+    const welcome = [
+      `WELCOME ${p.agent} — agent-comms quick start (POST every call to your /rpc endpoint with header "Authorization: Bearer <your token>"; the token IS your identity).`,
+      `1 inbox:  {"method":"inbox","params":{"wait":20}}        long-poll 20s — run this as your event loop; add "open":true for un-answered only.`,
+      `2 read:   {"method":"read","params":{"id":"<message id>"}}`,
+      `3 post:   {"method":"post","params":{"from":"${p.agent}","to":["<agent-id>"],"channel":"${home}","type":"note","body":"..."}}  (replies use "re":"<id>" and inherit the thread).`,
+      `4 receipts are duty: handle a message -> post type "ack", then type "done", each with "re":"<id>" of the message you handled. An "ask" to you stays owed until done.`,
+      `Your lanes: ${laneLine}. Messages outside your lanes are invisible everywhere.`,
+      `Errors: {"error":...} in result, not HTTP status. Usage errors are exit-2 class; check "detail".`,
+    ].join("\n");
+    return { value: { agent: row, active: listAgents(true), unresolved, welcome } };
   }
 
   function listAgents(activeOnly: boolean): AgentRow[] {
