@@ -134,6 +134,12 @@ describe("M3 remote CLI", () => {
       const badf = cli(["post", "--from", "kit-bot", "--to", "root", "--type", "note", "--body-file", "/etc/hostname"], { COMMS_URL: srv.url, COMMS_TOKEN: tok });
       expect(badf.code).toBe(2);
       expect(badf.err + badf.out).toContain("unknown flag --body-file");
+      // hermes-vllm bug @44749db: watch's real --exit-on-new flag was missing
+      // from KNOWN_FLAGS, so the fold-5 guard killed the only code path that
+      // reads it. Every flag watch/post read must survive parse().
+      const eon = cli(["watch", "--for", "kit-bot", "--exit-on-new", "--once", "--local"], { COMMS_HOME: home });
+      expect(eon.code).toBe(0);
+      expect(eon.err + eon.out).not.toContain("unknown flag");
       const loc = cli(["token", "create", "--agent", "local-kit"], { COMMS_HOME: home });
       expect(loc.code).toBe(0);
       expect(loc.out).not.toContain("QUICK START");

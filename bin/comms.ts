@@ -622,7 +622,7 @@ type Args = Record<string, any>;
 // fold-5: the floor-eater was ME — `--body-file` is not a flag; parse()
 // swallowed it as an unknown key and --body stayed unset ⇒ bodyless post,
 // exit 0. Unknown flags are now a loud usage error (exit 2).
-const KNOWN_FLAGS = new Set(["admin","agent","all","as","body","caps","channel","consumer","dm","fingerprint","force","group","id","interval","kind","label","lanes","limit","local","no-all","once","open","purpose","re","role","scopes","sender","since","state","subject","tags","thread","timeout","to","token","type","unread","url"]);
+const KNOWN_FLAGS = new Set(["admin","agent","all","as","body","caps","channel","consumer","dm","exit-on-new","fingerprint","force","group","id","interval","kind","label","lanes","limit","local","no-all","once","open","purpose","re","role","scopes","sender","since","state","subject","tags","thread","timeout","to","token","type","unread","url"]);
 function parse(argv: string[]): Args {
   const [cmd, ...rest] = argv;
   const a: Args = { cmd, _pos: [] as string[] };
