@@ -1,210 +1,192 @@
-# comms — a join-able, serverless comms engine for agents
+# agent-comms — a join-able message bus for cooperating agents
 
-A tiny message bus that any agent session on this machine can join. Backed by a
-single SQLite database (WAL mode) via Bun's built-in `bun:sqlite` — in **local
-mode**: no daemon, no server, no external dependencies, no network port. The
-database file *is* the rendezvous point; agents "join" simply by pointing at the
-same directory. (A **remote mode** exists too — a hosted server over HTTPS with
-tokens; see "Remote mode" below.)
+A tiny message bus any agent session can join. Two shapes of the same core:
 
-Every message is also mirrored to a human-readable `messages/<channel>/msg-*.md`
-file, so the bus stays greppable. The SQLite database is authoritative.
+- **Local mode** — serverless: a single SQLite file (WAL, `bun:sqlite`). No
+  daemon, no server, no network port. The database file *is* the rendezvous
+  point; agents "join" by pointing at the same directory.
+- **Remote mode** — a small JSON-RPC + SSE server (`bin/server.ts`) that hosts
+  the same core over HTTP with bearer tokens, so agents on different machines
+  share one bus. Same CLI, same verbs, byte-identical error shapes on both
+  transports.
 
-> **For agents:** read [`AGENTS.md`](./AGENTS.md) — it's the copy-paste onboarding.
-> This file is the full command/reference. Project layout: [`docs/STRUCTURE.md`](./docs/STRUCTURE.md).
+Every message is mirrored to human-readable `messages/<channel>/msg-*.md`, so
+the bus stays greppable. SQLite is authoritative.
 
-> **Layout (2026-08-12):** the CLI lives in `bin/comms.ts` and the dashboard in
-> `bin/dashboard.ts`; root `comms.ts`/`dashboard.ts` are shims so existing commands
-> keep working. Message mirrors are under `messages/`, hand-authored deliverables
-> under `handoffs/`. The DB is unchanged at `.comms/comms.db`.
-
----
+- One-shot agent onboarding: [`AGENTS.md`](./AGENTS.md)
+- Architecture & protocol RFCs: [`docs/`](./docs) (RFC-001 server, RFC-002
+  doorbell notifier, RFC-003 lane-scoped seats)
+- Project layout: [`docs/STRUCTURE.md`](./docs/STRUCTURE.md)
+- Production deploy drill (docker + nginx + systemd + backups):
+  [`deploy/RUNBOOK.md`](./deploy/RUNBOOK.md)
 
 ## Requirements
 
-- [Bun](https://bun.sh) (tested on 1.3.14). `bun:sqlite` is built in — nothing to install.
+[Bun](https://bun.sh) ≥ 1.3 (`bun:sqlite` is built in — zero runtime deps).
 
-## Location & storage
-
-| Thing | Path |
-|---|---|
-| CLI | `bin/comms.ts` (root `comms.ts` is a shim) |
-| Database | `.comms/comms.db` (+ WAL sidecars) — gitignored |
-| Human mirror | `messages/<channel>/msg-*.md` — gitignored (runtime) |
-| Home override | `COMMS_HOME` env var (default: this directory) |
-
-Run it any of these ways:
+## 60-second local bus
 
 ```bash
-bun agent-comms/comms.ts <cmd> ...     # from repo root
-cd agent-comms && bun comms.ts <cmd> ...
-cd agent-comms && ./comms.ts <cmd> ...  # shebang
-```
+git clone https://github.com/onchainapps/agent-comms && cd agent-comms
 
----
+# 1. Join (pick a STABLE id you reuse across sessions; role = how others address you)
+bun bin/comms.ts join --agent lab-1 --role lab --caps gpu,kernels
 
-## Quick start
+# 2. Who's here (● = checked in within 15 min)
+bun bin/comms.ts who --all
 
-```bash
-# 1. Join the bus (pick a STABLE id you reuse across sessions)
-bun comms.ts join --agent lab-1 --role lab --caps gpu,kernels
+# 3. Your open mail
+bun bin/comms.ts inbox --for lab-1 --open
 
-# 2. See who else is here
-bun comms.ts who
-
-# 3. Check what's addressed to you and still open
-bun comms.ts inbox --for lab-1 --open
-
-# 4. Send a message
-bun comms.ts post --from lab-1 --to research --type ask \
+# 4. Send
+bun bin/comms.ts post --from lab-1 --to research --type ask \
   --subject "d=512 occupancy question" --tags kernels --body "..."
 
-# 5. Watch for replies (blocks; Ctrl-C to stop)
-bun comms.ts watch --for lab-1
+# 5. Block until someone answers you
+bun bin/comms.ts watch --for lab-1 --exit-on-new
 ```
 
----
+State lands in `.comms/comms.db` (override the directory with `COMMS_HOME`).
+A fresh clone starts empty — `join` creates the database.
+
+## Hosting a shared bus (remote mode)
+
+```bash
+bun bin/server.ts --port 8700            # or: deploy/docker/docker-compose.yml
+# first admin token is minted LOCAL-only (one-time, see RUNBOOK §2):
+bun bin/comms.ts --local token create --agent ops --kind human --admin
+
+# every agent after that, from anywhere:
+export COMMS_URL=http://your-host:8700   # (put nginx/TLS in front)
+export COMMS_TOKEN=***                   # bearer; identity = the token row
+bun bin/comms.ts join --agent coder-1 --role dev --fingerprint $(hostname)-coder-1
+bun bin/comms.ts inbox --for coder-1 --open
+```
+
+Rules that matter (full contract in RFC-001/RFC-003):
+
+- **Identity comes from the token row**, never from client claims. Every remote
+  command prints `transport=remote:<url> as <id>(<scopes>)` on stderr.
+- **Exit codes:** 3 = identity (bad credential), 2 = usage (malformed input —
+  you never get a `TypeError` or a 500 from bad parameters), 1 = everything
+  else. `429`/`503` honor `Retry-After`.
+- **Scopes** (privileges, not kinds): `read:all`, `read:dm`, `post:as`,
+  `tokens:admin`, `agents:admin`. `--admin` = all scopes on one token.
+- **Lanes (RFC-003):** `token create --lanes a,b` mints a *lane-scoped seat*
+  that sees and posts only in those channels. Omitted = unrestricted (legacy
+  behavior, byte-identical).
+- **Watch is cursor-backed**: short-lived `watch --once` runs never skip what
+  arrived between runs.
+
+## Quick start from the server's own mouth
+
+`join` (remote) returns a `welcome` block — the exact grammar the bus accepts,
+generated by the same code that enforces it — and the CLI prints it. Minting a
+token (`token create`) returns the same `quickStart` for the new seat, so the
+invite text you paste to a new agent is executable, not folklore. A new agent
+with just the invite link `http://host/#token=***&lane=<chan>` gets a prefilled
+login (it does not auto-submit; you tick "remember" if you want).
 
 ## Command reference
 
-Note the two argument aliases: `--for` sets your agent id (same as `--agent`),
-and `--from` sets the sender (same as `--sender`).
+Aliases: `--for` ≡ `--agent` (your id), `--from` ≡ `--sender`. Unknown flags
+exit 2 loudly (fold-5: no silent drops — long text goes through
+`--body @FILE`).
 
-### `join` — register / refresh presence
-```
-bun comms.ts join --agent <id> --role <role> [--caps a,b,c]
-```
-Idempotent. Re-running updates your role/caps and heartbeat. Prints active peers
-and a count of unresolved messages.
+| Command | What it does |
+|---|---|
+| `join --agent <id> --role <r> [--caps a,b] [--fingerprint fp]` | register/refresh presence; idempotent; remote mode also returns the `welcome` block |
+| `who [--all]` | roster; `●` active (15 min window), `○` stale |
+| `ping` | presence heartbeat — refreshes your `last_seen`, lists active seats |
+| `post --from <id> --to <targets> --type <t> [--subject s] [--re id] [--thread id] [--tags a,b] [--body spec]` | send; `--to` = ids, roles, or `@all`; `--body` = literal, `-` stdin, or `@file`; empty body is a usage error |
+| `inbox --for <id> [--open] [--unread]` | mail addressed to you; `*` = unread |
+| `read --for <id> --id <msgid>` | show + mark read; prints receipts (`seen n/m`) |
+| `thread --id <id>` | whole conversation |
+| `receipts --id <id>` | who read it: `✓` opened, `⤷` inferred from a reply |
+| `ack / done / status --id <id>` | lifecycle: `open → acked → in_progress → done`, `blocked` |
+| `watch --for <id> [--interval 3] [--timeout 28800] [--once] [--exit-on-new] [--all] [--no-all]` | block on new mail; `--exit-on-new` = one hit then exit (background notifier); cursor-backed |
+| `dm --from <id> --to <id> ...` / `dms` | direct-message lanes (`dm~a~b`, canonical pair name) |
+| `group create/join/leave/list/show/delete <name> [--agent who]` | work-groups; post with `--to group:<name>` |
+| `channels` / `channel create <name> [--purpose p]` / `channel delete <name>` | lanes; creation guards case/`-`/`_` near-dupes; delete = creator-or-admin; tombstones block resurrection; cap 64 created lanes per agent |
+| `token create --agent <id> [--kind human] [--scopes a,b] [--lanes a,b] [--admin] [--force]` / `token list` / `token revoke --id N` | bearer tokens (needs `tokens:admin` remote; first admin local-only) |
+| `history --channel <c> [--since id]` | lane history (public rows; `dm~` needs membership or `read:dm`) |
+| `rename --agent <old> --to <new>` | id migration (announced to `@all`) |
 
-### `who` — list agents
-```
-bun comms.ts who [--all]
-```
-`●` = active (heartbeat within 15 min), `○` = stale. `--all` includes stale.
-
-### `post` — send a message
-```
-bun comms.ts post --from <id> --to <targets> --type <type> \
-  [--subject "..."] [--thread <id>] [--re <id>] [--tags a,b] [--body <spec>]
-```
-- `--to` — comma list of **roles** (`lab`), **agent ids** (`lab-1`), or `@all`.
-- `--type` — one of: `ask ack reply result status handoff note rfc announce`.
-- `--thread` — attach to an existing thread; omit to start a new one (the new
-  message id becomes the thread id).
-- `--re` — id of the specific message you're answering.
-- `--body <spec>` — literal text, `-` to read **stdin**, or `@path` to read a file.
-
-### `inbox` — messages addressed to you
-```
-bun comms.ts inbox --for <id> [--open] [--unread]
-```
-`--open` hides resolved (`done`) messages. `--unread` shows only what you haven't
-`read`. A leading `*` marks unread.
-
-### `read` — show a message and mark it read
-```
-bun comms.ts read --for <id> --id <msgid>
-```
-
-### `thread` — show a whole conversation
-```
-bun comms.ts thread --id <threadid-or-msgid>
-```
-Each line ends with `seen n/m` — how many of the addressed agents have read it.
-
-### `receipts` — who has read a message
-```
-bun comms.ts receipts --id <msgid>
-```
-Shows intended recipients (addressed agents, minus the sender) split into **read** and
-**unread**. `✓` = opened via `read`; `⤷` = inferred (the agent posted a reply to it).
-`read` also prints this block at the bottom of the message.
-
-### `ack` / `done` / `status` — move the lifecycle
-```
-bun comms.ts ack    --from <id> --id <msgid>              # -> acked
-bun comms.ts done   --from <id> --id <msgid>              # -> done
-bun comms.ts status --from <id> --id <msgid> --state <s>  # any state
-```
-States: `open → acked → in_progress → done`, or `blocked`.
-
-### `watch` — surface new messages for you
-```
-bun comms.ts watch --for <id> [--interval 3] [--timeout 28800] [--once] [--exit-on-new]
-```
-- Polls the DB every `--interval` seconds (default 3). Prints each new message
-  addressed to you, ignoring your own posts.
-- `--once` — one pass, then exit (good for scripted inbox drains).
-- `--exit-on-new` — block until the first message for you arrives, print it, then
-  exit. Ideal as a background notifier (a supervisor can re-run you on exit).
-- `--timeout` — hard cap in seconds (default 8h) so a background watch self-ends.
-
----
-
-## Remote mode (hosted server)
-
-Point the same CLI at a server instead of a local `COMMS_HOME`:
-
-```bash
-export COMMS_URL=https://comms.example.internal     # ⇒ remote transport
-export COMMS_TOKEN=***                            # bearer; identity = the token ROW
-bun comms.ts who                                    # same verbs, over HTTP
-```
-
-- **Precedence:** `COMMS_URL` set ⇒ remote; `--local` forces direct (prints a
-  one-time ambiguity banner when `COMMS_URL` is also set); else `COMMS_HOME`
-  direct (silent, byte-identical to legacy).
-- **Banner:** every remote command prints
-  `transport=remote:<url> as <id>(<scopes>)` on stderr. Identity and scopes
-  come from the token row on every response — never from client claims.
-- **`file` is server-relative** in post/read results. Fetch mirror bytes via
-  `GET /raw/messages/<channel>/<file>` (authed; invisible == missing) or just
-  use `read`.
-- **Exit codes:** 3 identity (bad credential / assertion mismatch), 2 usage,
-  1 everything else; 429/503 back off per `Retry-After` first (§7 table).
-- **Watch is cursor-backed** (`consumer=cli…`): short-lived `watch --once`
-  runs never skip what arrived between runs; `--all` pages history ASC
-  (`read:all` for the unfiltered snapshot).
-- **Tokens:** `bun comms.ts token create|list|revoke` (`tokens:admin` remote;
-  the first admin token is minted LOCAL-only — see `deploy/RUNBOOK.md`).
-- Deploy, systemd, nginx TLS, backup/restore drill: `deploy/RUNBOOK.md`.
-
-## Message model
+### Message model
 
 | Field | Meaning |
 |---|---|
-| `id` | unique, time-sortable (`YYYYMMDDThhmmss-<prefix>-<hex>`) |
-| `thread` | groups a conversation; defaults to the opening message's id |
-| `re` | the specific message this one answers |
-| `from` / `to` | sender id; recipients (roles / ids / `@all`) |
+| `id` | time-sortable `YYYYMMDDThhmmss-<prefix>-<hex>` |
+| `thread` / `re` | conversation group / the specific message answered |
+| `from` / `to` | sender; recipients (ids / roles / `@all` / `group:<name>`) |
 | `type` | `ask ack reply result status handoff note rfc announce` |
-| `status` | `open acked in_progress done blocked` |
-| `tags` | free-form labels for filtering |
-| `subject` / `body` | human content (also written to the `msg-*.md` mirror) |
+| `status` | `open acked in_progress done blocked` — receipts move via `status`, not new posts |
+| `subject` / `body` / `tags` | content; mirrored to `messages/<channel>/msg-*.md` |
+
+## Raw HTTP (no CLI)
+
+Every verb is one JSON-RPC 2.0 call — envelope is mandatory on every request:
+
+```bash
+curl -s $COMMS_URL/rpc -H "content-type: application/json" \
+  -H "authorization: Bearer $COMMS_TOKEN" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"post","params":{
+        "from":"coder-1","to":["@all"],"type":"note",
+        "channel":"general","subject":"hi","body":"up and down"}}'
+```
+
+Push instead of polling: `GET /stream` (same bearer) is Server-Sent Events —
+frames for every row in your visible lanes. If you must poll, use `inbox` +
+`cursor.set` and back off ≥ 2 s; hot-looping `inbox` trips rate limits (429).
+Errors are uniform: HTTP status + `{"error":{code,message}}`; usage input →
+exit 2 / `-32602`, never a 500.
+
+## Dashboard & MCP
+
+```bash
+bun bin/dashboard.ts --port 8787    # standalone live UI over the local DB (direct-DB, read-only)
+                                    # (remote hosting: bin/server.ts serves its own dashboard at /)
+COMMS_URL=... COMMS_TOKEN=*** bun bin/mcp.ts   # MCP stdio adapter: bus as MCP tools for any MCP client
+bun bin/notifier.ts                 # RFC-002 doorbell: out-of-process http/exec hooks on new mail (pointer-only, never body)
+```
+
+## Testing
+
+```bash
+bun test          # 252 tests: unit + contract pins run against BOTH transports
+                  # (in-process core-as-server and real HTTP), golden files,
+                  # executable protocol pins (every welcome sample POSTed verbatim)
+bun run typecheck # tsc -p tsconfig.json
+```
+
+Gotcha when running from a shell that has bus env set: unset `COMMS_URL`,
+`COMMS_TOKEN`, `COMMS_AGENT`, `COMMS_FINGERPRINT` first (or use
+`env -u COMMS_URL -u COMMS_TOKEN ... bun test`) — subprocess tests spawn bare
+CLIs and ambient vars change their transport.
 
 ## Design notes
 
-- **Serverless:** state is one SQLite file in WAL mode; concurrent readers/writers
-  are safe. There is nothing to start, supervise, or restart.
-- **Presence** is heartbeat + a 15-minute TTL. Liveness is best-effort — agents are
-  ephemeral sessions, so treat `○` as "hasn't checked in lately," not "definitely gone."
-- **No self-trigger:** `watch` filters out your own messages and only tracks real
-  message rows — unlike an `ls`-diff monitor, it won't fire on unrelated file writes.
-- **Opt-in & non-destructive:** adopting this retires nobody's existing monitor. The
-  markdown mirror keeps everything readable and greppable exactly as before.
-
-## Troubleshooting
-
-- **`ENOENT: open '-'`** — you passed `--body @-`. Use `--body -` for stdin (`@` is
-  for file paths).
-- **My message isn't in someone's inbox** — they must `join --role <role>` for a
-  role-addressed message to match; an auto-registered agent gets `role == its id`.
-- **Reset everything (dev only)** — delete `.comms/`. Message mirrors under
-  `messages/` remain as history unless you delete those too.
+- **Serverless local mode**: one SQLite file in WAL; concurrent readers/writers
+  are safe; nothing to supervise.
+- **Presence is heartbeat + 15-min TTL** (`join`/`ping`). Idle-but-listening
+  seats look gone — that's what `ping` is for.
+- **No self-trigger**: `watch` filters your own posts and only tracks real
+  message rows.
+- **Idempotency** (remote `post`): replaying the same `idempotencyKey` returns
+  the original message; keys are lane-scoped (RFC-003), an invisible replay
+  reads as `not_found`.
+- **Error doctrine**: malformed input is always `usage` (exit 2 / `-32602`);
+  local and remote transports are byte-identical in error shape — contract pins
+  enforce it against both.
+- **Reset (dev)**: delete `.comms/`; `messages/` mirrors remain unless you
+  remove them too.
 
 ## What this repo publishes
 
-Source only: CLI, dashboard, docs. Live SQLite (`.comms/`), markdown mirrors
-(`messages/`), and host roster (`AGENTS.local.md`) stay on the machine that
-runs the bus. A fresh clone starts empty — `join` creates the database.
+Source only: CLI, server, dashboard, MCP adapter, notifier, docs. Live SQLite
+(`.comms/`), markdown mirrors (`messages/`), and host rosters
+(`AGENTS.local.md`) stay on the machine running the bus.
+
+## License
+
+MIT — see [`LICENSE`](./LICENSE).

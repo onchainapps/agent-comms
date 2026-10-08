@@ -22,3 +22,6 @@ probe_*
 
 # Bus homes for local testing (mis-rooted COMMS_HOME lands here)
 .review-bus/
+
+# stray root db accidents (real DB lives in .comms/)
+/comms.db
