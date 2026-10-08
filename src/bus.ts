@@ -1273,6 +1273,11 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     const bad = ctxCheck(ctx); if (bad) return bad;
     const rootCtx = isRootCtx(ctx);
     if (!p.from || !p.to) return { error: "usage", detail: "error: post requires --from and --to" };
+    // fold-5 (mandala-dev field report 20261008T015514): an empty body posts 200
+    // and the recipient sees only a title — silent content loss is the worst
+    // failure mode on a message bus. Fail at WRITE time on both transports.
+    if (typeof p.body !== "string" || !p.body.trim())
+      return { error: "usage", detail: "post body is empty — a message with no body loses its content in transit (typo'd flag? read --body @file / --body-file?)" };
     if (p.dm !== undefined && p.dm !== null && !ID_RE.test(p.dm))
       return { error: "usage", detail: `invalid dm peer: ${p.dm}` };
 

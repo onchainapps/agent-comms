@@ -128,6 +128,12 @@ describe("M3 remote CLI", () => {
       // the grammar points the first read/post at the SCOPED lane, not general
       expect(t.out).toContain('\"channel\":\"arena2\"');
       // local bootstrap (no COMMS_URL): no kit — the host already is root
+      // fold-5 floor-eater pin: --body-file was never a flag — parse() swallowed
+      // it, --body stayed unset, the post went out EMPTY with exit 0. Unknown
+      // flags are now a loud exit 2; long text goes through --body @FILE.
+      const badf = cli(["post", "--from", "kit-bot", "--to", "root", "--type", "note", "--body-file", "/etc/hostname"], { COMMS_URL: srv.url, COMMS_TOKEN: tok });
+      expect(badf.code).toBe(2);
+      expect(badf.err + badf.out).toContain("unknown flag --body-file");
       const loc = cli(["token", "create", "--agent", "local-kit"], { COMMS_HOME: home });
       expect(loc.code).toBe(0);
       expect(loc.out).not.toContain("QUICK START");

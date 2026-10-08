@@ -1333,6 +1333,14 @@ export function contractSuite(name: string, make: Factory) {
       });
     });
 
+    test("fold-5: empty body rejected at WRITE (mandala-dev field report — bodyless posts hit the floor with 200)", async () => {
+      await withBus(async (_h, root) => {
+        expect((await root.post({ from: "root", to: "*", type: "note", body: "" })).error).toBe("usage");
+        expect((await root.post({ from: "root", to: "*", type: "note", body: "   \n " })).error).toBe("usage");
+        expect((await root.post({ from: "root", to: "*", type: "note", body: "x" })).error).toBeUndefined();
+      });
+    });
+
     test("RFC-003 15: join returns a lane-scoped welcome — scoped seat's text never names a hidden lane; unrestricted says ALL", async () => {
       await withBus(async (h, root) => {
         await root.channelCreate({ name: "secret-15", purpose: "hidden from seat" });
