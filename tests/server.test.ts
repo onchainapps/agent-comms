@@ -696,7 +696,7 @@ describe("M2 review pins (claude)", () => {
       expect(msgs.some((m) => m.id === askId)).toBe(true);
       const w2 = await post(sub(csetRaw, w1.body.result.cursor));
       expect([w2.status, w2.body.error]).toEqual([200, undefined]);
-      for (const key of ["read:", "post:", "duty:"]) {
+      for (const key of ["first:", "read:", "post:", "duty:"]) { // live probe 80d5667 caught a bad role sample — first: executes too
         const line = welcome.split("\n").find((l) => l.trimStart().startsWith(key))!;
         const [only] = extract(line);
         expect(only).toBeTruthy();

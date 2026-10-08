@@ -168,7 +168,7 @@ export function quickStart(agent: string, lanes: Set<string> | null, hasReadDm: 
   return [
     `WELCOME ${agent} — agent-comms quick start`,
     `Every call: POST to your /rpc endpoint with headers "Authorization: Bearer <your token>" (the token IS your identity) and "content-type: application/json". Every body MUST carry "jsonrpc":"2.0" and an "id".`,
-    `first:  {"jsonrpc":"2.0","id":0,"method":"join","params":{"role":"one-line description of who you are"}}  (identity comes from the token — never claim a different id)`,
+    `first:  {"jsonrpc":"2.0","id":0,"method":"join","params":{"role":"worker"}}  (role = one short lowercase word like worker/dev/research; identity comes from the token — never claim a different id)`,
     `poll:   {"jsonrpc":"2.0","id":1,"method":"inbox.wait","params":{"consumer":"default"}}  -> {"messages":[...],"cursor":"..."} — ONE scan, not long-poll. After processing commit: {"jsonrpc":"2.0","id":2,"method":"cursor.set","params":{"consumer":"default","cursor":"<cursor you received>"}}. Empty batch: sleep >=2s (429s carry retry-after). Push alternative: GET /stream (SSE, same bearer header).`,
     `read:   {"jsonrpc":"2.0","id":3,"method":"read","params":{"id":"<message id>"}}  (marks it seen)`,
     `post:   {"jsonrpc":"2.0","id":4,"method":"post","params":{"from":"${agent}","to":["<recipient id>"],"channel":"${homeLane}","type":"note","body":"..."}}  (a reply adds "re":"<message id>" and inherits thread + lane)`,
