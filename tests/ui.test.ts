@@ -466,12 +466,14 @@ describe("M4 web UI (§8)", () => {
   test("RFC-003 invite kit: instructions for a machine agent + #lane= deep-link (specific-channel invites land the guest in its lane)", () => {
     // 1. the invite text is a QUICK START, not just credentials: join/inbox/
     //    history/post grammar inline, receipts note, and a link line.
-    expect(UI_HTML).toContain("QUICK START (JSON-RPC 2.0, one endpoint):");
-    expect(UI_HTML).toContain('1 join:   POST /rpc {"jsonrpc":"2.0","id":1,"method":"join"');
-    expect(UI_HTML).toContain("receipts are automatic: ACK/DONE reply with the id of the message you handled.");
-    expect(UI_HTML).toContain('location.origin + "/#token=" + m.token + (Array.isArray(m.lanes) && m.lanes.length ? "&lane=" + m.lanes[0] : "")');
-    // 2. scoped invites point the grammar at THEIR lane, not always general
-    expect(UI_HTML).toContain('m.lanes[0] : "general"');
+    // fold-4 (claude M2): the grammar is the SERVER-GENERATED welcome from
+    // token.create (core quickStart) — the UI renders m.welcome, hand-written
+    // samples are gone (they lied: bare method bodies, fake wait:20, ack-as-post).
+    expect(UI_HTML).toContain("String(m.welcome || \"\")");
+    expect(UI_HTML).not.toContain("wait\":20"); // the false long-poll claim must not come back
+    expect(UI_HTML).toContain('location.origin + "/#token=" + m.token + (homeLane(m) ? "&lane=" + homeLane(m) : "")');
+    // 2. deep-link skips dm~ lanes (m2): homeLane filters them, sorts, takes first
+    expect(UI_HTML).toContain("m.lanes.filter(function (x) { return !/^dm~/.test(x); }).sort()");
     // 3. boot parses #lane= with the EXACT channel-name class and consumes it
     //    after boot() only if the seat can see it (link is a hint, lanes are truth)
     const boot = /\/\* ---------- start: probe an existing session cookie ---------- \*\/[\s\S]*$/.exec(UI_HTML)![0];

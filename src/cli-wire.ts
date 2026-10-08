@@ -12,6 +12,7 @@ export const csvSplit = (to: string) => (to ? String(to).split(",").map((s) => s
 export const REMOTE_METHODS: Record<string, (p: any) => [string, Record<string, unknown>]> = {
   joinAgent: (p) => ["join", p],
   listAgents: (p) => ["who", { all: !p.activeOnly }],
+  pingAgent: () => ["ping", {}],
   post: (p) => ["post", { ...p, to: csvSplit(p.to) }],
   inbox: (p) => ["inbox", p],
   read: (p) => ["read", p],

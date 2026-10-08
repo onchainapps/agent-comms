@@ -1343,14 +1343,22 @@ export function contractSuite(name: string, make: Factory) {
         expect(typeof w).toBe("string");
         expect(w).toContain("WELCOME r3b15");
         expect(w).toContain("#general");
-        expect(w).toContain('"wait":20');
-        expect(w).toContain("receipts are duty");
+        expect(w).toContain('"jsonrpc":"2.0"'); // B1: every sample carries the envelope
+        expect(w).toContain('"method":"inbox.wait"'); // B2: scan + backoff, no fake long-poll
+        expect(w).toContain('"method":"status"'); // B3: ack/done go through status
+        expect(w).not.toContain('"wait":20'); // the lie is gone
+        expect(w).not.toContain("receipts are duty"); // n2: "receipts" = read receipts only
+        expect((await seat.tokenCreate({ agent: "r3b15x" })).error).toBe("forbidden"); // scoped can't mint — belt intact
         expect(w).not.toContain("secret-15"); // invisibility applies to the welcome text itself
         // unrestricted seat: explicitly ALL, and named lanes are gone
         const un = await seedAgent(h, root, "r3b15u", "w");
         const ju = await (un as any).value.session.joinAgent({ agent: "r3b15u", role: "w" });
         const wu = (ju as any).value.welcome as string;
         expect(wu).toContain("ALL (unrestricted seat)");
+        expect(wu).toContain("read:dm"); // n1: unrestricted honest about DM scope
+        const kit = (await root.tokenCreate({ agent: "r3b15k" })) as any;
+        expect(typeof kit.value.welcome).toBe("string"); // M2: the invite kit ships from core
+        expect(kit.value.welcome).toContain("WELCOME r3b15k"); // built for the NEW seat, not the minter
         // deny-all belt: welcome still present, says none
         const legacy = await root.tokenCreate({ agent: "r3b15d" });
         (h as any).raw.testDb.run("UPDATE tokens SET lanes='' WHERE agent_id='r3b15d'");

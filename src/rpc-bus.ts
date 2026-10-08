@@ -107,6 +107,7 @@ function makeSession(bus: RpcBus, token: string): Session {
   const sess: MutableSession = {
     agentId: "",
     joinAgent: (p) => c("join", p as Record<string, unknown>),
+    pingAgent: () => c("ping", {}),
     listAgents: (activeOnly) => c("who", { all: !activeOnly }),
     post: (p) => c("post", { to: csvSplit(p.to), ...strip(p as Record<string, unknown>, "to") }),
     inbox: (p) => c("inbox", p as Record<string, unknown>),

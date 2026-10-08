@@ -648,6 +648,77 @@ describe("M2 review pins (claude)", () => {
     } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
   });
 
+  // fold-4 (claude M1): EXECUTABLE welcome pin — every JSON sample the
+  // welcome text teaches is POSTed verbatim (placeholders substituted only)
+  // to a live server and must answer result-without-error; then the taught
+  // lifecycle (wait → read → status acked → post re → status done) drives a
+  // real ask out of unresolved. The @653d236 text FAILS this pin by design.
+  test("fold-4 pin 16 (HTTP): every welcome sample executes against the live wire; taught lifecycle clears the ask", async () => {
+    const home = tmp(); const tok = bootstrap(home);
+    const srv = startServer({ home, port: 0, limits: { tailerMs: 40 } });
+    const extract = (line: string): string[] => { // balanced-brace scan, verbatim substrings
+      const out: string[] = [];
+      for (let i = 0; i < line.length; i++) {
+        if (line[i] !== "{") continue;
+        let depth = 0;
+        for (let j = i; j < line.length; j++) {
+          if (line[j] === "{") depth++;
+          else if (line[j] === "}") { depth--; if (depth === 0) { const s = line.slice(i, j + 1); try { JSON.parse(s); out.push(s); i = j; break; } catch { break; } } }
+        }
+      }
+      return out;
+    };
+    try {
+      const rpc2 = new RpcBus(srv.url, tok);
+      const root = rpc2.session({ token: tok });
+      const mc = await root.tokenCreate({ agent: "pin16-bot", lanes: ["general"] });
+      const bTok = (mc as any).value.token;
+      expect((mc as any).value.welcome).toContain("WELCOME pin16-bot");
+      await rpc2.session({ token: bTok }).joinAgent({ agent: "pin16-bot", role: "w" });
+      const ask = await root.post({ from: "root", to: "pin16-bot", type: "ask", subject: "do it", body: "please", channel: "general" });
+      const askId = String((ask as any).value.id);
+      const jw = await rpc2.session({ token: bTok }).joinAgent({ agent: "pin16-bot", role: "w" });
+      const welcome = String((jw as any).value.welcome);
+      const post = async (raw: string) => {
+        const r = await fetch(srv.url + "/rpc", { method: "POST", headers: { "content-type": "application/json", authorization: "Bear" + "er " + bTok }, body: raw });
+        return { status: r.status, body: await r.json() as any };
+      };
+      const sub = (s: string, cursor?: string) => s
+        .split("<message id>").join(askId)
+        .split("<recipient id>").join("root")
+        .split("<cursor you received>").join(cursor ?? "x");
+      // verbatim envelope line from the poll instruction: inbox.wait then cursor.set
+      const pollLine = welcome.split("\n").find((l) => l.includes("inbox.wait"))!;
+      const [waitRaw, csetRaw] = extract(pollLine);
+      const w1 = await post(sub(waitRaw));
+      expect([w1.status, w1.body.error]).toEqual([200, undefined]);
+      const msgs = w1.body.result.messages as any[];
+      expect(msgs.some((m) => m.id === askId)).toBe(true);
+      const w2 = await post(sub(csetRaw, w1.body.result.cursor));
+      expect([w2.status, w2.body.error]).toEqual([200, undefined]);
+      for (const key of ["read:", "post:", "duty:"]) {
+        const line = welcome.split("\n").find((l) => l.trimStart().startsWith(key))!;
+        const [only] = extract(line);
+        expect(only).toBeTruthy();
+        const r = await post(sub(only));
+        expect([key, r.status, r.body.error]).toEqual([key, 200, undefined]);
+      }
+      // taught lifecycle end-to-end: acked (duty line above executed) → done → unresolved 0
+      const seat = rpc2.session({ token: bTok });
+      await seat.setStatus({ agent: "pin16-bot", id: askId, state: "done" });
+      const jf = await seat.joinAgent({ agent: "pin16-bot", role: "w" });
+      expect((jf as any).value.unresolved).toBe(0);
+      // m1: envelope-less probe now self-documents the fix in the error detail
+      const bare = await post('{"method":"inbox","params":{}}');
+      expect(bare.status).toBe(400);
+      expect(String(bare.body.error.message)).toContain('\"jsonrpc\":\"2.0\"');
+      // mandala-dev ask: presence ping refreshes presence and answers the roster
+      const pr = await post('{"jsonrpc":"2.0","id":9,"method":"ping","params":{}}');
+      expect([pr.status, pr.body.result.agent]).toEqual([200, "pin16-bot"]);
+      expect((pr.body.result.active as any[]).some((a) => a.id === "pin16-bot")).toBe(true);
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
   // r3 grok M2: RFC pin 5 on the HTTP transport — lanes must reach /raw and
   // SSE principalOf; a principalOf edit that drops lanes fails HERE, not only
   // in the in-process contract suite.

@@ -836,6 +836,8 @@ function renderAdmin() {
 // token.create returns scopes as normalized CSV; token.list returns an array.
 // Accept both so the invite block is right whichever path filled S.minted.
 function scopesCsv(m) { return Array.isArray(m.scopes) ? m.scopes.join(",") : String(m.scopes || ""); }
+// fold-4 m2: deep-link the first NON-dm lane (sorted[0] could be a dm~ pair).
+function homeLane(m) { const ls = Array.isArray(m.lanes) ? m.lanes.filter(function (x) { return !/^dm~/.test(x); }).sort() : []; return ls.length ? ls[0] : ""; }
 function inviteText(m) {
   // The bus has no invite RPC by design (§5: bootstrap local-only, tokens are
   // minted) — an invite is this text block. Identity rides the token, so the
@@ -852,14 +854,11 @@ function inviteText(m) {
     "auth:    header  Authorization: " + authz() + m.token,
     "         content-type: application/json",
     "",
-    "QUICK START (JSON-RPC 2.0, one endpoint):",
-    '  1 join:   POST /rpc {"jsonrpc":"2.0","id":1,"method":"join","params":{"role":"one-line description of who you are"}}',
-    '  2 inbox:  POST /rpc {"jsonrpc":"2.0","id":2,"method":"inbox","params":{}}   (add "wait":20 to long-poll)',
-    '  3 read:   POST /rpc {"jsonrpc":"2.0","id":3,"method":"history","params":{"channel":"' + (Array.isArray(m.lanes) && m.lanes.length ? m.lanes[0] : "general") + '"}}',
-    '  4 post:   POST /rpc {"jsonrpc":"2.0","id":4,"method":"post","params":{"from":"' + m.agent + '","to":["<agent-id>"],"channel":"' + (Array.isArray(m.lanes) && m.lanes.length ? m.lanes[0] : "general") + '","body":"your message","type":"note"}}',
-    "  receipts are automatic: ACK/DONE reply with the id of the message you handled.",
+    // fold-4 (claude M2): the QUICK START is the SERVER-GENERATED welcome from
+    // token.create (core quickStart()) — no hand-written grammar to drift.
+    String(m.welcome || ""),
     "",
-    "link:    " + location.origin + "/#token=" + m.token + (Array.isArray(m.lanes) && m.lanes.length ? "&lane=" + m.lanes[0] : "") + "   (dashboard prefill — paste into a browser)",
+    "link:    " + location.origin + "/#token=" + m.token + (homeLane(m) ? "&lane=" + homeLane(m) : "") + "   (dashboard prefill — paste into a browser)",
     'docs:    README "Remote mode" · deploy/RUNBOOK.md · RFC-001 §5–§7',
     "note:    token is shown ONCE — store it; revoke in Admin any time.",
     "────────────────────────────────────────────────",
@@ -880,7 +879,7 @@ function renderMinted() {
   // RFC-003 N1b: a link the guest just pastes into chat — the fragment is
   // stripped by the boot IIFE on arrival (replaceState BEFORE any fill).
   const cl = el("button", "mini", "copy invite link");
-  cl.onclick = () => navigator.clipboard && navigator.clipboard.writeText(location.origin + "/#token=" + S.minted.token + (Array.isArray(S.minted.lanes) && S.minted.lanes.length ? "&lane=" + S.minted.lanes[0] : "")).then(() => { cl.textContent = "link copied"; });
+  cl.onclick = () => navigator.clipboard && navigator.clipboard.writeText(location.origin + "/#token=" + S.minted.token + (homeLane(S.minted) ? "&lane=" + homeLane(S.minted) : "")).then(() => { cl.textContent = "link copied"; });
   const dx = el("button", "mini", "dismiss"); dx.onclick = () => { S.minted = null; renderMinted(); };
   d.appendChild(cb); d.appendChild(document.createTextNode(" ")); d.appendChild(ci); d.appendChild(document.createTextNode(" ")); d.appendChild(cl); d.appendChild(document.createTextNode(" ")); d.appendChild(dx);
   const det = el("details"); const sm = el("summary"); sm.textContent = "preview invite text"; det.appendChild(sm);
@@ -958,7 +957,7 @@ function buildAdmin() {
     if (fcb.checked) p.force = true;
     try {
       const r = await rpc("token.create", p);
-      S.minted = { token: r.token, prefix: r.prefix, agent: r.agentId, label: p.label, scopes: r.scopes, lanes: r.lanes };
+      S.minted = { token: r.token, prefix: r.prefix, agent: r.agentId, label: p.label, scopes: r.scopes, lanes: r.lanes, welcome: r.welcome };
       ag.value = ""; lab.value = ""; for (const s of SC) cks[s].checked = false; fcb.checked = false; if (ln) ln.value = "";
       renderMinted(); renderTokenTable();
     } catch (e) { err.textContent = "create failed: " + e.message; }

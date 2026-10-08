@@ -34,7 +34,7 @@ export const LIMITS = {
   maxSessionsPerToken: 8,
 };
 
-const WRITE_METHODS = new Set(["join", "post", "status", "rename", "token.create", "token.revoke", "group.create", "group.join", "group.leave", "group.delete", "channel.create", "channel.delete", "cursor.set", "login"]);
+const WRITE_METHODS = new Set(["join", "ping", "post", "status", "rename", "token.create", "token.revoke", "group.create", "group.join", "group.leave", "group.delete", "channel.create", "channel.delete", "cursor.set", "login"]);
 
 // §7 /raw filename gate: msg-<...>.md, no '/' (regex runs before any join).
 const FILE_RE = /^msg-[A-Za-z0-9._-]+\.md$/;
@@ -316,6 +316,7 @@ export function startServer(opts: ServerOpts): RunningServer {
     };
     switch (method) {
       case "join": return call(session.joinAgent({ agent: p.agent ?? session.agentId, role: p.role ?? "", caps: p.caps, fingerprint: p.fingerprint }));
+      case "ping": return call(session.pingAgent()); // presence heartbeat (mandala-dev ask)
       case "who": return call(session.listAgents(!p.all));
       case "post": return call(session.post({ from: p.from ?? session.agentId, to: Array.isArray(p.to) ? p.to.join(",") : String(p.to ?? ""), type: String(p.type ?? ""), subject: p.subject, body: String(p.body ?? ""), thread: p.thread, re: p.re, tags: p.tags, channel: p.channel, as: p.as, idempotencyKey: p.idempotencyKey, dm: p.dm }));
       case "inbox": return call(session.inbox({ agent: p.for ?? p.agent ?? session.agentId, open: p.open, unread: p.unread, channel: p.channel, mark: p.mark, noAll: p.noAll === true }));
@@ -380,7 +381,9 @@ export function startServer(opts: ServerOpts): RunningServer {
     try { body = JSON.parse(text); } catch { return json(400, { jsonrpc: "2.0", error: envErr(J.parse, "parse error"), id: null }); }
     if (Array.isArray(body)) return json(400, { jsonrpc: "2.0", error: envErr(J.invalid, "batches rejected (§6)"), id: null });
     if (!body || typeof body !== "object" || body.jsonrpc !== "2.0" || typeof body.method !== "string" || !("id" in body))
-      return json(400, { jsonrpc: "2.0", error: envErr(J.invalid, "invalid request"), id: body?.id ?? null });
+      // fold-4 (claude m1): a raw curl with no envelope is the #1 cold-start
+      // failure — the fixed reply now teaches the shape instead of just -32600.
+      return json(400, { jsonrpc: "2.0", error: envErr(J.invalid, 'invalid request — body must be {"jsonrpc":"2.0","id":<num>,"method":"<name>","params":{...}} (methods: join, post, inbox, read, inbox.wait, cursor.get, cursor.set, status, thread, receipts, channels, who, history, rename, channel.create, channel.delete, group.create, group.join, group.leave, group.list, group.show, dm.members, token.create, token.list, token.revoke, login, logout, ping)'), id: body?.id ?? null });
     const id = body.id;
     const p = body.params ?? {};
     if (typeof p !== "object" || p === null || Array.isArray(p))

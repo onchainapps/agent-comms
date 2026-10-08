@@ -118,9 +118,11 @@ describe("M3 remote CLI", () => {
       expect(cc.code).toBe(0);
       const t = cli(["token", "create", "--agent", "kit-bot", "--lanes", "arena2", "--scopes", "post:as"], { COMMS_URL: srv.url, COMMS_TOKEN: tok });
       expect(t.code).toBe(0);
-      expect(t.out).toContain("QUICK START (JSON-RPC 2.0, one endpoint):");
+      // fold-4 (claude M2): kit text = core quickStart via token.create
+      expect(t.out).toContain("WELCOME kit-bot");
       expect(t.out).toContain('"method":"join"');
-      expect(t.out).toContain("receipts are automatic");
+      expect(t.out).toContain('"method":"inbox.wait"');
+      expect(t.out).toContain('"method":"status"');
       expect(t.out).toContain("link:    " + srv.url + "/#token=ac_");
       expect(t.out).toContain("&lane=arena2"); // scoped seat: link deep-links its lane
       // the grammar points the first read/post at the SCOPED lane, not general
@@ -157,7 +159,7 @@ describe("M3 remote CLI", () => {
       expect(j.out).toContain("joined: m3-bot");
       // SELF-BOOTSTRAP pin: remote join prints the server-computed welcome kit
       expect(j.out).toContain("WELCOME m3-bot");
-      expect(j.out).toContain("receipts are duty");
+      expect(j.out).toContain('"method":"status"'); // fold-4 grammar: ack/done via status
 
       const p = cli(["post", "--from", "m3-bot", "--to", "root", "--type", "note", "--subject", "hi", "--body", "remote hello"], { COMMS_URL: srv.url, COMMS_TOKEN: botTok });
       expect(p.code).toBe(0);

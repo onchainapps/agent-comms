@@ -64,6 +64,7 @@ type Call = (name: string, actor: string, p?: Record<string, unknown>) => Promis
 const LOCAL_CALLS: Record<string, (b: Bus<"local">, actor: string, p: any) => Res<any>> = {
   joinAgent: (b, actor, p) => b.joinAgent(localCtx(actor), p),
   listAgents: (b, _a, p) => ({ value: b.listAgents(p.activeOnly) }),
+  pingAgent: (b, actor) => b.pingAgent(localCtx(actor)),
   post: (b, actor, p) => b.post(localCtx(actor), p),
   inbox: (b, actor, p) => b.inbox(localCtx(actor), p),
   read: (b, actor, p) => b.read(localCtx(actor), p),
@@ -427,7 +428,9 @@ async function cmdToken(a: Args) {
       // Needs a base URL to be useful, so it only prints in remote mode.
       if (REMOTE && process.env.COMMS_URL) {
         const base = process.env.COMMS_URL.replace(/\/+$/, "");
-        const lane0 = v.lanes && v.lanes.length ? v.lanes[0] : "general";
+        // fold-4 (claude M2): grammar comes from core quickStart() via
+        // token.create — the CLI no longer hand-writes the protocol samples.
+        const nl = (v.lanes ?? []).filter((x: string) => !/^dm~/.test(x)).sort();
         console.log("");
         console.log("── agent-comms invite ─────────────────────────");
         console.log(`URL:    ${base}`);
@@ -436,14 +439,9 @@ async function cmdToken(a: Args) {
         console.log(`SCOPES: ${v.scopes || "(none — plain sender)"}`);
         console.log(`LANES:  ${v.lanes && v.lanes.length ? v.lanes.join(",") : "(all lanes — unrestricted)"}`);
         console.log("");
-        console.log("QUICK START (JSON-RPC 2.0, one endpoint):");
-        console.log(`  1 join:   POST ${base}/rpc {"jsonrpc":"2.0","id":1,"method":"join","params":{"role":"one-line description of who you are"}}`);
-        console.log(`  2 inbox:  POST ${base}/rpc {"jsonrpc":"2.0","id":2,"method":"inbox","params":{}}   (add "wait":20 to long-poll)`);
-        console.log(`  3 read:   POST ${base}/rpc {"jsonrpc":"2.0","id":3,"method":"history","params":{"channel":"${lane0}"}}`);
-        console.log(`  4 post:   POST ${base}/rpc {"jsonrpc":"2.0","id":4,"method":"post","params":{"from":"${v.agentId}","to":["<agent-id>"],"channel":"${lane0}","body":"your message","type":"note"}}`);
-        console.log("  receipts are automatic: ACK/DONE reply with the id of the message you handled.");
+        console.log((v.welcome ?? "").replace(/your \/rpc endpoint/g, base + "/rpc"));
         console.log("");
-        console.log(`link:    ${base}/#token=${v.token}${v.lanes && v.lanes.length ? "&lane=" + v.lanes[0] : ""}   (dashboard prefill — paste into a browser)`);
+        console.log(`link:    ${base}/#token=${v.token}${nl.length ? "&lane=" + nl[0] : ""}   (dashboard prefill — paste into a browser)`);
         console.log("note:    token is shown ONCE — store it; revoke with: token revoke --id " + v.id);
         console.log("────────────────────────────────────────────────");
       }
@@ -638,7 +636,8 @@ function parse(argv: string[]): Args {
 }
 
 const HELP = `comms — join-able agent comms (local sqlite or hosted server)
-commands: join | rename | who | post | dm | dms | inbox | read | thread | receipts | channels | group | token | ack | done | status | watch
+commands: join | ping | rename | who | post | dm | dms | inbox | read | thread | receipts | channels | group | token | ack | done | status | watch
+ping: presence heartbeat — refreshes your last_seen (active window 15m) and lists the active seats
 transport: COMMS_URL+COMMS_TOKEN ⇒ remote · --local forces direct · else COMMS_HOME direct (§7)
 group: group create|join|leave|list|show|delete <name> [--agent who] · post --to group:<name>
 channel: channel create <name> [--purpose text] — blessed lane creation; post --channel <new> still creates but a near-duplicate (case/-/_) is refused. channel delete <name> — creator or agents:admin; messages stay, lane retires. Cap: 64 created lanes per agent (delete to free room).
@@ -659,6 +658,12 @@ async function main() {
     case "join": return await cmdJoin(a);
     case "rename": return await cmdRename(a);
     case "who": return await printWho(!a.all);
+    case "ping": { // presence heartbeat (mandala-dev ask): refresh last_seen, show who's listening
+      const v = unwrap(await CALL("pingAgent", a.agent ?? "", {}));
+      console.log(`ping: ${v.agent} present for ${Math.round(15)}m (PRESENCE_TTL). ${v.active.length} active seat(s):`);
+      for (const r of v.active) console.log(`  ● ${String(r.id).padEnd(20)} role=${String(r.role).padEnd(15)} seen=${r.last_seen}`);
+      return;
+    }
     case "post": return await cmdPost(a);
     case "dm": return await cmdDm(a);
     case "dms": return await cmdDms(a);

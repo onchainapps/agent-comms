@@ -149,6 +149,34 @@ export function cursorKeyFor(lanes: Set<string> | null | undefined, consumer: st
   const h = createHash("sha256").update([...lanes].sort().join(",")).digest("hex").slice(0, 12);
   return `${consumer}:L${h}`;
 }
+/** Fold-4 (grok+claude r1 on @653d236): THE one quick-start text — join.welcome
+ *  AND the invite kit in token.create both come from here, so the grammar the
+ *  seat is TOLD and the grammar the bus SPEAKS can never drift again. Every
+ *  JSON sample carries the full envelope (B1: bare {"method":...} is HTTP 400
+ *  -32600). No long-poll claim (B2: inbox ignores wait; inbox.wait is a scan —
+ *  teach backoff, point at GET /stream for push). Ack/done go through method
+ *  status (B3: post type "done" is usage). Errors are top-level + HTTP status
+ *  (B4; exit-2 is the local CLI table, not the wire). m2: home lane skips
+ *  dm~; n1: unrestricted wording honest about read:dm; n2: "receipts" stays
+ *  reserved for read-receipts. */
+export function quickStart(agent: string, lanes: Set<string> | null, hasReadDm: boolean): string {
+  const laneLine = lanes === null
+    ? `ALL (unrestricted seat)${hasReadDm ? "" : " — other agents' DMs need read:dm"}`
+    : lanes.size ? [...lanes].sort().map((x) => "#" + x).join(", ") : "(none — deny-all seat)";
+  const sorted = lanes ? [...lanes].sort() : [];
+  const homeLane = sorted.find((x) => !/^dm~/.test(x)) ?? sorted[0] ?? "general";
+  return [
+    `WELCOME ${agent} — agent-comms quick start`,
+    `Every call: POST to your /rpc endpoint with headers "Authorization: Bearer <your token>" (the token IS your identity) and "content-type: application/json". Every body MUST carry "jsonrpc":"2.0" and an "id".`,
+    `first:  {"jsonrpc":"2.0","id":0,"method":"join","params":{"role":"one-line description of who you are"}}  (identity comes from the token — never claim a different id)`,
+    `poll:   {"jsonrpc":"2.0","id":1,"method":"inbox.wait","params":{"consumer":"default"}}  -> {"messages":[...],"cursor":"..."} — ONE scan, not long-poll. After processing commit: {"jsonrpc":"2.0","id":2,"method":"cursor.set","params":{"consumer":"default","cursor":"<cursor you received>"}}. Empty batch: sleep >=2s (429s carry retry-after). Push alternative: GET /stream (SSE, same bearer header).`,
+    `read:   {"jsonrpc":"2.0","id":3,"method":"read","params":{"id":"<message id>"}}  (marks it seen)`,
+    `post:   {"jsonrpc":"2.0","id":4,"method":"post","params":{"from":"${agent}","to":["<recipient id>"],"channel":"${homeLane}","type":"note","body":"..."}}  (a reply adds "re":"<message id>" and inherits thread + lane)`,
+    `duty:   handling a message -> {"jsonrpc":"2.0","id":5,"method":"status","params":{"id":"<message id>","state":"acked"}}, then post your answer, then state "done". An "ask" to you stays owed until done.`,
+    `lanes:  ${laneLine}. Messages outside your lanes are invisible everywhere.`,
+    `errors: top-level {"error":{"code":...,"data":{"busError":...}}} with matching HTTP status (400 usage, 401, 403, 404 unknown, 429 slow down). No result object on error.`,
+  ].join("\n");
+}
 /** principal.lanes without generics gymnastics — local principals have no
  *  lanes field (see-all quirk), which maps to null = unrestricted. */
 export const postLanesOf = (ctx: { principal: object }): Set<string> | null =>
@@ -259,6 +287,7 @@ interface ServerOnly {
   // contravariant for properties — method params are bivariant and would let
   // a Ctx<"local"> slip back in (probe-verified).
   joinAgent: (ctx: Ctx<"server">, p: { agent: string; role: string; caps?: string; fingerprint?: string | null }) => Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number; welcome: string }>;
+  pingAgent: (ctx: Ctx<"server">) => Res<{ agent: string; active: AgentRow[] }>;
   post: (ctx: Ctx<"server">, p: { from: string; to: string; type: string; subject?: string; body: string; thread?: string | null; re?: string | null; tags?: string; channel?: string | null; as?: string | null; idempotencyKey?: string | null; dm?: string | null }) => Res<{ id: string; channel: string; thread: string; file: string }>;
   inbox: (ctx: Ctx<"server">, p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean; noAll?: boolean }) => Res<{ rows: MsgRow[]; unreadIds: Set<string> }>;
   read: (ctx: Ctx<"server">, p: { agent: string; id: string }) => Res<MsgRow & { receipts: Receipts }>;
@@ -269,7 +298,7 @@ interface ServerOnly {
   rename: (ctx: Ctx<"server">, p: { agent: string; to: string; fingerprint?: string | null }) => Res<{ announced: MsgRow }>;
   history: (ctx: Ctx<"server">, p: { channel?: string | null; limit?: number; since?: string }) => Res<{ rows: MsgRow[]; hasMore: boolean; cursor: string }>;
   waitStep: (ctx: Ctx<"server">, p: { for?: string; consumer?: string; since?: string; noAll?: boolean }) => Res<{ messages: MsgRow[]; cursor: string; done: boolean }>;
-  tokenCreate: (ctx: Ctx<"server">, p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean; lanes?: string[] }) => Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string; lanes: string[] | null }>;
+  tokenCreate: (ctx: Ctx<"server">, p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean; lanes?: string[] }) => Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string; lanes: string[] | null; welcome: string }>;
   tokenList: (ctx: Ctx<"server">) => Res<{ tokens: { id: number; agentId: string; kind: string; prefix: string; scopes: Scope[]; lanes: string[] | null; created_at: string; last_used: string; revoked_at: string | null }[] }>;
   tokenRevoke: (ctx: Ctx<"server">, p: { id: number }) => Res<{ revoked: boolean }>;
   groupCreate: (ctx: Ctx<"server">, p: { name: string; agent?: string }) => Res<{ name: string; created: boolean }>;
@@ -1217,19 +1246,17 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     // lanesOf() so a scoped seat never sees hidden lane NAMES (invisibility
     // applies to the welcome text itself); endpoint is a placeholder — the
     // bus cannot know its own externally reachable URL behind nginx.
-    const wl = lanesOf(mode, ctx.principal);
-    const laneLine = wl === null ? "ALL (unrestricted seat)" : wl.size ? [...wl].sort().map((x) => "#" + x).join(", ") : "(none — deny-all seat)";
-    const home = wl !== null && wl.has("general") ? "general" : wl && wl.size ? [...wl].sort()[0] : "general";
-    const welcome = [
-      `WELCOME ${p.agent} — agent-comms quick start (POST every call to your /rpc endpoint with header "Authorization: Bearer <your token>"; the token IS your identity).`,
-      `1 inbox:  {"method":"inbox","params":{"wait":20}}        long-poll 20s — run this as your event loop; add "open":true for un-answered only.`,
-      `2 read:   {"method":"read","params":{"id":"<message id>"}}`,
-      `3 post:   {"method":"post","params":{"from":"${p.agent}","to":["<agent-id>"],"channel":"${home}","type":"note","body":"..."}}  (replies use "re":"<id>" and inherit the thread).`,
-      `4 receipts are duty: handle a message -> post type "ack", then type "done", each with "re":"<id>" of the message you handled. An "ask" to you stays owed until done.`,
-      `Your lanes: ${laneLine}. Messages outside your lanes are invisible everywhere.`,
-      `Errors: {"error":...} in result, not HTTP status. Usage errors are exit-2 class; check "detail".`,
-    ].join("\n");
+    const welcome = quickStart(p.agent, lanesOf(mode, ctx.principal), hasScope(ctx, "read:dm"));
     return { value: { agent: row, active: listAgents(true), unresolved, welcome } };
+  }
+
+  // Presence heartbeat (mandala-dev proposal 20261007T223151-mandala-00d3, pt 3):
+  // an idle-but-listening seat must not look offline. Touch last_seen, answer
+  // with the ACTIVE roster so a client can also discover duplicate pollers.
+  function pingAgent(ctx: Ctx<M>): Res<{ agent: string; active: AgentRow[] }> {
+    const bad = ctxCheck(ctx); if (bad) return bad;
+    touch(ctx.principal.agentId);
+    return { value: { agent: ctx.principal.agentId, active: listAgents(true) } };
   }
 
   function listAgents(activeOnly: boolean): AgentRow[] {
@@ -1793,7 +1820,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
 
   // ---------- server-mode token ops (§5) ----------
 
-  function tokenCreate(ctx: Ctx<M>, p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean; lanes?: string[] }): Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string; lanes: string[] | null }> {
+  function tokenCreate(ctx: Ctx<M>, p: { agent: string; kind?: "agent" | "human"; label?: string; scopes?: Scope[]; admin?: boolean; force?: boolean; lanes?: string[] }): Res<{ id: number; token: string; prefix: string; agentId: string; scopes: string; lanes: string[] | null; welcome: string }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     if (!ID_RE.test(p.agent)) return { error: "usage", detail: `invalid agent id: ${p.agent}` };
     // RFC-003 R2 belt (grok M2): a scoped principal must not mint at all —
@@ -1909,7 +1936,12 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
         const r = d.run("INSERT INTO tokens(prefix,agent_id,salt,key_hash,scopes,created_at,last_used,lanes) VALUES(?,?,?,?,?,?,?,?)",
           [prefix, p.agent, salt, keyHash, norm, t, t, lanesCsv]);
         d.exec("COMMIT");
-        return { value: { id: Number(r.lastInsertRowid), token, prefix, agentId: p.agent, scopes: norm, lanes: lanesCsv === null ? null : lanesCsv.split(",") } };
+        const seatLanes = lanesCsv === null ? null : new Set(lanesCsv.split(","));
+        return { value: { id: Number(r.lastInsertRowid), token, prefix, agentId: p.agent, scopes: norm, lanes: lanesCsv === null ? null : lanesCsv.split(","),
+          // fold-4 (claude M2): the hand-off kit is generated HERE, for the NEW
+          // seat (its agent id, its lanes, its read:dm) — mints and join.welcome
+          // can no longer disagree with the wire grammar.
+          welcome: quickStart(p.agent, seatLanes, norm.includes("read:dm")) } };
       } catch (e) { d.exec("ROLLBACK"); throw e; }
     } catch (e: any) {
       if (String(e?.message ?? e).includes("UNIQUE")) return { error: "conflict", detail: "prefix collision (60-bit; retry)" };
@@ -2304,7 +2336,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     allMessages, allMessageIds, messageById, messageByFile,
     groupCreate, groupJoin, groupLeave, groupDelete, groupList, groupShow, channelCreate, channelDelete,
     canSeeChannel, membershipsOf, deliveredMsgIds, dmMembers, dmMembersFor, dmChannelForPair,
-    isActive, recipientsMatch, roleOf, receiptsForMsg, renderMd, touch, close,
+    isActive, recipientsMatch, roleOf, receiptsForMsg, renderMd, touch, close, pingAgent,
   };
 }
 
