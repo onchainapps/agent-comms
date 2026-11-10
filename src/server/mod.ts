@@ -308,26 +308,55 @@ export function startServer(opts: ServerOpts): RunningServer {
   }
 
   // ---------- RPC dispatch ----------
-  // RFC-004 (#2): write/read verbs are STRICT about their parameter names — a
-  // typo like {"lane":"cardano"} used to be silently ignored and the post fell
-  // to general with a 200. Unknown keys are a usage error now, before dispatch.
+  // RFC-004 (#2, rework M2): write/read verbs are STRICT about their parameter
+  // names — a typo like {"lane":"cardano"} used to be silently ignored and the
+  // post fell to general with a 200; {"lane":[...]} on token.create minted an
+  // UNRESTRICTED seat. EVERY dispatch case is mapped below, with the alias keys
+  // the switch actually reads (rename.newId, who.all, history.limit, ...).
+  // An unmapped method would be a silent-drop hole again — add the case here
+  // in the same commit that adds it to the switch.
   const PARAM_KEYS: Record<string, readonly string[]> = {
     join: ["agent", "role", "caps", "fingerprint"],
     ping: [],
+    who: ["all"],
     post: ["from", "to", "type", "subject", "body", "thread", "re", "tags", "channel", "as", "idempotencyKey", "dm"],
     inbox: ["for", "agent", "open", "unread", "channel", "mark", "noAll", "since", "consumer", "new", "newOnly"],
     read: ["for", "agent", "id"],
+    thread: ["id"],
+    receipts: ["id"],
     status: ["id", "state", "agent", "for"], // agent/for are accepted-and-ignored (principal wins — spoof pin)
+    channels: [],
+    history: ["channel", "since", "limit"],
+    rename: ["agent", "to", "newId"],
     "inbox.wait": ["for", "consumer", "since", "noAll"],
     "cursor.get": ["consumer"],
     "cursor.set": ["consumer", "cursor", "force"],
+    "token.create": ["agent", "kind", "label", "scopes", "admin", "force", "lanes"],
+    "token.list": [],
+    "token.revoke": ["id"],
+    "channel.create": ["name", "purpose"],
+    "channel.delete": ["name"],
+    "group.create": ["name", "agent"],
+    "group.join": ["name", "agent"],
+    "group.leave": ["name", "agent"],
+    "group.delete": ["name"],
+    "group.list": [],
+    "group.show": ["name"],
+    "dm.members": ["channel"],
   };
+  /** M3 (rework): booleans the wire can erase. `{"new":"true"}` used to be a
+   *  silent plain-inbox fallback (nothing advanced). Reject non-boolean with
+   *  usage — same class as the `lane` typo. */
+  const BOOL_PARAMS = ["new", "newOnly", "noAll", "mark", "open", "unread", "force"] as const;
   async function rpcCall(session: Session, method: string, p: any): Promise<{ ok: true; result: unknown } | { ok: false; err: ReturnType<typeof busToRpc> }> {
     const allowed = PARAM_KEYS[method];
     if (allowed && p && typeof p === "object" && !Array.isArray(p)) {
       const extra = Object.keys(p).filter((k) => !allowed.includes(k));
       if (extra.length)
         return { ok: false as const, err: busToRpc({ error: "usage", detail: `unknown param(s) for ${method}: ${extra.join(",")} — allowed: ${allowed.join(",") || "(none)"}` }) };
+      const badBool = BOOL_PARAMS.filter((k) => p[k] !== undefined && typeof p[k] !== "boolean");
+      if (badBool.length)
+        return { ok: false as const, err: busToRpc({ error: "usage", detail: `invalid param type for ${method}: ${badBool.map((k) => `${k} must be a boolean`).join(", ")}` }) };
     }
     const call = async (r: Promise<{ error?: BusErrorCode; detail?: string; value?: unknown; data?: Record<string, unknown> }>) => {
       const res = await r;

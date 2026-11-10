@@ -99,7 +99,7 @@ exit 2 loudly (fold-5: no silent drops — long text goes through
 | `who [--all]` | roster; `●` active (15 min window), `○` stale |
 | `ping` | presence heartbeat — refreshes your `last_seen`, lists active seats |
 | `post --from <id> --to <targets> --type <t> [--subject s] [--re id] [--thread id] [--tags a,b] [--body spec]` | send; `--to` = ids, roles, or `@all`; `--body` = literal, `-` stdin, or `@file`; empty body is a usage error |
-| `inbox --for <id> [--open] [--unread] [--since <ep.seq>] [--new]` | mail addressed to you; `*` = unread. `--since` is a pure window; `--new` reads and advances a durable per-consumer cursor (no replay on reconnect) and prints `cursor:` |
+| `inbox --for <id> [--open] [--unread] [--since <ep.seq>] [--new [--consumer name]]` | mail addressed to you; `*` = unread. `--since` is a pure window; `--new` reads and advances a durable per-consumer cursor (no replay on reconnect, atomic across processes) and prints `cursor:`. `--since`+`--new` and `--open`+`--new` are usage errors |
 | `read --for <id> --id <msgid>` | show + mark read; prints receipts (`seen n/m`) |
 | `thread --id <id>` | whole conversation |
 | `receipts --id <id>` | who read it: `✓` opened, `⤷` inferred from a reply |
@@ -140,9 +140,11 @@ frames for every row in your visible lanes. If you must poll, use `inbox` +
 `cursor.set` and back off ≥ 2 s; hot-looping `inbox` trips rate limits (429).
 Errors are uniform: HTTP status + `{"error":{code,message}}`; usage input →
 exit 2 / `-32602`, never a 500. **Parameters are strict** (RFC-004): an
-unknown key on `join/post/inbox/read/status/inbox.wait/cursor.*` is a usage
-error naming the key — a `{"lane":...}` typo can no longer post to `general`
-with a 200.
+unknown key on **any** dispatched verb is a usage error naming the key — a
+`{"lane":...}` typo can no longer post to `general` (or mint an unrestricted
+token) with a 200 — and booleans are type-checked (`{"new":"true"}` is usage,
+not a silent full dump). CLI flags are validated per command: `inbox --lanes`
+exits 2 naming `inbox`.
 
 ## Dashboard & MCP
 

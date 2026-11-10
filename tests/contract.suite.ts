@@ -1488,6 +1488,67 @@ export function contractSuite(name: string, make: Factory) {
         expect((await sess.inbox({ agent: "r4c", since: "deadbeefdeadbeef.999999" })).error).toBe("resync"); // foreign epoch = resync signal, never a silent dump
       });
     });
+
+    test("RFC-004 rework M3: non-boolean new/open/unread/mark/noAll are usage on BOTH transports — never a silent plain inbox", async () => {
+      await withBus(async (h, root) => {
+        const s = await seedAgent(h, root, "r4t", "lab");
+        const sess = (s as any).value.session as Session;
+        await root.post({ from: "root", to: "r4t", type: "note", subject: "one", body: "b" });
+        for (const bad of [{ newOnly: "true" }, { newOnly: 1 }, { open: "true" }, { unread: 1 }, { mark: "true" }, { noAll: "1" }]) {
+          const r = (await sess.inbox({ agent: "r4t", ...(bad as any) })) as any;
+          expect(r.error).toBe("usage");
+        }
+        // the refusals wrote nothing: the plain inbox still shows the mail and no cursor moved
+        const plain = (await sess.inbox({ agent: "r4t" })) as any;
+        expect(plain.value.rows.map((r: any) => r.subject)).toEqual(["one"]);
+        expect(((await sess.cursorGet({ consumer: "inbox" })) as any).value.seq).toBe(0);
+      });
+    });
+
+    test("RFC-004 rework N1+Q3: since=+new= and open=+new= are exclusive (usage, nothing written)", async () => {
+      await withBus(async (h, root) => {
+        const s = await seedAgent(h, root, "r4u", "lab");
+        const sess = (s as any).value.session as Session;
+        const hw = (await root.history({ limit: 1 })) as any;
+        const cur = hw.value.cursor as string;
+        await root.post({ from: "root", to: "r4u", type: "note", subject: "b", body: "b" });
+        expect(((await sess.inbox({ agent: "r4u", since: cur, newOnly: true })) as any).error).toBe("usage");
+        expect(((await sess.inbox({ agent: "r4u", newOnly: true, open: true })) as any).error).toBe("usage");
+        // N1: since stays pure, and the pair never moved the durable cursor
+        expect(((await sess.inbox({ agent: "r4u", since: cur })) as any).value.rows.map((r: any) => r.subject)).toEqual(["b"]);
+        expect(((await sess.cursorGet({ consumer: "inbox" })) as any).value.seq).toBe(0);
+      });
+    });
+
+    test("RFC-004 rework N2: read:all can READ a foreign seat's inbox but cannot ADVANCE its cursor", async () => {
+      await withBus(async (h, root) => {
+        const s = await seedAgent(h, root, "r4v", "lab");
+        const sess = (s as any).value.session as Session;
+        await root.post({ from: "root", to: "r4v", type: "note", subject: "keep", body: "b" });
+        const peek = (await root.inbox({ agent: "r4v", newOnly: true })) as any;
+        expect(peek.error).toBe("forbidden");
+        // the seat itself still receives the mail — nothing was consumed by the peek
+        const own = (await sess.inbox({ agent: "r4v", newOnly: true })) as any;
+        expect(own.error).toBeUndefined();
+        expect(own.value.rows.map((r: any) => r.subject)).toEqual(["keep"]);
+      });
+    });
+
+    test("RFC-004 rework N3: the new-window cursor advances past filter-excluded rows (no livelock)", async () => {
+      await withBus(async (h, root) => {
+        const s = await seedAgent(h, root, "r4w", "lab");
+        const sess = (s as any).value.session as Session;
+        const base = ((await sess.cursorGet({ consumer: "auto" })) as any).value.seq;
+        await root.post({ from: "root", to: "someone-else", type: "note", subject: "not mine", body: "b" });
+        const a = (await sess.inbox({ agent: "r4w", newOnly: true, consumer: "auto" })) as any;
+        expect(a.error).toBeUndefined();
+        expect(a.value.rows).toEqual([]); // filtered out by the recipient predicate
+        expect(Number(String(a.value.cursor).split(".")[1])).toBeGreaterThan(base); // but scanned + advanced
+        await root.post({ from: "root", to: "r4w", type: "note", subject: "mine", body: "b" });
+        const b = (await sess.inbox({ agent: "r4w", newOnly: true, consumer: "auto" })) as any;
+        expect(b.value.rows.map((r: any) => r.subject)).toEqual(["mine"]);
+      });
+    });
   });
 }
 

@@ -3,8 +3,10 @@ import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { openBus, localCtx, serverCtx, csv, normalizeScopes, canonicalJson, sha256hex, RPC_CODES, EXIT_CODES } from "../src/bus.ts";
 import { testSeams } from "../src/seams.ts";
+import { LocalBus } from "../src/bus-iface.ts";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "comms-test-"));
 const srv = (home: string) => openBus({ home, mode: "server", seams: testSeams({}) });
@@ -691,4 +693,94 @@ describe("M1.5 F/G — local direction + mechanics (unit)", () => {
     expect(recipientsMatch("group:g1", "x", "g1", mem, "2026-06-01T00:00:00Z")).toBe(true); // bare-role arm can't hit group: tokens
     expect(recipientsMatch("group:g1", "x", null)).toBe(false); // no memberships ⇒ inert (legacy call shape)
   });
+});
+
+// ---------- RFC-004 rework (t_5bf0ad14) ----------
+describe("RFC-004 rework: atomic cursor advance + scoped keys + paging", () => {
+  test("M1: the advance is a compare-and-swap — two writers that scanned the same position cannot both deliver", () => {
+    const home = tmp();
+    const bus = loc(home);
+    const ep = bus.epoch();
+    const p = bus.post(localCtx("poster"), { from: "poster", to: "racer", type: "note", body: "one" });
+    expect(p.error).toBeUndefined();
+    const ev = (bus.testDb.query("SELECT seq FROM events WHERE msg_id=?").get((p as any).value.id) as any).seq as number;
+    // writer A: fresh consumer (no row) at the floor — wins
+    expect((bus as any).cursorAdvanceCas("racer", "inbox", ep, null, ev)).toBe(true);
+    // writer B scanned the SAME "no row" position — the INSERT conflicts, no delivery
+    expect((bus as any).cursorAdvanceCas("racer", "inbox", ep, null, ev)).toBe(false);
+    // writer B instead scanned "row @ 0" — the CAS UPDATE matches 0 rows
+    expect((bus as any).cursorAdvanceCas("racer", "inbox", ep, 0, ev)).toBe(false);
+    // the legitimate next advance still wins
+    const p2 = bus.post(localCtx("poster"), { from: "poster", to: "racer", type: "note", body: "two" });
+    const ev2 = (bus.testDb.query("SELECT seq FROM events WHERE msg_id=?").get((p2 as any).value.id) as any).seq as number;
+    expect((bus as any).cursorAdvanceCas("racer", "inbox", ep, ev, ev2)).toBe(true);
+    bus.close(); rmSync(home, { recursive: true, force: true });
+  });
+
+  test("M1: two connections on one DB share the key — a message is delivered exactly once", () => {
+    const home = tmp();
+    const a = loc(home);
+    const b = loc(home);
+    a.post(localCtx("poster"), { from: "poster", to: "racer", type: "note", subject: "once", body: "b" });
+    const x = a.inbox(localCtx("racer"), { agent: "racer", newOnly: true }) as any;
+    const y = b.inbox(localCtx("racer"), { agent: "racer", newOnly: true }) as any;
+    expect(x.error).toBeUndefined();
+    expect(y.error).toBeUndefined();
+    expect(x.value.rows.map((r: any) => r.subject)).toEqual(["once"]);
+    expect(y.value.rows).toEqual([]); // the second process saw the ADVANCED cursor
+    a.close(); b.close(); rmSync(home, { recursive: true, force: true });
+  });
+
+  test("N3: a scoped seat's inbox cursor key carries :L<hex> and is independent of the unrestricted key", async () => {
+    const home = tmp();
+    const h = LocalBus.open({ home });
+    const raw = h.raw;
+    expect(raw.channelCreate(localCtx("boot"), { name: "scopelane" }).error).toBeUndefined();
+    const scopedT = raw.tokenCreate(localCtx("boot"), { agent: "seat-l", lanes: ["scopelane"] });
+    const looseT = raw.tokenCreate(localCtx("boot"), { agent: "seat-l" });
+    expect(scopedT.error).toBeUndefined();
+    expect(looseT.error).toBeUndefined();
+    const scoped = h.session({ token: (scopedT as any).value.token });
+    const loose = h.session({ token: (looseT as any).value.token });
+    expect((await raw.post(localCtx("boot"), { from: "boot", to: "seat-l", type: "note", subject: "lane-mail", body: "b", channel: "scopelane" })).error).toBeUndefined();
+    const a = (await scoped.inbox({ agent: "seat-l", newOnly: true, consumer: "pick" })) as any;
+    expect(a.error).toBeUndefined();
+    expect(a.value.rows.map((r: any) => r.subject)).toEqual(["lane-mail"]);
+    // the row landed under the lane-hashed key, not the raw one
+    const keys = (raw.testDb.query("SELECT consumer FROM cursors WHERE agent_id='seat-l' ORDER BY consumer").all() as any[]).map((r) => r.consumer);
+    expect(keys).toContain("pick:L" + createHash("sha256").update("scopelane").digest("hex").slice(0, 12));
+    // the unrestricted sibling token has its OWN key ⇒ it still gets the mail once
+    const b = (await loose.inbox({ agent: "seat-l", newOnly: true, consumer: "pick" })) as any;
+    expect(b.value.rows.map((r: any) => r.subject)).toEqual(["lane-mail"]);
+    expect((raw.testDb.query("SELECT consumer FROM cursors WHERE agent_id='seat-l' AND consumer='pick'").get() as any).consumer).toBe("pick");
+    // and neither replays
+    expect(((await scoped.inbox({ agent: "seat-l", newOnly: true, consumer: "pick" })) as any).value.rows).toEqual([]);
+    h.close(); rmSync(home, { recursive: true, force: true });
+  });
+
+  test("N3: hasMore pages the inbox new window 500/5/0 with zero duplicates", () => {
+    const home = tmp();
+    // mirror sink off: 505 posts should not cost 505 disk writes in a unit pin
+    const bus = openBus({ home, mode: "local", seams: { ...testSeams({}), mirror: () => "(memory)" } });
+    for (let i = 0; i < 505; i++) {
+      const r = bus.post(localCtx("poster"), { from: "poster", to: "pager", type: "note", subject: `p${i}`, body: "b" });
+      expect(r.error).toBeUndefined();
+    }
+    const seen: string[] = [];
+    let r = bus.inbox(localCtx("pager"), { agent: "pager", newOnly: true, consumer: "pager" }) as any;
+    expect(r.error).toBeUndefined();
+    expect(r.value.rows.length).toBe(500);
+    expect(r.value.hasMore).toBe(true);
+    seen.push(...r.value.rows.map((x: any) => x.id));
+    r = bus.inbox(localCtx("pager"), { agent: "pager", newOnly: true, consumer: "pager" }) as any;
+    expect(r.value.rows.length).toBe(5);
+    expect(r.value.hasMore).toBe(false);
+    seen.push(...r.value.rows.map((x: any) => x.id));
+    r = bus.inbox(localCtx("pager"), { agent: "pager", newOnly: true, consumer: "pager" }) as any;
+    expect(r.value.rows.length).toBe(0);
+    expect(r.value.hasMore).toBe(false);
+    expect(seen.length).toBe(505);
+    expect(new Set(seen).size).toBe(505); // no duplicate across pages
+    bus.close(); rmSync(home, { recursive: true, force: true });
+  }, 30000); // 505 posts at ~12ms each exceeds bun's 5s default
 });

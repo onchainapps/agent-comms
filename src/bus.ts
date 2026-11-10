@@ -1649,44 +1649,88 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     // every event it scanned (delivery = advance), so a reconnecting watcher
     // can never replay a message it was already handed. Cursor advances past
     // rows the filters excluded — "new matching mail", not "new mail".
+    // M3 (RFC-004 rework): the wire erases types. A stringified/numeric
+    // boolean used to fall through to the plain FULL inbox with no cursor —
+    // the same silent-drop class this RFC exists to kill. Checked on EVERY
+    // inbox call (plain included), before any branch, so local and RPC answer
+    // with the same usage error.
+    if (p.open !== undefined && typeof p.open !== "boolean") return { error: "usage", detail: "inbox open must be a boolean" };
+    if (p.unread !== undefined && typeof p.unread !== "boolean") return { error: "usage", detail: "inbox unread must be a boolean" };
+    if (p.mark !== undefined && typeof p.mark !== "boolean") return { error: "usage", detail: "inbox mark must be a boolean" };
+    if (p.noAll !== undefined && typeof p.noAll !== "boolean") return { error: "usage", detail: "inbox noAll must be a boolean" };
+    if (p.newOnly !== undefined && typeof p.newOnly !== "boolean") return { error: "usage", detail: "inbox new must be a boolean" };
+    if (p.since !== undefined && typeof p.since !== "string") return { error: "usage", detail: "inbox since must be a cursor string <epoch>.<seq>" };
+    if (p.consumer !== undefined && typeof p.consumer !== "string") return { error: "usage", detail: "inbox consumer must be a string" };
+    if (p.channel !== undefined && p.channel !== null && typeof p.channel !== "string") return { error: "usage", detail: "inbox channel must be a string" };
     if (p.since !== undefined || p.newOnly === true) {
+      // N1: the RFC table promises `since` writes nothing, so asking for both
+      // is a usage error — not "since wins but the durable cursor moved anyway".
+      if (p.since !== undefined && p.newOnly === true)
+        return { error: "usage", detail: "inbox since= and new= are exclusive: since= is a read-only window, new= advances the durable cursor" };
+      // Q3: `open` is NOT monotone (setStatus allows blocked->open and
+      // done->open), so one advancing scan would hand a message back once and
+      // then silently lose it when it is reopened. Refuse the pair.
+      if (p.open === true && p.newOnly === true)
+        return { error: "usage", detail: "inbox open= cannot be combined with new=: open is not monotone (a message can be reopened after the scan); use plain open= or new= and filter client-side" };
       const consumer = p.consumer ?? "inbox";
       if (!CONSUMER_RE.test(consumer)) return CONSUMER_BAD;
       const ep0 = epochSafe();
       if (ep0 === null) return { error: "internal", detail: "meta.epoch missing (corrupt DB)" };
-      let seq: number;
-      if (p.since !== undefined) {
-        const c = parseCursor(p.since);
-        if (c.error) return c;
-        seq = c.value.seq;
-      } else {
-        const laneRows = lanesOf(mode, ctx.principal);
-        const row = cursorRaw(p.agent, cursorKeyFor(laneRows, consumer));
-        if (row && row.epoch !== ep0)
-          return { error: "resync", detail: "cursor epoch stale (epoch rotated)", data: { resync: true, epoch: ep0, floor: gcFloor() } };
-        // A FRESH consumer (no row) starts at the RETENTION FLOOR, not 0: a real
-        // bus has GC'd events (live .173: floor 7144, min seq 7145), and seq 0
-        // would make the very first --new a spurious resync. Only an EXISTING
-        // row below the floor is genuinely stale.
-        seq = row ? row.seq : gcFloor();
-        if (row && seq < gcFloor())
-          return { error: "resync", detail: "cursor below retention floor", data: { resync: true, epoch: ep0, floor: gcFloor() } };
-      }
       // events are the delivery log; messages are the truth (§6). LIKE IN
       // waitStep: walk events ASC, hydrate rows, apply the SAME inbox predicate.
-      const cand = d.query(
-        "SELECT e.seq AS _seq, m.* FROM events e JOIN messages m ON m.id=e.msg_id WHERE e.kind='msg' AND e.seq>? ORDER BY e.seq ASC LIMIT 501",
-      ).all(seq) as (MsgRow & { _seq: number })[];
-      const page = cand.slice(0, 500);
-      const out = page.filter((r) => match(r));
-      const lastSeq = page.length ? page[page.length - 1]._seq : seq;
-      if (p.newOnly === true && lastSeq > seq) {
-        const w = cursorSet(p.agent, consumer, ep0, lastSeq, false, lanesOf(mode, ctx.principal));
-        if ("error" in w) return w as Res<never>;
+      const scan = (from: number) => {
+        const cand = d.query(
+          "SELECT e.seq AS _seq, m.* FROM events e JOIN messages m ON m.id=e.msg_id WHERE e.kind='msg' AND e.seq>? ORDER BY e.seq ASC LIMIT 501",
+        ).all(from) as (MsgRow & { _seq: number })[];
+        const page = cand.slice(0, 500);
+        return { cand, out: page.filter((r) => match(r)), lastSeq: page.length ? page[page.length - 1]._seq : from };
+      };
+      const result = (outRows: (MsgRow & { _seq: number })[], lastSeq: number, hasMore: boolean) => {
+        const clean = outRows.map(({ _seq, ...r }) => r as MsgRow);
+        return { value: { rows: clean, unreadIds: new Set(clean.map((r) => r.id).filter((id) => !readIds.has(id))), cursor: `${ep0}.${lastSeq}`, hasMore } };
+      };
+      if (p.newOnly !== true) {
+        // `since`: PURE window — no transaction, no writes.
+        const c = parseCursor(p.since as string);
+        if (c.error) return c;
+        const { cand, out, lastSeq } = scan(c.value.seq);
+        if (mark) for (const r of out) d.run("INSERT OR REPLACE INTO reads(agent,msg,read_at) VALUES(?,?,?)", [p.agent, r.id, nowIso()]);
+        return result(out, lastSeq, cand.length > 500);
       }
-      if (mark) for (const r of out) d.run("INSERT OR REPLACE INTO reads(agent,msg,read_at) VALUES(?,?,?)", [p.agent, r.id, nowIso()]);
-      const clean = out.map(({ _seq, ...r }) => r as MsgRow);
-      return { value: { rows: clean, unreadIds: new Set(clean.map((r) => r.id).filter((id) => !readIds.has(id))), cursor: `${ep0}.${lastSeq}`, hasMore: cand.length > 500 } };
+      // N2: read:all may READ another seat's inbox; it must not move that
+      // seat's delivery pointer. The seat itself (or a local root — the CLI's
+      // own authority) is the only writer.
+      if (p.agent !== ctx.principal.agentId && !rootCtx)
+        return { error: "forbidden", detail: "new= advances the target seat's cursor; read a foreign inbox with since= (read-only) — only the seat itself may advance it" };
+      const key = cursorKeyFor(lanesOf(mode, ctx.principal), consumer);
+      // M1: read + scan + advance are ONE IMMEDIATE transaction, and the
+      // advance is a compare-and-swap on the position this call scanned. Two
+      // processes sharing a key can therefore never both be handed the same id.
+      try {
+        return db_txn(() => {
+          const ep = epochSafe();
+          if (ep === null) return { error: "internal" as const, detail: "meta.epoch missing (corrupt DB)" };
+          const row = cursorRaw(p.agent, key);
+          if (row && row.epoch !== ep)
+            return { error: "resync" as const, detail: "cursor epoch stale (epoch rotated)", data: { resync: true, epoch: ep, floor: gcFloor() } };
+          // A FRESH consumer (no row) starts at the RETENTION FLOOR, not 0: a
+          // real bus has GC'd events (live .173: floor 7144, min seq 7145), and
+          // seq 0 would make the very first --new a spurious resync. Only an
+          // EXISTING row below the floor is genuinely stale.
+          const start = row ? row.seq : gcFloor();
+          if (row && start < gcFloor())
+            return { error: "resync" as const, detail: "cursor below retention floor", data: { resync: true, epoch: ep, floor: gcFloor() } };
+          const { cand, out, lastSeq } = scan(start);
+          if (lastSeq > start && !cursorAdvanceCas(p.agent, key, ep, row ? row.seq : null, lastSeq))
+            return { error: "contention" as const, detail: "cursor advanced by another process; retry" };
+          if (mark) for (const r of out) d.run("INSERT OR REPLACE INTO reads(agent,msg,read_at) VALUES(?,?,?)", [p.agent, r.id, nowIso()]);
+          return result(out, lastSeq, cand.length > 500);
+        });
+      } catch (e: any) {
+        const msg = String(e?.message ?? e);
+        if (msg.includes("SQLITE_BUSY") || msg.includes("database is locked")) return { error: "contention", detail: "busy after retries" };
+        return { error: "internal", detail: `inbox: ${msg}` };
+      }
     }
     const out = rows.filter(match);
     if (mark) for (const r of out) d.run("INSERT OR REPLACE INTO reads(agent,msg,read_at) VALUES(?,?,?)", [p.agent, r.id, nowIso()]);
@@ -2133,6 +2177,27 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     return { value: null };
   }
 
+  /** M1 (RFC-004 rework): the conditional advance used by the inbox{new} path.
+   *  Returns true iff THIS call moved the row from the exact position it
+   *  scanned (compare-and-swap on `last_seq`, or a no-row INSERT). A second
+   *  process that scanned the same position gets false and must deliver
+   *  nothing — that is what makes delivery at-most-once per consumer across
+   *  processes. Callers hold `BEGIN IMMEDIATE` (db_txn) around scan+advance. */
+  function cursorAdvanceCas(agentId: string, consumer: string, ep: string, fromSeq: number | null, toSeq: number): boolean {
+    if (fromSeq === null) {
+      const ins = d.run(
+        "INSERT INTO cursors(agent_id,consumer,epoch,last_seq) VALUES(?,?,?,?) ON CONFLICT(agent_id,consumer) DO NOTHING",
+        [agentId, consumer, ep, toSeq],
+      );
+      return ins.changes === 1;
+    }
+    const upd = d.run(
+      "UPDATE cursors SET epoch=?, last_seq=? WHERE agent_id=? AND consumer=? AND epoch=? AND last_seq=?",
+      [ep, toSeq, agentId, consumer, ep, fromSeq],
+    );
+    return upd.changes === 1;
+  }
+
   // ---------- streaming/history (§6) ----------
 
   /** M3 (round 2): ONE cursor parser for every since-bearing entry point
@@ -2382,7 +2447,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     testDb: d, home, mode, seams, DB_PATH, MSG_DIR, nowIso, stamp, newId,
     joinAgent, listAgents, post, inbox, read, threadOf, receipts, setStatus, channels, rename,
     tokenCreate, tokenVerify, tokenById, tokenList, tokenRevoke, tokenTouch,
-    cursorGet, cursorSet, history, waitStep, tailEvents, eventsHighWater, epoch, gcFloor, rotateEpoch, gc, preflight,
+    cursorGet, cursorSet, cursorAdvanceCas, history, waitStep, tailEvents, eventsHighWater, epoch, gcFloor, rotateEpoch, gc, preflight,
     allMessages, allMessageIds, messageById, messageByFile,
     groupCreate, groupJoin, groupLeave, groupDelete, groupList, groupShow, channelCreate, channelDelete,
     canSeeChannel, membershipsOf, deliveredMsgIds, dmMembers, dmMembersFor, dmChannelForPair,

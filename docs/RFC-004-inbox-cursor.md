@@ -44,6 +44,28 @@ inbox { for, open, unread, channel, mark, noAll, since?, consumer?, new? }
 | `new: true` (,`consumer` default `inbox`) | reads the durable per-consumer cursor, returns the same window, and **advances the cursor** past every event it scanned | cursor row only |
 | plain `inbox` | unchanged, byte-identical | none |
 
+`since` and `new` are **mutually exclusive** (`usage`): the table above promises
+`since` writes nothing, so a request for both is a contradiction, not a
+"since wins but the cursor moved anyway" surprise.
+
+`new: true` is **at-most-once per (agent, consumer)** even across processes:
+the cursor read, the scan and the advance run inside one `BEGIN IMMEDIATE`
+transaction and the advance is a compare-and-swap on the position this call
+scanned (`UPDATE … WHERE last_seq = <scanned>` / `INSERT … ON CONFLICT DO
+NOTHING`). A second process that scanned the same position gets `changes = 0`
+and delivers nothing. The log is immutable and the plain inbox stays total, so
+nothing is lost — recovery is the plain view or a fresh `consumer` name.
+
+`new: true` may only be asked for the **caller's own seat**: `read:all` can
+*read* another seat's inbox (`for=`), but it must not move that seat's delivery
+pointer (a local root — the CLI's own authority — is the one exception).
+
+`open: true` is **refused with `new: true`** (`usage`). `open` is not monotone
+(`setStatus` allows `blocked→open` and `done→open`), so one advancing scan
+would hand back a message and then silently lose it when it is reopened. Use
+plain `open` for the full matching view, or `new` without `open` and filter
+client-side.
+
 Both forms return `cursor: "<epoch>.<seq>"` = the highest seq scanned (or the
 input cursor when nothing was scanned), and `hasMore: true` when >500 events
 remain (page again with `cursor`).
@@ -63,15 +85,32 @@ Rules inherited unchanged from §6:
 ### 2.2 Strict parameter names on RPC write/read verbs
 
 Server-side allowlist per method (unknown key ⇒ `usage`, `-32602`, HTTP 400,
-before dispatch; detail names the offending key and the allowed set):
+before dispatch; detail names the offending key and the allowed set). **Every
+dispatch case is mapped** — an unmapped verb is a silent-drop hole, and the
+holes that mattered were the mutating ones (`token.create` with `lane:` minted
+an UNRESTRICTED seat with HTTP 200):
 
 ```
-join, ping, post, inbox, read, status, inbox.wait, cursor.get, cursor.set
+join [agent,role,caps,fingerprint]            ping []
+who [all]                                     post [from,to,type,subject,body,thread,re,tags,channel,as,idempotencyKey,dm]
+inbox [for,agent,open,unread,channel,mark,noAll,since,consumer,new,newOnly]
+read [for,agent,id]                           thread [id]                receipts [id]
+status [id,state,agent,for]                   channels []
+history [channel,since,limit]                 rename [agent,to,newId]
+inbox.wait [for,consumer,since,noAll]         cursor.get [consumer]      cursor.set [consumer,cursor,force]
+token.create [agent,kind,label,scopes,admin,force,lanes]   token.list []  token.revoke [id]
+channel.create [name,purpose]                 channel.delete [name]
+group.create/join/leave [name,agent]          group.delete/show [name]   group.list []
+dm.members [channel]
 ```
 
 Accepted-and-ignored compatibility params stay allowlisted and documented
-(`status.agent`/`status.for` — principal wins; spoof pin). Methods not in the
-map are unchanged for now.
+(`status.agent`/`status.for` — principal wins; spoof pin).
+
+**Types too.** Booleans are checked (`new`, `newOnly`, `noAll`, `mark`, `open`,
+`unread`, `force`): `{"new":"true"}` or `{"new":1}` is `usage`, never a silent
+plain-inbox fallback with no cursor. The core checks the same names (plus
+`since`/`consumer`/`channel` strings) so both transports answer identically.
 
 ## 3. Compatibility
 
@@ -80,7 +119,9 @@ map are unchanged for now.
 - Additive result fields (`cursor`, `hasMore`) appear only when the cursor
   path is used.
 - CLI: `inbox --since <cursor>` and `inbox --new [--consumer name]`; prints a
-  `cursor:` line only when one of them is used.
+  `cursor:` line only when one of them is used. Flags are validated **per
+  command** (`COMMAND_FLAGS`): a flag that belongs to another command is a
+  usage error naming the command, exit 2 — never a silent no-op.
 - Nothing depends on the old silent-drop behavior; the UI and CLI never send
   unknown keys.
 
@@ -96,8 +137,21 @@ map are unchanged for now.
    **nothing written**; the same call with `channel` succeeds; `read` with a
    typo'd id key is usage, not a not_found lie; `inbox {new:true}` returns a
    cursor on the wire.
-5. CLI flags: `--new`/`--since` parse; `--dm`/`--url` are no longer silently
-   accepted (removed dead allowlist entries).
+5. CLI flags: `--new`/`--since` parse and print a `cursor:` line; `--dm`/`--url`
+   are no longer silently accepted (removed dead allowlist entries). Flags are
+   **per command**: `inbox --lanes a,b` exits 2 naming `inbox` (it used to be a
+   silent full-dump no-op); `token create --lanes` and
+   `watch --exit-on-new --once --local` still exit 0.
+6. **Atomic advance** (local core): the CAS primitive refuses a second writer
+   that scanned the same position (no-row INSERT conflicts, stale
+   `last_seq` UPDATE matches 0 rows); two connections on one DB deliver a
+   message exactly once.
+7. **Types** (both transports): non-boolean `new`/`open`/`unread`/`mark`/`noAll`
+   ⇒ `usage`, nothing written, no cursor moved.
+8. **Scope rules** (both transports): `since`+`new` and `open`+`new` ⇒ `usage`;
+   a `read:all` caller cannot advance a foreign seat's cursor; the new-window
+   cursor advances past filter-excluded rows; scoped seats get `:L<hex>` cursor
+   keys on the inbox path; `hasMore` pages 500/5/0 with no duplicates.
 
 ## 5. Non-goals
 

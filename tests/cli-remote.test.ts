@@ -622,3 +622,51 @@ describe("M3 review pins (claude)", () => {
     } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
   });
 });
+
+// RFC-004 rework (t_5bf0ad14): the CLI halves of M4 and N3.
+describe("RFC-004 rework: per-command CLI flags + --new/--since parse", () => {
+  test("M4: a flag owned by ANOTHER command exits 2 naming the command (inbox --lanes was a silent full dump)", () => {
+    const home = tmp();
+    try {
+      const r = cli(["inbox", "--for", "seat", "--lanes", "a,b"], { COMMS_HOME: home });
+      expect(r.code).toBe(2);
+      expect(r.out).toBe("");
+      expect(r.err).toContain("--lanes");
+      expect(r.err).toContain("not a flag for 'inbox'");
+      // the OWNING command still accepts it
+      cli(["join", "--agent", "cseat", "--role", "lab"], { COMMS_HOME: home });
+      const t = cli(["token", "create", "--agent", "lane-seat", "--lanes", "general"], { COMMS_HOME: home });
+      expect(t.code).toBe(0);
+      // and the real watch invocation still parses every one of its flags
+      const w = cli(["watch", "--for", "cseat", "--exit-on-new", "--once", "--local"], { COMMS_HOME: home });
+      expect(w.code).toBe(0);
+      expect(w.out).toContain("watch: cseat");
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("N3: --new prints a cursor and delivers once; --since is a pure window; the pair is refused", () => {
+    const home = tmp();
+    try {
+      cli(["join", "--agent", "a1", "--role", "lab"], { COMMS_HOME: home });
+      cli(["join", "--agent", "a2", "--role", "lab"], { COMMS_HOME: home });
+      cli(["post", "--from", "a2", "--to", "a1", "--type", "note", "--subject", "hello", "--body", "b"], { COMMS_HOME: home });
+      const n1 = cli(["inbox", "--for", "a1", "--new", "--consumer", "manual"], { COMMS_HOME: home });
+      expect(n1.code).toBe(0);
+      expect(n1.out).toContain("hello");
+      const m = /cursor: ([0-9a-f]+\.[0-9]+)/.exec(n1.out);
+      expect(m).not.toBeNull();
+      const n2 = cli(["inbox", "--for", "a1", "--new", "--consumer", "manual"], { COMMS_HOME: home });
+      expect(n2.code).toBe(0);
+      expect(n2.out).not.toContain("hello"); // delivered exactly once
+      expect(n2.out).toContain(`cursor: ${m![1]}`); // nothing new ⇒ same cursor
+      const s1 = cli(["inbox", "--for", "a1", "--since", m![1]], { COMMS_HOME: home });
+      expect(s1.code).toBe(0);
+      expect(s1.out).toContain("cursor:");
+      const s2 = cli(["inbox", "--for", "a1", "--since", m![1]], { COMMS_HOME: home });
+      expect(s2.out).toBe(s1.out); // PURE window: identical output on replay
+      const both = cli(["inbox", "--for", "a1", "--new", "--since", m![1]], { COMMS_HOME: home });
+      expect(both.code).toBe(2);
+      expect(both.err).toContain("exclusive");
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+});

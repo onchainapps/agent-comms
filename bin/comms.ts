@@ -633,16 +633,56 @@ type Args = Record<string, any>;
 // RFC-004: "new" joins the set (inbox --new). "dm"/"url" removed — nothing
 // read them, so they were silent drops (grok N2: the allowlist claims only
 // flags that are actually wired).
-const KNOWN_FLAGS = new Set(["admin","agent","all","as","body","caps","channel","consumer","exit-on-new","fingerprint","force","group","id","interval","kind","label","lanes","limit","local","new","no-all","once","open","purpose","re","role","scopes","sender","since","state","subject","tags","thread","timeout","to","token","type","unread"]);
+// M4 (RFC-004 rework): the allowlist is PER COMMAND. A global set made
+// `inbox --lanes a,b` a silent full-dump no-op (exit 0): every flag owned by
+// another command was still swallowed. Keys here are the POST-ALIAS names
+// (--for⇒agent, --from⇒sender) because parse() remaps before the check.
+const GLOBAL_FLAGS = ["local", "token"] as const;
+const COMMAND_FLAGS: Record<string, readonly string[]> = {
+  join: ["agent", "role", "caps", "fingerprint", "group"],
+  rename: ["agent", "to", "fingerprint"],
+  who: ["all"],
+  ping: ["agent"],
+  post: ["sender", "to", "type", "subject", "body", "as", "thread", "re", "tags", "channel"],
+  dm: ["sender", "to", "type", "subject", "body"],
+  dms: ["agent"],
+  group: ["group", "agent"],
+  token: ["agent", "kind", "label", "scopes", "admin", "force", "lanes", "id"],
+  inbox: ["agent", "open", "unread", "channel", "no-all", "since", "new", "consumer"],
+  read: ["agent", "id"],
+  thread: ["id"],
+  receipts: ["id"],
+  channels: [],
+  channel: ["channel", "purpose"],
+  // ack/done/status keep --from (alias sender) as a historical accepted
+  // alias: the golden CLI transcript pins `ack --from <me>`, and remote seats
+  // habitually type it. The status verb only ever acts as the principal.
+  ack: ["agent", "sender", "id"],
+  done: ["agent", "sender", "id"],
+  status: ["agent", "sender", "id", "state"],
+  watch: ["agent", "all", "no-all", "channel", "interval", "timeout", "once", "exit-on-new", "consumer"],
+  history: ["agent", "channel", "since", "limit"],
+  help: [],
+};
+const KNOWN_FLAGS = new Set<string>(["admin","agent","all","as","body","caps","channel","consumer","exit-on-new","fingerprint","force","group","id","interval","kind","label","lanes","limit","local","new","no-all","once","open","purpose","re","role","scopes","sender","since","state","subject","tags","thread","timeout","to","token","type","unread"]);
 function parse(argv: string[]): Args {
   const [cmd, ...rest] = argv;
   const a: Args = { cmd, _pos: [] as string[] };
+  // An UNKNOWN verb falls through to the help text (exit 2) — its flags are
+  // not judged (there is no command to name). Known verbs get the strict set.
+  const cmdFlags = cmd !== undefined ? COMMAND_FLAGS[cmd] : undefined;
+  const allowed = cmdFlags ? new Set<string>([...GLOBAL_FLAGS, ...cmdFlags]) : null;
   for (let i = 0; i < rest.length; i++) {
     const t = rest[i];
     if (!t.startsWith("--")) { a._pos.push(t); continue; }
-    const key = t.slice(2) === "for" ? "agent" : t.slice(2) === "from" ? "sender" : t.slice(2);
+    const raw = t.slice(2);
+    const key = raw === "for" ? "agent" : raw === "from" ? "sender" : raw;
     if (!KNOWN_FLAGS.has(key)) {
       console.error(`error: unknown flag ${t} (no silent drop — did you mean --body? long text: --body @FILE reads a file)`);
+      process.exit(2);
+    }
+    if (allowed && !allowed.has(key)) {
+      console.error(`error: --${raw} is not a flag for '${cmd}' — allowed: ${[...allowed].join(", ")} (no silent drops; see README.md)`);
       process.exit(2);
     }
     const next = rest[i + 1];
@@ -662,10 +702,10 @@ group: group create|join|leave|list|show|delete <name> [--agent who] · post --t
 channel: channel create <name> [--purpose text] — blessed lane creation; post --channel <new> still creates but a near-duplicate (case/-/_) is refused. channel delete <name> — creator or agents:admin; messages stay, lane retires. Cap: 64 created lanes per agent (delete to free room).
 token: token create --agent <id> [--kind human] [--scopes a,b] [--lanes a,b] [--admin] [--force] | token list | token revoke --id N
 --lanes a,b (RFC-003): lane-scoped seat — sees/posts ONLY those lanes; lanes must exist at mint; omitted = unrestricted (legacy).
-inbox --since <epoch.seq> (pure window) | inbox --new [--consumer name] (durable cursor, advances) — RFC-004.
+inbox --since <epoch.seq> (pure window) | inbox --new [--consumer name] (durable cursor, advances) — RFC-004; the two are exclusive, and --open cannot be combined with --new (open is not monotone).
 watch --all (remote) pages history since-cursors: public rows are visible to every token; dm~ rows need membership or read:dm (ruling c).
 watch --no-all (E1) drops the @all broadcast arm: only id/role/group-addressed mail prints (auditor watch; consumer-namespaced cursor).
-unknown flags exit 2 (no silent drops) — full usage: README.md.`;
+flags are PER COMMAND (a flag that belongs to another command exits 2 naming it), unknown flags exit 2 — full usage: README.md.`;
 
 async function main() {
   const a = parse(process.argv.slice(2));

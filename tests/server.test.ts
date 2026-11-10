@@ -795,6 +795,80 @@ describe("M2 review pins (claude)", () => {
     } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
   });
 
+  test("RFC-004 rework M2: the allowlist covers the MUTATING verbs — a `lane` typo can never mint an unrestricted seat", async () => {
+    const home = tmp(); const tok = bootstrap(home); const srv = startServer({ home, port: 0 });
+    try {
+      // live defect on 8462fcb: 200 + token minted with lanes=null (unrestricted)
+      const bad = await rpc(srv.url, tok, "token.create", { agent: "seat-x", lane: ["secret-lane"] });
+      expect(bad.status).toBe(400);
+      expect((bad.body as any).error.code).toBe(-32602);
+      expect((bad.body as any).error.data.busError).toBe("usage");
+      expect(String((bad.body as any).error.data.detail)).toContain("lane");
+      const list = await rpc(srv.url, tok, "token.list", {});
+      expect(((list.body as any).result.tokens as any[]).filter((t) => t.agentId === "seat-x").length).toBe(0); // nothing minted
+      // the same request with the RIGHT key mints a LANE-SCOPED seat
+      const okLane = await rpc(srv.url, tok, "token.create", { agent: "seat-y", lanes: ["general"] });
+      expect(okLane.status).toBe(200);
+      expect((okLane.body as any).result.lanes).toEqual(["general"]);
+      // every other mutating/read verb is mapped too (aliases included)
+      const cases: [string, any][] = [
+        ["history", { chanel: "general" }],
+        ["rename", { agent: "root", tu: "x", newId: "y" }], // newId IS allowed; "tu" is not
+        ["channel.create", { nam: "x" }],
+        ["channel.delete", { nam: "x" }],
+        ["group.create", { nam: "g" }],
+        ["group.join", { nam: "g" }],
+        ["group.leave", { nam: "g" }],
+        ["group.delete", { nam: "g" }],
+        ["group.show", { nam: "g" }],
+        ["group.list", { bogus: 1 }],
+        ["dm.members", { chan: "x" }],
+        ["token.revoke", { ids: 1 }],
+        ["channels", { x: 1 }],
+        ["who", { only: true }],
+        ["thread", { msg: "x" }],
+        ["receipts", { msg: "x" }],
+      ];
+      for (const [m, params] of cases) {
+        const r = await rpc(srv.url, tok, m, params);
+        expect([m, r.status]).toEqual([m, 400]);
+        expect([m, (r.body as any).error.code]).toEqual([m, -32602]);
+        expect([m, (r.body as any).error.data.busError]).toEqual([m, "usage"]);
+      }
+      // and the alias keys dispatch really reads are ACCEPTED
+      const ren = await rpc(srv.url, tok, "rename", { agent: "seat-y", newId: "seat-y2" });
+      expect(ren.status).toBe(200);
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("RFC-004 rework M3: non-boolean new/open/unread/mark/noAll/force are usage (-32602/400) on the wire", async () => {
+    const home = tmp(); const tok = bootstrap(home); const srv = startServer({ home, port: 0 });
+    try {
+      await rpc(srv.url, tok, "post", { from: "root", to: "root", type: "note", body: "x" });
+      const cases: [string, any][] = [
+        ["inbox", { for: "root", new: "true" }],
+        ["inbox", { for: "root", new: 1 }],
+        ["inbox", { for: "root", open: "true" }],
+        ["inbox", { for: "root", unread: 0 }],
+        ["inbox", { for: "root", mark: "1" }],
+        ["inbox", { for: "root", noAll: "false" }],
+        ["cursor.set", { consumer: "c", cursor: "deadbeefdeadbeef.1", force: "true" }],
+      ];
+      for (const [m, params] of cases) {
+        const r = await rpc(srv.url, tok, m, params);
+        expect([m, r.status]).toEqual([m, 400]);
+        expect([m, (r.body as any).error.data.busError]).toEqual([m, "usage"]);
+      }
+      // the stringified-bool bug class: NOTHING advanced (the old code returned a plain inbox)
+      const cur = await rpc(srv.url, tok, "cursor.get", { consumer: "inbox" });
+      expect((cur.body as any).result.seq).toBe(0);
+      // and the real boolean advances as promised
+      const okNew = await rpc(srv.url, tok, "inbox", { for: "root", new: true });
+      expect(okNew.status).toBe(200);
+      expect(typeof (okNew.body as any).result.cursor).toBe("string");
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
   test("§7 /raw: mirror bytes served to addressee; 401 without cred; traversal + regex rejected pre-join", async () => {
     const home = tmp(); const tok = bootstrap(home);
     const srv = startServer({ home, port: 0 });
