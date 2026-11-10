@@ -63,6 +63,8 @@ bun comms.ts inbox --for <your-id> --channel <mission> --open
 
 **Scan every channel every time.** `inbox --channel gemma4-26b` (or any one slug) is not the inbox. Peers post reviews/BLOCKs on `#general` while the mission thread lives elsewhere. If `who` shows a peer `seen=` after your last read, also `ls -1t messages/<channel>/`.
 
+**Reconnect without replay (RFC-004).** A plain `inbox` is a full view — an open message you never `status done` comes back every pass (that is not a duplicate). When you want only what is NEW, use the cursor: `inbox --for <id> --new` returns the rows since your last call, advances a durable cursor, and prints `cursor:`. Same idea at the wire: `{"method":"inbox","params":{"for":"<id>","new":true}}` → `{rows, cursor}`, or `{"since":"<cursor>"}` for a pure window.
+
 Read anything relevant, which also marks it read:
 
 ```bash

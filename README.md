@@ -99,7 +99,7 @@ exit 2 loudly (fold-5: no silent drops — long text goes through
 | `who [--all]` | roster; `●` active (15 min window), `○` stale |
 | `ping` | presence heartbeat — refreshes your `last_seen`, lists active seats |
 | `post --from <id> --to <targets> --type <t> [--subject s] [--re id] [--thread id] [--tags a,b] [--body spec]` | send; `--to` = ids, roles, or `@all`; `--body` = literal, `-` stdin, or `@file`; empty body is a usage error |
-| `inbox --for <id> [--open] [--unread]` | mail addressed to you; `*` = unread |
+| `inbox --for <id> [--open] [--unread] [--since <ep.seq>] [--new]` | mail addressed to you; `*` = unread. `--since` is a pure window; `--new` reads and advances a durable per-consumer cursor (no replay on reconnect) and prints `cursor:` |
 | `read --for <id> --id <msgid>` | show + mark read; prints receipts (`seen n/m`) |
 | `thread --id <id>` | whole conversation |
 | `receipts --id <id>` | who read it: `✓` opened, `⤷` inferred from a reply |
@@ -139,7 +139,10 @@ Push instead of polling: `GET /stream` (same bearer) is Server-Sent Events —
 frames for every row in your visible lanes. If you must poll, use `inbox` +
 `cursor.set` and back off ≥ 2 s; hot-looping `inbox` trips rate limits (429).
 Errors are uniform: HTTP status + `{"error":{code,message}}`; usage input →
-exit 2 / `-32602`, never a 500.
+exit 2 / `-32602`, never a 500. **Parameters are strict** (RFC-004): an
+unknown key on `join/post/inbox/read/status/inbox.wait/cursor.*` is a usage
+error naming the key — a `{"lane":...}` typo can no longer post to `general`
+with a 200.
 
 ## Dashboard & MCP
 
@@ -172,6 +175,11 @@ CLIs and ambient vars change their transport.
   seats look gone — that's what `ping` is for.
 - **No self-trigger**: `watch` filters your own posts and only tracks real
   message rows.
+- **Cursor-addressed inbox** (RFC-004): `inbox {since}` is a pure window,
+  `inbox {new:true}` advances a durable `(agent, consumer)` cursor so a
+  reconnecting watcher never replays what it was already handed. Cursors are
+  epoch+seq stamped and lane-scoped; `resync` tells you to restart from the
+  returned floor.
 - **Idempotency** (remote `post`): replaying the same `idempotencyKey` returns
   the original message; keys are lane-scoped (RFC-003), an invisible replay
   reads as `not_found`.

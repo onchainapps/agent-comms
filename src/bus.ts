@@ -289,7 +289,7 @@ interface ServerOnly {
   joinAgent: (ctx: Ctx<"server">, p: { agent: string; role: string; caps?: string; fingerprint?: string | null }) => Res<{ agent: AgentRow; active: AgentRow[]; unresolved: number; welcome: string }>;
   pingAgent: (ctx: Ctx<"server">) => Res<{ agent: string; active: AgentRow[] }>;
   post: (ctx: Ctx<"server">, p: { from: string; to: string; type: string; subject?: string; body: string; thread?: string | null; re?: string | null; tags?: string; channel?: string | null; as?: string | null; idempotencyKey?: string | null; dm?: string | null }) => Res<{ id: string; channel: string; thread: string; file: string }>;
-  inbox: (ctx: Ctx<"server">, p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean; noAll?: boolean }) => Res<{ rows: MsgRow[]; unreadIds: Set<string> }>;
+  inbox: (ctx: Ctx<"server">, p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean; noAll?: boolean; since?: string; consumer?: string; newOnly?: boolean }) => Res<{ rows: MsgRow[]; unreadIds: Set<string>; cursor?: string; hasMore?: boolean }>;
   read: (ctx: Ctx<"server">, p: { agent: string; id: string }) => Res<MsgRow & { receipts: Receipts }>;
   threadOf: (ctx: Ctx<"server">, id: string) => Res<{ rows: MsgRow[]; receipts: Receipts[] }>;
   receipts: (ctx: Ctx<"server">, id: string) => Res<MsgRow & { receipts: Receipts }>;
@@ -1277,7 +1277,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     // and the recipient sees only a title — silent content loss is the worst
     // failure mode on a message bus. Fail at WRITE time on both transports.
     if (typeof p.body !== "string" || !p.body.trim())
-      return { error: "usage", detail: "post body is empty — a message with no body loses its content in transit (typo'd flag? read --body @file / --body-file?)" };
+      return { error: "usage", detail: "post body is empty — a message with no body loses its content in transit (typo'd flag? long text goes through --body @FILE)" };
     if (p.dm !== undefined && p.dm !== null && !ID_RE.test(p.dm))
       return { error: "usage", detail: `invalid dm peer: ${p.dm}` };
 
@@ -1611,7 +1611,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
     return { value: { id: m.id, channel, thread, file } };
   }
 
-  function inbox(ctx: Ctx<M>, p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean; noAll?: boolean }): Res<{ rows: MsgRow[]; unreadIds: Set<string> }> {
+  function inbox(ctx: Ctx<M>, p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean; noAll?: boolean; since?: string; consumer?: string; newOnly?: boolean }): Res<{ rows: MsgRow[]; unreadIds: Set<string>; cursor?: string; hasMore?: boolean }> {
     const bad = ctxCheck(ctx); if (bad) return bad;
     const rootCtx = isRootCtx(ctx);
     if ((mode === "server" || !rootCtx) && p.agent !== ctx.principal.agentId && !hasScope(ctx, "read:all"))
@@ -1635,7 +1635,7 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
        dmMembers(ch).includes(ctx.principal.agentId));
     const rows = d.query("SELECT * FROM messages ORDER BY created_at ASC, rowid ASC").all() as MsgRow[];
     const readIds = new Set((d.query("SELECT msg FROM reads WHERE agent=?").all(p.agent) as any[]).map((x) => x.msg));
-    const out = rows.filter((r) => {
+    const match = (r: MsgRow) => {
       if (r.sender === p.agent) return false;
       if (p.channel && r.channel !== p.channel) return false;
       if (!callerSeesDm(r.channel)) return false;
@@ -1643,7 +1643,48 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
       if (p.open && !["open", "acked", "in_progress"].includes(r.status)) return false;
       if (p.unread && readIds.has(r.id)) return false;
       return true;
-    });
+    };
+    // RFC-004: cursor-addressed inbox. `since` is a PURE window (no writes);
+    // `newOnly` reads the DURABLE per-consumer cursor and advances it past
+    // every event it scanned (delivery = advance), so a reconnecting watcher
+    // can never replay a message it was already handed. Cursor advances past
+    // rows the filters excluded — "new matching mail", not "new mail".
+    if (p.since !== undefined || p.newOnly === true) {
+      const consumer = p.consumer ?? "inbox";
+      if (!CONSUMER_RE.test(consumer)) return CONSUMER_BAD;
+      const ep0 = epochSafe();
+      if (ep0 === null) return { error: "internal", detail: "meta.epoch missing (corrupt DB)" };
+      let seq: number;
+      if (p.since !== undefined) {
+        const c = parseCursor(p.since);
+        if (c.error) return c;
+        seq = c.value.seq;
+      } else {
+        const laneRows = lanesOf(mode, ctx.principal);
+        const row = cursorRaw(p.agent, cursorKeyFor(laneRows, consumer));
+        if (row && row.epoch !== ep0)
+          return { error: "resync", detail: "cursor epoch stale (epoch rotated)", data: { resync: true, epoch: ep0, floor: gcFloor() } };
+        seq = row?.seq ?? 0;
+        if (seq < gcFloor())
+          return { error: "resync", detail: "cursor below retention floor", data: { resync: true, epoch: ep0, floor: gcFloor() } };
+      }
+      // events are the delivery log; messages are the truth (§6). LIKE IN
+      // waitStep: walk events ASC, hydrate rows, apply the SAME inbox predicate.
+      const cand = d.query(
+        "SELECT e.seq AS _seq, m.* FROM events e JOIN messages m ON m.id=e.msg_id WHERE e.kind='msg' AND e.seq>? ORDER BY e.seq ASC LIMIT 501",
+      ).all(seq) as (MsgRow & { _seq: number })[];
+      const page = cand.slice(0, 500);
+      const out = page.filter((r) => match(r));
+      const lastSeq = page.length ? page[page.length - 1]._seq : seq;
+      if (p.newOnly === true && lastSeq > seq) {
+        const w = cursorSet(p.agent, consumer, ep0, lastSeq, false, lanesOf(mode, ctx.principal));
+        if ("error" in w) return w as Res<never>;
+      }
+      if (mark) for (const r of out) d.run("INSERT OR REPLACE INTO reads(agent,msg,read_at) VALUES(?,?,?)", [p.agent, r.id, nowIso()]);
+      const clean = out.map(({ _seq, ...r }) => r as MsgRow);
+      return { value: { rows: clean, unreadIds: new Set(clean.map((r) => r.id).filter((id) => !readIds.has(id))), cursor: `${ep0}.${lastSeq}`, hasMore: cand.length > 500 } };
+    }
+    const out = rows.filter(match);
     if (mark) for (const r of out) d.run("INSERT OR REPLACE INTO reads(agent,msg,read_at) VALUES(?,?,?)", [p.agent, r.id, nowIso()]);
     return { value: { rows: out, unreadIds: new Set(out.map((r) => r.id).filter((id) => !readIds.has(id))) } };
   }

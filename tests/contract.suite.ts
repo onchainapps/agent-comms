@@ -1412,6 +1412,63 @@ export function contractSuite(name: string, make: Factory) {
         expect(core.post(forged, { from: "mallory", to: "x", type: "note", body: "b" }).error).toBe("internal");
       });
     });
+
+    test("RFC-004: inbox since= is a pure window — only newer mail, cursor returned, replay empty, re-request stable", async () => {
+      await withBus(async (h, root) => {
+        const s = await seedAgent(h, root, "r4a", "lab");
+        const sess = (s as any).value.session as Session;
+        await root.post({ from: "root", to: "r4a", type: "note", subject: "old", body: "old body" });
+        const hw = (await root.history({ limit: 1 })) as any;
+        const cur = hw.value.cursor as string;
+        expect(cur).toMatch(/^[0-9a-f]{8,64}\.\d+$/);
+        await root.post({ from: "root", to: "r4a", type: "note", subject: "new", body: "new body" });
+        const a = (await sess.inbox({ agent: "r4a", since: cur })) as any;
+        expect(a.error).toBeUndefined();
+        expect(a.value.rows.map((r: any) => r.subject)).toEqual(["new"]);
+        expect(typeof a.value.cursor).toBe("string");
+        const b = (await sess.inbox({ agent: "r4a", since: a.value.cursor })) as any;
+        expect(b.value.rows).toEqual([]);
+        expect(b.value.cursor).toBe(a.value.cursor); // no new events ⇒ cursor unchanged
+        // pure: nothing was written — the same window still yields the row
+        const c = (await sess.inbox({ agent: "r4a", since: cur })) as any;
+        expect(c.value.rows.map((r: any) => r.subject)).toEqual(["new"]);
+        // and it does not disturb the plain inbox either
+        const plain = (await sess.inbox({ agent: "r4a" })) as any;
+        expect(plain.value.rows.length).toBe(2);
+      });
+    });
+
+    test("RFC-004: inbox new=true advances the DURABLE cursor — a reconnect never replays; consumers are independent", async () => {
+      await withBus(async (h, root) => {
+        const s = await seedAgent(h, root, "r4b", "lab");
+        const sess = (s as any).value.session as Session;
+        await root.post({ from: "root", to: "r4b", type: "note", subject: "first", body: "1" });
+        const a = (await sess.inbox({ agent: "r4b", newOnly: true })) as any;
+        expect(a.error).toBeUndefined();
+        expect(a.value.rows.map((r: any) => r.subject)).toEqual(["first"]);
+        expect(typeof a.value.cursor).toBe("string");
+        const b = (await sess.inbox({ agent: "r4b", newOnly: true })) as any;
+        expect(b.value.rows).toEqual([]); // delivered once
+        // a different consumer starts at 0 and sees the same history
+        const other = (await sess.inbox({ agent: "r4b", newOnly: true, consumer: "audit" })) as any;
+        expect(other.value.rows.map((r: any) => r.subject)).toEqual(["first"]);
+        await root.post({ from: "root", to: "r4b", type: "note", subject: "second", body: "2" });
+        const d = (await sess.inbox({ agent: "r4b", newOnly: true })) as any;
+        expect(d.value.rows.map((r: any) => r.subject)).toEqual(["second"]);
+        // plain inbox still shows everything (backwards compatible)
+        const plain = (await sess.inbox({ agent: "r4b" })) as any;
+        expect(plain.value.rows.length).toBe(2);
+      });
+    });
+
+    test("RFC-004: a malformed since is usage on both transports (never a silent full dump)", async () => {
+      await withBus(async (h, root) => {
+        const s = await seedAgent(h, root, "r4c", "lab");
+        const sess = (s as any).value.session as Session;
+        expect((await sess.inbox({ agent: "r4c", since: "not-a-cursor" })).error).toBe("usage");
+        expect((await sess.inbox({ agent: "r4c", since: "deadbeefdeadbeef.999999" })).error).toBe("resync"); // foreign epoch = resync signal, never a silent dump
+      });
+    });
   });
 }
 

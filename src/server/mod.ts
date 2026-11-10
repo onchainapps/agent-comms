@@ -308,7 +308,27 @@ export function startServer(opts: ServerOpts): RunningServer {
   }
 
   // ---------- RPC dispatch ----------
+  // RFC-004 (#2): write/read verbs are STRICT about their parameter names — a
+  // typo like {"lane":"cardano"} used to be silently ignored and the post fell
+  // to general with a 200. Unknown keys are a usage error now, before dispatch.
+  const PARAM_KEYS: Record<string, readonly string[]> = {
+    join: ["agent", "role", "caps", "fingerprint"],
+    ping: [],
+    post: ["from", "to", "type", "subject", "body", "thread", "re", "tags", "channel", "as", "idempotencyKey", "dm"],
+    inbox: ["for", "agent", "open", "unread", "channel", "mark", "noAll", "since", "consumer", "new", "newOnly"],
+    read: ["for", "agent", "id"],
+    status: ["id", "state", "agent", "for"], // agent/for are accepted-and-ignored (principal wins — spoof pin)
+    "inbox.wait": ["for", "consumer", "since", "noAll"],
+    "cursor.get": ["consumer"],
+    "cursor.set": ["consumer", "cursor", "force"],
+  };
   async function rpcCall(session: Session, method: string, p: any): Promise<{ ok: true; result: unknown } | { ok: false; err: ReturnType<typeof busToRpc> }> {
+    const allowed = PARAM_KEYS[method];
+    if (allowed && p && typeof p === "object" && !Array.isArray(p)) {
+      const extra = Object.keys(p).filter((k) => !allowed.includes(k));
+      if (extra.length)
+        return { ok: false as const, err: busToRpc({ error: "usage", detail: `unknown param(s) for ${method}: ${extra.join(",")} — allowed: ${allowed.join(",") || "(none)"}` }) };
+    }
     const call = async (r: Promise<{ error?: BusErrorCode; detail?: string; value?: unknown; data?: Record<string, unknown> }>) => {
       const res = await r;
       if (res.error) return { ok: false as const, err: busToRpc(res as any) };
@@ -319,7 +339,7 @@ export function startServer(opts: ServerOpts): RunningServer {
       case "ping": return call(session.pingAgent()); // presence heartbeat (mandala-dev ask)
       case "who": return call(session.listAgents(!p.all));
       case "post": return call(session.post({ from: p.from ?? session.agentId, to: Array.isArray(p.to) ? p.to.join(",") : String(p.to ?? ""), type: String(p.type ?? ""), subject: p.subject, body: String(p.body ?? ""), thread: p.thread, re: p.re, tags: p.tags, channel: p.channel, as: p.as, idempotencyKey: p.idempotencyKey, dm: p.dm }));
-      case "inbox": return call(session.inbox({ agent: p.for ?? p.agent ?? session.agentId, open: p.open, unread: p.unread, channel: p.channel, mark: p.mark, noAll: p.noAll === true }));
+      case "inbox": return call(session.inbox({ agent: p.for ?? p.agent ?? session.agentId, open: p.open, unread: p.unread, channel: p.channel, mark: p.mark, noAll: p.noAll === true, since: p.since, consumer: p.consumer, newOnly: p.new === true || p.newOnly === true }));
       case "read": return call(session.read({ agent: p.for ?? p.agent ?? session.agentId, id: String(p.id ?? "") }));
       case "thread": return call(session.threadOf(String(p.id ?? "")));
       case "receipts": return call(session.receipts(String(p.id ?? "")));

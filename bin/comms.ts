@@ -328,13 +328,21 @@ async function cmdGroup(a: Args) {
 }
 
 async function cmdInbox(a: Args) {
-  const v = unwrap(await CALL("inbox", a.agent, { agent: a.agent, open: a.open, unread: a.unread, channel: a.channel, ...(a["no-all"] ? { noAll: true } : {}) }));
+  // RFC-004: --since <epoch.seq> is a PURE window; --new reads and ADVANCES the
+  // durable per-consumer cursor (default "inbox"), so a reconnect never replays
+  // what it was already handed. Plain inbox output stays byte-identical.
+  const p: Record<string, unknown> = { agent: a.agent, open: a.open, unread: a.unread, channel: a.channel, ...(a["no-all"] ? { noAll: true } : {}) };
+  if (typeof a.since === "string") p.since = a.since;
+  if (a.new === true) { p.newOnly = true; if (typeof a.consumer === "string") p.consumer = a.consumer; }
+  const v = unwrap(await CALL("inbox", a.agent, p));
   // claude M3 B2: core returns a Set, the wire (and the Session contract)
   // an array — one CALL surface must normalize ONE shape.
   const unread = new Set<string>(v.unreadIds);
   let shown = 0;
   for (const r of v.rows) { console.log(fmtRow(r, unread.has(r.id))); shown++; }
   console.log(shown ? `\n${shown} message(s). '*' = unread. Read: bun comms.ts read --for ${a.agent} --id <ID>` : "(inbox empty for filter)");
+  if (typeof v.cursor === "string" && (typeof a.since === "string" || a.new === true))
+    console.log(`cursor: ${v.cursor}${v.hasMore ? "  (more queued — call again)" : ""}`);
 }
 
 async function cmdRead(a: Args) {
@@ -622,7 +630,10 @@ type Args = Record<string, any>;
 // fold-5: the floor-eater was ME — `--body-file` is not a flag; parse()
 // swallowed it as an unknown key and --body stayed unset ⇒ bodyless post,
 // exit 0. Unknown flags are now a loud usage error (exit 2).
-const KNOWN_FLAGS = new Set(["admin","agent","all","as","body","caps","channel","consumer","dm","exit-on-new","fingerprint","force","group","id","interval","kind","label","lanes","limit","local","no-all","once","open","purpose","re","role","scopes","sender","since","state","subject","tags","thread","timeout","to","token","type","unread","url"]);
+// RFC-004: "new" joins the set (inbox --new). "dm"/"url" removed — nothing
+// read them, so they were silent drops (grok N2: the allowlist claims only
+// flags that are actually wired).
+const KNOWN_FLAGS = new Set(["admin","agent","all","as","body","caps","channel","consumer","exit-on-new","fingerprint","force","group","id","interval","kind","label","lanes","limit","local","new","no-all","once","open","purpose","re","role","scopes","sender","since","state","subject","tags","thread","timeout","to","token","type","unread"]);
 function parse(argv: string[]): Args {
   const [cmd, ...rest] = argv;
   const a: Args = { cmd, _pos: [] as string[] };
@@ -651,9 +662,10 @@ group: group create|join|leave|list|show|delete <name> [--agent who] · post --t
 channel: channel create <name> [--purpose text] — blessed lane creation; post --channel <new> still creates but a near-duplicate (case/-/_) is refused. channel delete <name> — creator or agents:admin; messages stay, lane retires. Cap: 64 created lanes per agent (delete to free room).
 token: token create --agent <id> [--kind human] [--scopes a,b] [--lanes a,b] [--admin] [--force] | token list | token revoke --id N
 --lanes a,b (RFC-003): lane-scoped seat — sees/posts ONLY those lanes; lanes must exist at mint; omitted = unrestricted (legacy).
+inbox --since <epoch.seq> (pure window) | inbox --new [--consumer name] (durable cursor, advances) — RFC-004.
 watch --all (remote) pages history since-cursors: public rows are visible to every token; dm~ rows need membership or read:dm (ruling c).
 watch --no-all (E1) drops the @all broadcast arm: only id/role/group-addressed mail prints (auditor watch; consumer-namespaced cursor).
-run 'bun comms.ts <cmd> --help-ish' — see header of this file for full usage.`;
+unknown flags exit 2 (no silent drops) — full usage: README.md.`;
 
 async function main() {
   const a = parse(process.argv.slice(2));

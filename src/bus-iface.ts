@@ -17,7 +17,7 @@ export interface Session {
   pingAgent(): Promise<Res<{ agent: string; active: AgentRow[] }>>;
   listAgents(activeOnly: boolean): Promise<Res<AgentRow[]>>;
   post(p: { from: string; to: string; type: string; subject?: string; body: string; thread?: string | null; re?: string | null; tags?: string; channel?: string | null; as?: string | null; idempotencyKey?: string | null; dm?: string | null }): Promise<Res<{ id: string; channel: string; thread: string; file: string }>>;
-  inbox(p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean; noAll?: boolean }): Promise<Res<{ rows: MsgRow[]; unreadIds: string[] }>>;
+  inbox(p: { agent: string; open?: boolean; unread?: boolean; channel?: string | null; mark?: boolean; noAll?: boolean; since?: string; consumer?: string; newOnly?: boolean }): Promise<Res<{ rows: MsgRow[]; unreadIds: string[]; cursor?: string; hasMore?: boolean }>>;
   read(p: { agent: string; id: string }): Promise<Res<MsgRow & { receipts: Receipts }>>;
   threadOf(id: string): Promise<Res<{ rows: MsgRow[]; receipts: Receipts[] }>>;
   receipts(id: string): Promise<Res<MsgRow & { receipts: Receipts }>>;
@@ -74,7 +74,7 @@ function wrapSessionImpl<M extends Mode>(bus: Bus<M>, ctx: Ctx<M>): Session {
     post: (p) => a(bus.post(c, p)),
     inbox: (p) => {
       const r = bus.inbox(c, p);
-      return Promise.resolve(r.error ? r : { value: { rows: r.value.rows, unreadIds: [...r.value.unreadIds] } });
+      return Promise.resolve(r.error ? r : { value: { rows: r.value.rows, unreadIds: [...r.value.unreadIds], ...(r.value.cursor !== undefined ? { cursor: r.value.cursor } : {}), ...(r.value.hasMore !== undefined ? { hasMore: r.value.hasMore } : {}) } });
     },
     read: (p) => a(bus.read(c, p)),
     threadOf: (id) => a(bus.threadOf(c, id)),

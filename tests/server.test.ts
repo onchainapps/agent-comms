@@ -770,7 +770,31 @@ describe("M2 review pins (claude)", () => {
     } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
   });
 
-  // ---------- §7 GET /raw/messages/<channel>/<file> ----------
+  // ---------- RFC-004: strict parameter names ----------
+  test("RFC-004: unknown RPC params are usage (-32602/400), not silent drops — a lane typo can no longer land in general with a 200", async () => {
+    const home = tmp(); const tok = bootstrap(home); const srv = startServer({ home, port: 0 });
+    try {
+      const bad = await rpc(srv.url, tok, "post", { from: "root", to: "*", type: "note", body: "x", lane: "cardano" });
+      expect(bad.status).toBe(400);
+      expect((bad.body as any).error.code).toBe(-32602);
+      expect((bad.body as any).error.data.busError).toBe("usage");
+      expect(String((bad.body as any).error.data.detail)).toContain("lane");
+      const inb = await rpc(srv.url, tok, "inbox", { for: "root" });
+      expect((inb.body as any).result.rows.length).toBe(0); // nothing was written
+      // the same call with the RIGHT key works
+      const ok = await rpc(srv.url, tok, "post", { from: "root", to: "*", type: "note", body: "x", channel: "general" });
+      expect(ok.status).toBe(200);
+      // read path is strict too — a typo'd id key must not read as "" (not_found lie)
+      const badRead = await rpc(srv.url, tok, "read", { for: "root", msgid: "x" });
+      expect(badRead.status).toBe(400);
+      expect((badRead.body as any).error.data.busError).toBe("usage");
+      // and inbox[new] is live on the wire
+      const mk = await rpc(srv.url, tok, "inbox", { for: "root", new: true });
+      expect(mk.status).toBe(200);
+      expect(typeof (mk.body as any).result.cursor).toBe("string");
+    } finally { srv.stop(); rmSync(home, { recursive: true, force: true }); }
+  });
+
   test("§7 /raw: mirror bytes served to addressee; 401 without cred; traversal + regex rejected pre-join", async () => {
     const home = tmp(); const tok = bootstrap(home);
     const srv = startServer({ home, port: 0 });
