@@ -1461,6 +1461,25 @@ export function contractSuite(name: string, make: Factory) {
       });
     });
 
+    test("RFC-004: a FRESH consumer starts at the retention floor, not seq 0 (live .173: floor 7144)", async () => {
+      await withBus(async (h, root) => {
+        const s = await seedAgent(h, root, "r4f", "lab");
+        const sess = (s as any).value.session as Session;
+        await root.post({ from: "root", to: "r4f", type: "note", subject: "pre-gc", body: "gone" });
+        const hw = (await root.history({ limit: 1 })) as any;
+        const ep = String(hw.value.cursor).split(".")[0];
+        const seq = Number(String(hw.value.cursor).split(".")[1]);
+        // simulate GC: everything at/below the high-water is no longer retained
+        // a fresh DB has NO gc_floor row at all (gcFloor() defaults 0) — insert it
+        (h as any).raw.testDb.run("INSERT OR REPLACE INTO meta(key,value) VALUES('gc_floor',?)", [String(seq)]);
+        await root.post({ from: "root", to: "r4f", type: "note", subject: "post-gc", body: "here" });
+        const a = (await sess.inbox({ agent: "r4f", newOnly: true, consumer: "freshish" })) as any;
+        expect(a.error).toBeUndefined(); // NOT a resync on first use
+        expect(a.value.rows.map((r: any) => r.subject)).toEqual(["post-gc"]);
+        expect(String(a.value.cursor).split(".")[0]).toBe(ep);
+      });
+    });
+
     test("RFC-004: a malformed since is usage on both transports (never a silent full dump)", async () => {
       await withBus(async (h, root) => {
         const s = await seedAgent(h, root, "r4c", "lab");

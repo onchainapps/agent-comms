@@ -1664,8 +1664,12 @@ function openBusCore<M extends Mode>(home: string, mode: M, seams: Seams, busyTi
         const row = cursorRaw(p.agent, cursorKeyFor(laneRows, consumer));
         if (row && row.epoch !== ep0)
           return { error: "resync", detail: "cursor epoch stale (epoch rotated)", data: { resync: true, epoch: ep0, floor: gcFloor() } };
-        seq = row?.seq ?? 0;
-        if (seq < gcFloor())
+        // A FRESH consumer (no row) starts at the RETENTION FLOOR, not 0: a real
+        // bus has GC'd events (live .173: floor 7144, min seq 7145), and seq 0
+        // would make the very first --new a spurious resync. Only an EXISTING
+        // row below the floor is genuinely stale.
+        seq = row ? row.seq : gcFloor();
+        if (row && seq < gcFloor())
           return { error: "resync", detail: "cursor below retention floor", data: { resync: true, epoch: ep0, floor: gcFloor() } };
       }
       // events are the delivery log; messages are the truth (§6). LIKE IN
